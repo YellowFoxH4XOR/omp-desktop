@@ -60,6 +60,11 @@ impl WatcherManager {
             thread_id: thread_id.to_string(),
         });
     }
+
+    #[cfg(test)]
+    fn is_watching(&self, thread_id: &str) -> bool {
+        self.threads.lock().contains_key(thread_id)
+    }
 }
 
 struct WatchedDir {
@@ -242,6 +247,20 @@ fn event_paths_relevant(paths: &[PathBuf], cwd: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::git;
+
+    #[test]
+    fn unwatch_removes_failed_start_membership() {
+        let (tx, _rx) = channel();
+        let threads = Arc::new(Mutex::new(HashMap::new()));
+        let manager = WatcherManager {
+            cmd: tx,
+            threads: threads.clone(),
+        };
+        manager.watch("failed", Path::new("/tmp"));
+        assert!(manager.is_watching("failed"));
+        manager.unwatch("failed");
+        assert!(!manager.is_watching("failed"));
+    }
     use std::process::Command;
 
     #[test]

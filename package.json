@@ -7,11 +7,19 @@
     "dev": "vite dev",
     "build": "vite build",
     "preview": "vite preview",
-    "check": "svelte-check --tsconfig ./tsconfig.json",
+    "check": "bun run check:frontend && bun run check:rust",
+    "check:frontend": "svelte-check --tsconfig ./tsconfig.json",
+    "check:rust": "cd src-tauri && cargo fmt -- --check && cargo check --locked",
     "check:watch": "svelte-check --tsconfig ./tsconfig.json --watch",
     "tauri": "tauri",
-    "test": "vitest run src/lib/session.test.ts"
+    "test": "vitest run --exclude 'tests/e2e/**'",
+    "test:watch": "vitest --exclude 'tests/e2e/**'",
+    "test:e2e": "playwright test tests/e2e --pass-with-no-tests",
+    "test:rust": "cd src-tauri && cargo test --lib --locked",
+    "validate": "./scripts/validate.sh",
+    "bundle:macos": "bun run tauri build --bundles app && ./scripts/sign-macos-bundle.sh"
   },
+  "packageManager": "bun@1.4.2",
   "license": "MIT",
   "dependencies": {
     "@codemirror/commands": "^6.11.1",
@@ -33,6 +41,7 @@
     "zod": "^4.6.5"
   },
   "devDependencies": {
+    "@playwright/test": "^1.63.0",
     "@sveltejs/vite-plugin-svelte": "^7.1.2",
     "@tauri-apps/cli": "^2",
     "svelte": "^5.56.3",

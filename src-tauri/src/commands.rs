@@ -8,7 +8,35 @@ use crate::state::AppState;
 use crate::util;
 use serde_json::Value;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use tauri::State;
+
+static ACTIVE_INSTALL: Mutex<Option<HarnessKind>> = Mutex::new(None);
+
+struct ActiveInstallGuard;
+
+impl ActiveInstallGuard {
+    fn acquire(kind: HarnessKind) -> Result<Self, AppError> {
+        let mut active = ACTIVE_INSTALL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if active.is_some() {
+            return Err(AppError::new(
+                "Another harness installation is already in progress. Wait for it to finish, then try again.",
+            ));
+        }
+        *active = Some(kind);
+        Ok(Self)
+    }
+}
+
+impl Drop for ActiveInstallGuard {
+    fn drop(&mut self) {
+        *ACTIVE_INSTALL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+}
 
 // ---------------------------------------------------------------------
 // Harness detection / install
@@ -34,13 +62,12 @@ pub async fn set_executable_override(
 
 #[tauri::command]
 pub async fn install_harness(state: State<'_, AppState>, kind: HarnessKind) -> CmdResult<()> {
-    let registry = state.registry.clone();
-    let app = state.app.clone();
-    // Run in the background; progress streams via install_progress events.
-    tauri::async_runtime::spawn(async move {
-        let _ = registry.install(kind, app).await;
-    });
-    Ok(())
+    let _active_install = ActiveInstallGuard::acquire(kind).map_err(cmd_err)?;
+    state
+        .registry
+        .install(kind, state.app.clone())
+        .await
+        .map_err(cmd_err)
 }
 
 // ---------------------------------------------------------------------
@@ -364,4 +391,18 @@ pub fn git_write_if_unchanged(
 ) -> CmdResult<()> {
     let cwd = state.threads.thread_cwd(&thread_id).map_err(cmd_err)?;
     git::write_if_unchanged(&cwd, &path, &expected_hash, &content).map_err(cmd_err)
+}
+
+#[tauri::command]
+pub fn open_changed_file(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    thread_id: String,
+    path: String,
+) -> CmdResult<()> {
+    let cwd = state.threads.thread_cwd(&thread_id).map_err(cmd_err)?;
+    let abs = git::openable_path(&cwd, &path).map_err(cmd_err)?;
+    tauri_plugin_opener::OpenerExt::opener(&app)
+        .open_path(abs.to_string_lossy().to_string(), None::<&str>)
+        .map_err(|error| cmd_err(AppError::new(format!("Could not open file: {error}"))))
 }

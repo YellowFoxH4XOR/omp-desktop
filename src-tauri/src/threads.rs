@@ -14,7 +14,7 @@ use parking_lot::Mutex;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
@@ -32,6 +32,9 @@ const LOGIN_TIMEOUT_SECS: u64 = 600;
 
 pub struct LiveThread {
     client: Arc<RpcClient>,
+    /// Monotonic identity for this process incarnation. Event callbacks carry
+    /// the generation they were created for and ignore later incarnations.
+    generation: u64,
     last_activity: Mutex<Instant>,
     streaming: AtomicBool,
     failed: AtomicBool,
@@ -133,6 +136,58 @@ fn attach_task_metadata(agents: &mut [AgentInfo], messages: &[Value]) {
     }
 }
 
+fn release_owner(owners: &Mutex<HashMap<String, String>>, cwd: &str, thread_id: &str) {
+    let key = ThreadManager::checkout_key(cwd);
+    let mut owners = owners.lock();
+    if owners.get(&key).is_some_and(|owner| owner == thread_id) {
+        owners.remove(&key);
+    }
+}
+
+fn prompt_invokes_agent(kind: HarnessKind, data: &Value) -> bool {
+    match kind {
+        HarnessKind::Omp => data
+            .get("agentInvoked")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        HarnessKind::Pi => true,
+    }
+}
+
+fn acquire_owner(owners: &Mutex<HashMap<String, String>>, cwd: &str, thread_id: &str) -> bool {
+    let key = ThreadManager::checkout_key(cwd);
+    let mut owners = owners.lock();
+    if owners
+        .get(&key)
+        .is_some_and(|owner| owner.as_str() != thread_id)
+    {
+        return false;
+    }
+    owners.insert(key, thread_id.to_string());
+    true
+}
+
+fn resume_arguments(
+    kind: HarnessKind,
+    session_id: &str,
+    session_file: &str,
+) -> AppResult<Vec<String>> {
+    match (session_id, session_file) {
+        ("", "") => Ok(Vec::new()),
+        ("", _) | (_, "") => Err(AppError::new(
+            "This thread's saved session mapping is incomplete. Restore its session file before reopening it.",
+        )),
+        (_, mapped) if !Path::new(mapped).is_file() => Err(AppError::new(format!(
+            "The saved session file {} is missing or has moved. Restore it before reopening this thread.",
+            mapped
+        ))),
+        (_, mapped) => Ok(match kind {
+            HarnessKind::Omp => vec!["--resume".into(), mapped.to_string()],
+            HarnessKind::Pi => vec!["--session".into(), mapped.to_string()],
+        }),
+    }
+}
+
 pub struct ThreadManager {
     store: Arc<Store>,
     registry: Arc<HarnessRegistry>,
@@ -141,6 +196,11 @@ pub struct ThreadManager {
     live: Arc<Mutex<HashMap<String, Arc<LiveThread>>>>,
     /// Threads currently being spawned (prevents double-spawn races).
     spawning: Mutex<std::collections::HashSet<String>>,
+    next_generation: AtomicU64,
+    /// Exclusive owner of a non-isolated checkout. A reservation is made
+    /// before a prompt starts and lives until that turn becomes terminal or
+    /// its process exits.
+    checkout_owners: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl ThreadManager {
@@ -157,6 +217,8 @@ impl ThreadManager {
             app,
             live: Arc::new(Mutex::new(HashMap::new())),
             spawning: Mutex::new(std::collections::HashSet::new()),
+            next_generation: AtomicU64::new(1),
+            checkout_owners: Arc::new(Mutex::new(HashMap::new())),
         })
     }
     fn touch_activity(&self, thread_id: &str) {
@@ -169,6 +231,32 @@ impl ThreadManager {
         if let Some(l) = self.live.lock().get(thread_id) {
             l.streaming.store(streaming, Ordering::SeqCst);
             l.note_activity();
+        }
+    }
+
+    fn checkout_key(cwd: &str) -> String {
+        util::resolve_path(Path::new(cwd))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// Atomically acquire a checkout for an active turn. The owner remains
+    /// reserved until that process reports terminal/idle state or exits.
+    fn reserve_checkout(&self, cwd: &str, thread_id: &str) -> AppResult<()> {
+        if acquire_owner(&self.checkout_owners, cwd, thread_id) {
+            Ok(())
+        } else {
+            Err(AppError::new(
+                "Another thread is working in this checkout. Create a new isolated thread to avoid mixing their changes.",
+            ))
+        }
+    }
+
+    fn release_checkout(&self, cwd: &str, thread_id: &str) {
+        let key = Self::checkout_key(cwd);
+        let mut owners = self.checkout_owners.lock();
+        if owners.get(&key).is_some_and(|owner| owner == thread_id) {
+            owners.remove(&key);
         }
     }
 
@@ -185,17 +273,17 @@ impl ThreadManager {
         let project = self.store.get_project(project_id)?;
         let project_path = PathBuf::from(&project.path);
         let mut rows = self.store.list_threads(project_id)?;
-        let mut seen_files: std::collections::HashSet<String> = rows
+        let mut seen_sessions: std::collections::HashSet<(HarnessKind, String)> = rows
             .iter()
-            .map(|r| r.session_file.clone())
-            .filter(|s| !s.is_empty())
+            .filter(|row| !row.session_file.is_empty())
+            .map(|row| (row.harness, row.session_file.clone()))
             .collect();
         for kind in [HarnessKind::Omp, HarnessKind::Pi] {
             for scanned in sessions::scan_sessions(kind, &project_path) {
-                if seen_files.contains(&scanned.session_file) {
+                let identity = (kind, scanned.session_file.clone());
+                if !seen_sessions.insert(identity) {
                     continue;
                 }
-                seen_files.insert(scanned.session_file.clone());
                 let id = uuid::Uuid::new_v4().to_string();
                 let row = self.store.upsert_thread(
                     &id,
@@ -250,21 +338,20 @@ impl ThreadManager {
             live.get(&row.id)
                 .is_some_and(|process| !process.client.is_exited() && row.cwd == project.path)
         });
-        let running_peer = existing.iter().any(|row| {
-            live.get(&row.id).is_some_and(|process| {
-                !process.client.is_exited() && process.is_busy() && row.cwd == project.path
-            })
-        });
         drop(live);
-        let git_repo = (isolated || live_peer) && git::is_repo(&project_path);
-        if running_peer && !git_repo {
+
+        // Serialize the peer decision with prompt reservations. Creation only
+        // inserts metadata; ownership is acquired by the first prompt/turn.
+        let checkout_key = Self::checkout_key(&project.path);
+        let owners = self.checkout_owners.lock();
+        let peer = live_peer || owners.contains_key(&checkout_key);
+        let git_repo = (isolated || peer) && git::is_repo(&project_path);
+        if peer && !git_repo {
             return Err(AppError::new(
-                "Another thread is running in this directory. Wait for it to finish; concurrent threads need a Git worktree for isolation.",
+                "Another thread is working in this directory. Wait for it to finish; concurrent threads need a Git worktree for isolation.",
             ));
         }
-        // UI status can lag a worker; Git threads get a separate worktree
-        // whenever another live process already owns the project checkout.
-        let isolated = isolated || (live_peer && git_repo);
+        let isolated = isolated || (peer && git_repo);
         let id = uuid::Uuid::new_v4().to_string();
         let mut cwd = project_path.clone();
         let mut worktree_path = None;
@@ -279,8 +366,8 @@ impl ThreadManager {
                 .join("worktrees")
                 .join(&id);
             git::create_worktree(&project_path, &dest)?;
-            cwd = dest.clone();
-            worktree_path = Some(dest.to_string_lossy().to_string());
+            cwd = dest;
+            worktree_path = Some(cwd.to_string_lossy().to_string());
         }
         let row = self.store.upsert_thread(
             &id,
@@ -302,13 +389,11 @@ impl ThreadManager {
     // ------------------------------------------------------------------
 
     /// Spawn (or resume) the harness process for a thread. Returns the live
-    /// handle. Idempotent: returns the existing process when already running.
+    /// handle. Idempotent: returns the existing process when still running.
     pub async fn ensure_running(&self, thread_id: &str) -> AppResult<Arc<LiveThread>> {
-        if let Some(l) = self.live.lock().get(thread_id) {
-            if !l.client.is_exited() {
-                l.note_activity();
-                return Ok(l.clone());
-            }
+        if let Some(l) = Self::take_reusable_live(&self.live, thread_id) {
+            l.note_activity();
+            return Ok(l);
         }
         // Serialize concurrent spawns for the same thread.
         let already_spawning = {
@@ -321,14 +406,16 @@ impl ThreadManager {
             }
         };
         if already_spawning {
-            // Another caller is spawning; wait for it to finish.
+            // Never return a mapped handle until the reader has observed exit.
             for _ in 0..200 {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                if let Some(l) = self.live.lock().get(thread_id) {
-                    return Ok(l.clone());
+                if let Some(l) = Self::take_reusable_live(&self.live, thread_id) {
+                    return Ok(l);
                 }
                 if !self.spawning.lock().contains(thread_id) {
-                    break;
+                    return Err(AppError::new(
+                        "The session failed to start. Try again in a moment.",
+                    ));
                 }
             }
             return Err(AppError::new(
@@ -338,6 +425,40 @@ impl ThreadManager {
         let result = self.spawn(thread_id).await;
         self.spawning.lock().remove(thread_id);
         result
+    }
+
+    /// Return a running process, eagerly evicting a handle whose exit callback
+    /// has not run yet. This closes the stop/restart reuse window.
+    fn take_reusable_live(
+        live: &Mutex<HashMap<String, Arc<LiveThread>>>,
+        thread_id: &str,
+    ) -> Option<Arc<LiveThread>> {
+        let mut live = live.lock();
+        let reusable = live
+            .get(thread_id)
+            .filter(|process| !process.client.is_exited())
+            .cloned();
+        if reusable.is_none() {
+            live.remove(thread_id);
+        }
+        reusable
+    }
+
+    fn remove_generation(
+        live: &Mutex<HashMap<String, Arc<LiveThread>>>,
+        thread_id: &str,
+        generation: u64,
+    ) -> Option<Arc<LiveThread>> {
+        let mut live = live.lock();
+        if !live
+            .get(thread_id)
+            .is_some_and(|process| process.generation == generation)
+        {
+            return None;
+        }
+        let process = live.remove(thread_id)?;
+        process.cancel_idle_watch();
+        Some(process)
     }
 
     async fn spawn(&self, thread_id: &str) -> AppResult<Arc<LiveThread>> {
@@ -352,23 +473,10 @@ impl ThreadManager {
         }
         let exe = self.registry.executable_path(kind).await?;
         let mut args: Vec<String> = vec!["--mode".into(), "rpc".into()];
-        let session_file = row.session_file.clone();
-        let can_resume = !session_file.is_empty() && Path::new(&session_file).is_file();
-        match kind {
-            HarnessKind::Omp => {
-                if can_resume {
-                    args.push("--resume".into());
-                    args.push(session_file.clone());
-                }
-            }
-            HarnessKind::Pi => {
-                if can_resume {
-                    args.push("--session".into());
-                    args.push(session_file.clone());
-                }
-            }
-        }
+        args.extend(resume_arguments(kind, &row.session_id, &row.session_file)?);
         let mut command = Command::new(&exe);
+        #[cfg(unix)]
+        command.process_group(0);
         if let Some(shell_env) = util::login_shell_env() {
             for (key, value) in shell_env {
                 if !matches!(key.as_str(), "PWD" | "SHLVL" | "_") && std::env::var_os(key).is_none()
@@ -401,46 +509,53 @@ impl ThreadManager {
         let store = self.store.clone();
         let live_map = self.live.clone();
         let watcher = self.watcher.clone();
+        let checkout_owners = self.checkout_owners.clone();
 
         // OMP readiness resolves on the `ready` frame.
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Value>();
         let ready_tx = Mutex::new(Some(ready_tx));
 
+        let generation = self.next_generation.fetch_add(1, Ordering::SeqCst);
         let tid_ev = tid.clone();
         let tid_exit = tid.clone();
         let live_ev = live_map.clone();
         let store_ev = store.clone();
         let app_ev = app.clone();
-        // Slot filled with this spawn's client so a stale exit handler can't
-        // evict a newer process for the same thread.
-        let client_slot: Arc<Mutex<Option<Arc<RpcClient>>>> = Arc::new(Mutex::new(None));
-        let client_slot_exit = client_slot.clone();
+        let checkout_owners_ev = checkout_owners.clone();
+        let cwd_ev = cwd.to_string_lossy().into_owned();
+        let cwd_exit = cwd_ev.clone();
+        let cwd_cleanup = cwd_ev.clone();
+        let checkout_owners_exit = checkout_owners.clone();
+        // Events from an older process must not mutate or emit for a replacement.
+        // The generation is captured before the client is attached.
         let handlers = RpcHandlers {
             on_event: Box::new(move |frame: Value| {
                 let ftype = frame.get("type").and_then(Value::as_str).unwrap_or("");
-                if let Some(l) = live_ev.lock().get(&tid_ev) {
-                    match ftype {
-                        "agent_start" => {
-                            l.streaming.store(true, Ordering::SeqCst);
-                            l.failed.store(false, Ordering::SeqCst);
-                            let _ = store_ev.update_thread_status(&tid_ev, "active");
-                        }
-                        "agent_end" => {
-                            if frame.get("isTerminal") != Some(&Value::Bool(false))
-                                && frame.get("willRetry") != Some(&Value::Bool(true))
-                            {
-                                l.streaming.store(false, Ordering::SeqCst);
-                                let status = if !l.active_subagents.lock().is_empty() {
-                                    "active"
-                                } else if l.failed.load(Ordering::SeqCst) {
-                                    "failed"
-                                } else {
-                                    "completed"
-                                };
-                                let _ = store_ev.update_thread_status(&tid_ev, status);
-                            }
-                        }
-                        "agent_settled" => {
+                let Some(l) = live_ev
+                    .lock()
+                    .get(&tid_ev)
+                    .filter(|l| l.generation == generation)
+                    .cloned()
+                else {
+                    return;
+                };
+                match ftype {
+                    "agent_start" => {
+                        l.streaming.store(true, Ordering::SeqCst);
+                        l.failed.store(false, Ordering::SeqCst);
+                        let _ = store_ev.update_thread_status(&tid_ev, "active");
+                    }
+                    "agent_end" => {
+                        let pi = store_ev
+                            .get_thread(&tid_ev)
+                            .ok()
+                            .is_some_and(|row| row.harness == HarnessKind::Pi);
+                        // Pi can still compact or drain queued handlers after agent_end.
+                        if pi {
+                            l.note_activity();
+                        } else if frame.get("isTerminal") != Some(&Value::Bool(false))
+                            && frame.get("willRetry") != Some(&Value::Bool(true))
+                        {
                             l.streaming.store(false, Ordering::SeqCst);
                             let status = if !l.active_subagents.lock().is_empty() {
                                 "active"
@@ -450,98 +565,126 @@ impl ThreadManager {
                                 "completed"
                             };
                             let _ = store_ev.update_thread_status(&tid_ev, status);
-                        }
-                        "message_end" => {
-                            if frame
-                                .get("message")
-                                .and_then(|message| message.get("stopReason"))
-                                .and_then(Value::as_str)
-                                == Some("error")
-                            {
-                                l.failed.store(true, Ordering::SeqCst);
+                            if status != "active" {
+                                release_owner(&checkout_owners_ev, &cwd_ev, &tid_ev);
                             }
                         }
-                        "response"
-                            if frame.get("success").and_then(Value::as_bool) == Some(false)
-                                && matches!(
-                                    frame.get("command").and_then(Value::as_str),
-                                    Some("prompt" | "abort_and_prompt" | "steer" | "follow_up")
-                                ) =>
-                        {
-                            l.streaming.store(false, Ordering::SeqCst);
-                            l.failed.store(true, Ordering::SeqCst);
-                            let _ = store_ev.update_thread_status(&tid_ev, "failed");
-                        }
-                        "subagent_lifecycle" => {
-                            if let Some(payload) = frame.get("payload") {
-                                if let Some(id) = payload.get("id").and_then(Value::as_str) {
-                                    let mut active = l.active_subagents.lock();
-                                    if payload.get("status").and_then(Value::as_str)
-                                        == Some("started")
-                                    {
-                                        active.insert(id.to_string());
-                                    } else {
-                                        active.remove(id);
-                                    }
-                                }
-                            }
-                            if !l.streaming.load(Ordering::SeqCst) {
-                                let status = if !l.active_subagents.lock().is_empty() {
-                                    "active"
-                                } else if l.failed.load(Ordering::SeqCst) {
-                                    "failed"
-                                } else {
-                                    "completed"
-                                };
-                                let _ = store_ev.update_thread_status(&tid_ev, status);
-                            }
-                        }
-                        "extension_ui_request" => {
-                            // Fire-and-forget UI requests (open_url, widgets,
-                            // notifications) have no pending dialog to answer.
-                            let method = frame.get("method").and_then(Value::as_str).unwrap_or("");
-                            if matches!(method, "select" | "confirm" | "input" | "editor") {
-                                if let Some(id) = frame.get("id").and_then(Value::as_str) {
-                                    l.pending_ui_requests.lock().insert(id.to_string());
-                                }
-                                let _ = store_ev.update_thread_status(&tid_ev, "waiting");
-                            }
-                            if method == "cancel" {
-                                // The harness withdrew a request; resolve the
-                                // target locally so it can't block suspension.
-                                let target = frame
-                                    .get("targetId")
-                                    .and_then(Value::as_str)
-                                    .or_else(|| frame.get("id").and_then(Value::as_str));
-                                if let Some(target) = target {
-                                    l.pending_ui_requests.lock().remove(target);
-                                    l.ui_fire_and_forget.lock().remove(target);
-                                }
-                            }
-                            if matches!(
-                                method,
-                                "open_url"
-                                    | "setWidget"
-                                    | "setStatus"
-                                    | "setTitle"
-                                    | "notify"
-                                    | "cancel"
-                            ) {
-                                if let Some(id) = frame.get("id").and_then(Value::as_str) {
-                                    let mut set = l.ui_fire_and_forget.lock();
-                                    if set.len() >= 4096 {
-                                        set.clear();
-                                    }
-                                    set.insert(id.to_string());
-                                }
-                            }
-                        }
-                        _ => {}
                     }
-                    // Signal after state mutations so a woken idle watch
-                    // observes the fresh busy flags.
-                    l.note_activity();
+                    "agent_settled" => {
+                        l.streaming.store(false, Ordering::SeqCst);
+                        let status = if !l.active_subagents.lock().is_empty() {
+                            "active"
+                        } else if l.failed.load(Ordering::SeqCst) {
+                            "failed"
+                        } else {
+                            "completed"
+                        };
+                        let _ = store_ev.update_thread_status(&tid_ev, status);
+                        if status != "active" {
+                            release_owner(&checkout_owners_ev, &cwd_ev, &tid_ev);
+                        }
+                    }
+                    "message_end" => {
+                        if frame
+                            .get("message")
+                            .and_then(|message| message.get("stopReason"))
+                            .and_then(Value::as_str)
+                            == Some("error")
+                        {
+                            l.failed.store(true, Ordering::SeqCst);
+                        }
+                    }
+                    "response"
+                        if frame.get("success").and_then(Value::as_bool) == Some(false)
+                            && matches!(
+                                frame.get("command").and_then(Value::as_str),
+                                Some("prompt" | "abort_and_prompt" | "steer" | "follow_up")
+                            ) =>
+                    {
+                        l.streaming.store(false, Ordering::SeqCst);
+                        l.failed.store(true, Ordering::SeqCst);
+                        let _ = store_ev.update_thread_status(&tid_ev, "failed");
+                        release_owner(&checkout_owners_ev, &cwd_ev, &tid_ev);
+                    }
+                    "prompt_result"
+                        if frame.get("agentInvoked").and_then(Value::as_bool) == Some(false) =>
+                    {
+                        l.streaming.store(false, Ordering::SeqCst);
+                        l.failed.store(false, Ordering::SeqCst);
+                        let _ = store_ev.update_thread_status(&tid_ev, "completed");
+                        release_owner(&checkout_owners_ev, &cwd_ev, &tid_ev);
+                    }
+                    "subagent_lifecycle" => {
+                        if let Some(payload) = frame.get("payload") {
+                            if let Some(id) = payload.get("id").and_then(Value::as_str) {
+                                let mut active = l.active_subagents.lock();
+                                if payload.get("status").and_then(Value::as_str) == Some("started")
+                                {
+                                    active.insert(id.to_string());
+                                } else {
+                                    active.remove(id);
+                                }
+                            }
+                        }
+                        if !l.streaming.load(Ordering::SeqCst) {
+                            let status = if !l.active_subagents.lock().is_empty() {
+                                "active"
+                            } else if l.failed.load(Ordering::SeqCst) {
+                                "failed"
+                            } else {
+                                "completed"
+                            };
+                            let _ = store_ev.update_thread_status(&tid_ev, status);
+                            if status != "active" {
+                                release_owner(&checkout_owners_ev, &cwd_ev, &tid_ev);
+                            }
+                        }
+                    }
+                    "extension_ui_request" => {
+                        let method = frame.get("method").and_then(Value::as_str).unwrap_or("");
+                        if matches!(method, "select" | "confirm" | "input" | "editor") {
+                            if let Some(id) = frame.get("id").and_then(Value::as_str) {
+                                l.pending_ui_requests.lock().insert(id.to_string());
+                            }
+                            let _ = store_ev.update_thread_status(&tid_ev, "waiting");
+                        }
+                        if method == "cancel" {
+                            let target = frame
+                                .get("targetId")
+                                .and_then(Value::as_str)
+                                .or_else(|| frame.get("id").and_then(Value::as_str));
+                            if let Some(target) = target {
+                                l.pending_ui_requests.lock().remove(target);
+                                l.ui_fire_and_forget.lock().remove(target);
+                            }
+                            if l.pending_ui_requests.lock().is_empty()
+                                && !l.streaming.load(Ordering::SeqCst)
+                            {
+                                let _ = store_ev.update_thread_status(&tid_ev, "completed");
+                                release_owner(&checkout_owners_ev, &cwd_ev, &tid_ev);
+                            }
+                        }
+                        if matches!(
+                            method,
+                            "open_url"
+                                | "setWidget"
+                                | "setStatus"
+                                | "setTitle"
+                                | "notify"
+                                | "cancel"
+                        ) {
+                            if let Some(id) = frame.get("id").and_then(Value::as_str) {
+                                let mut set = l.ui_fire_and_forget.lock();
+                                if set.len() >= 4096 {
+                                    set.clear();
+                                }
+                                set.insert(id.to_string());
+                            }
+                        }
+                    }
+                    _ => {}
                 }
+                l.note_activity();
                 let _ = app_ev.emit(
                     "desktop-event",
                     BackendEvent::Rpc {
@@ -551,15 +694,10 @@ impl ThreadManager {
                 );
             }),
             on_exit: Box::new(move |code: Option<i32>, stderr: String, expected: bool| {
-                // An old process must not change the status or watcher of a
-                // replacement spawned for the same thread.
-                let Some(mine) = client_slot_exit.lock().clone() else {
-                    return;
-                };
                 let mut map = live_map.lock();
                 if !map
                     .get(&tid_exit)
-                    .is_some_and(|l| Arc::ptr_eq(&l.client, &mine))
+                    .is_some_and(|l| l.generation == generation)
                 {
                     return;
                 }
@@ -568,6 +706,7 @@ impl ThreadManager {
                 }
                 drop(map);
                 watcher.unwatch(&tid_exit);
+                release_owner(&checkout_owners_exit, &cwd_exit, &tid_exit);
                 let status = if expected { "idle" } else { "disconnected" };
                 let _ = store.update_thread_status(&tid_exit, status);
                 let _ = app.emit(
@@ -590,9 +729,9 @@ impl ThreadManager {
             },
         };
         let client = Arc::new(RpcClient::attach(child, stdout, stderr, handlers));
-        *client_slot.lock() = Some(client.clone());
         let live = Arc::new(LiveThread {
             client: client.clone(),
+            generation,
             last_activity: Mutex::new(Instant::now()),
             streaming: AtomicBool::new(false),
             failed: AtomicBool::new(false),
@@ -605,14 +744,7 @@ impl ThreadManager {
         if let Some(prev) = self.live.lock().insert(tid.clone(), live.clone()) {
             prev.cancel_idle_watch();
         }
-        Self::start_idle_watch(
-            &live,
-            &tid,
-            self.live.clone(),
-            self.store.clone(),
-            IDLE_SUSPEND,
-        );
-        self.watcher.watch(&tid, &cwd);
+        // The watcher starts only after the readiness handshake succeeds.
 
         // Handshake per harness.
         match kind {
@@ -627,8 +759,8 @@ impl ThreadManager {
                     _ => {
                         let tail = client.stderr_tail().await;
                         client.shutdown().await;
-                        live.cancel_idle_watch();
-                        self.live.lock().remove(&tid);
+                        Self::remove_generation(&self.live, &tid, generation);
+                        release_owner(&checkout_owners, &cwd_cleanup, &tid);
                         return Err(AppError::new(format!(
                             "OMP did not become ready.{}",
                             if tail.trim().is_empty() {
@@ -665,15 +797,15 @@ impl ThreadManager {
                     Ok(Ok(_)) => {}
                     Ok(Err(e)) => {
                         client.shutdown().await;
-                        live.cancel_idle_watch();
-                        self.live.lock().remove(&tid);
+                        Self::remove_generation(&self.live, &tid, generation);
+                        release_owner(&checkout_owners, &cwd_cleanup, &tid);
                         return Err(e);
                     }
                     Err(_) => {
                         let tail = client.stderr_tail().await;
                         client.shutdown().await;
-                        live.cancel_idle_watch();
-                        self.live.lock().remove(&tid);
+                        Self::remove_generation(&self.live, &tid, generation);
+                        release_owner(&checkout_owners, &cwd_cleanup, &tid);
                         return Err(AppError::new(format!(
                             "Pi did not become ready.{}",
                             if tail.trim().is_empty() {
@@ -686,41 +818,83 @@ impl ThreadManager {
                 }
             }
         }
-        // Adopt the real session identity once known.
-        if let Ok(state) = client.call("get_state", Map::new()).await {
-            self.adopt_state(&row, &state)?;
+        // Readiness is proven; only now may file events start flowing.
+        self.watcher.watch(&tid, &cwd);
+        Self::start_idle_watch(
+            &live,
+            &tid,
+            self.live.clone(),
+            self.store.clone(),
+            self.checkout_owners.clone(),
+            cwd.to_string_lossy().into_owned(),
+            IDLE_SUSPEND,
+        );
+        let state = match client.call("get_state", Map::new()).await {
+            Ok(state) => state,
+            Err(error) => {
+                client.shutdown().await;
+                Self::remove_generation(&self.live, &tid, generation);
+                self.watcher.unwatch(&tid);
+                release_owner(&checkout_owners, &cwd_cleanup, &tid);
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.adopt_state(&row, &state) {
+            client.shutdown().await;
+            Self::remove_generation(&self.live, &tid, generation);
+            self.watcher.unwatch(&tid);
+            release_owner(&checkout_owners, &cwd_cleanup, &tid);
+            return Err(error);
         }
         let _ = self.store.update_thread_status(&tid, "idle");
         let _ = self.store.touch_thread(&tid);
         Ok(live)
     }
 
-    /// Persist session id/file learned from get_state.
+    /// Persist session identity learned from get_state without erasing a
+    /// durable mapping when a harness omits an optional field.
     fn adopt_state(&self, row: &ThreadRow, state: &Value) -> AppResult<()> {
         let session_id = state.get("sessionId").and_then(Value::as_str).unwrap_or("");
         let session_file = state
             .get("sessionFile")
             .and_then(Value::as_str)
             .unwrap_or("");
-        if !session_id.is_empty() || !session_file.is_empty() {
-            self.store
-                .update_thread_session(&row.id, session_id, session_file)?;
+        if session_id.is_empty() {
+            return Err(AppError::new(
+                "The harness returned an invalid empty session identity.",
+            ));
         }
-        Ok(())
+        if !row.session_id.is_empty() && !session_id.is_empty() && row.session_id != session_id {
+            return Err(AppError::new(
+                "The harness resumed a different session than the one mapped to this thread.",
+            ));
+        }
+        if !row.session_file.is_empty()
+            && !session_file.is_empty()
+            && util::resolve_path(Path::new(&row.session_file))
+                != util::resolve_path(Path::new(session_file))
+        {
+            return Err(AppError::new(
+                "The harness resumed a different session file than the one mapped to this thread.",
+            ));
+        }
+        self.store
+            .update_thread_session(&row.id, session_id, session_file)
     }
 
     /// Graceful stop: SIGTERM → SIGKILL; emits `exited` with expected=true.
     pub async fn stop(&self, thread_id: &str) -> AppResult<()> {
-        let live = self.live.lock().get(thread_id).cloned();
+        let live = self.live.lock().remove(thread_id);
         if let Some(l) = live {
             l.cancel_idle_watch();
             l.client.expect_exit();
+            self.watcher.unwatch(thread_id);
+            self.release_checkout(&self.store.get_thread(thread_id)?.cwd, thread_id);
             l.client.shutdown().await;
         }
         self.set_status(thread_id, "idle");
         Ok(())
     }
-
     /// Stop then spawn again (crash recovery / user restart).
     pub async fn restart(&self, thread_id: &str) -> AppResult<Arc<LiveThread>> {
         self.stop(thread_id).await.ok();
@@ -747,8 +921,28 @@ impl ThreadManager {
         let state = client.call("get_state", Map::new()).await?;
         self.adopt_state(&row, &state)?;
         let messages = Self::fetch_messages(&client, row.harness).await?;
-        let models = self.fetch_models(&client).await;
-        let levels = self.fetch_levels(&client).await;
+        let models_result = client.call("get_available_models", Map::new()).await;
+        let models = models_result
+            .as_ref()
+            .ok()
+            .and_then(|d| d.get("models").and_then(Value::as_array))
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(value_to_model)
+            .collect::<Vec<_>>();
+        let levels_result = client
+            .call("get_available_thinking_levels", Map::new())
+            .await;
+        let levels = levels_result
+            .as_ref()
+            .ok()
+            .and_then(|d| d.get("levels").and_then(Value::as_array))
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|value| value.as_str().map(String::from))
+            .collect::<Vec<_>>();
         let stats = client.call("get_session_stats", Map::new()).await.ok();
         let live_agents = self.fetch_agents(&client, row.harness).await;
         let row = self.store.get_thread(thread_id)?;
@@ -761,13 +955,22 @@ impl ThreadManager {
             attach_task_metadata(&mut agents, &messages);
         }
         let harness = row.harness;
+        let mut capabilities = HarnessCapabilities::for_kind(harness);
+        if harness == HarnessKind::Pi {
+            capabilities.model_switching = models_result.is_ok();
+            capabilities.effort_levels = levels_result.is_ok();
+            capabilities.context_usage = stats
+                .as_ref()
+                .is_some_and(|stats| stats.get("contextUsage").is_some());
+            capabilities.token_usage = stats.is_some();
+        }
         Ok(SessionSnapshot {
             thread: row.into_dto(),
             messages,
             state: build_session_state(&state, stats.as_ref()),
             models,
             levels,
-            capabilities: HarnessCapabilities::for_kind(harness),
+            capabilities,
             agents,
         })
     }
@@ -872,35 +1075,57 @@ impl ThreadManager {
 
     pub async fn send_prompt(&self, thread_id: &str, message: &str, mode: &str) -> AppResult<()> {
         let row = self.store.get_thread(thread_id)?;
-        let project = self.store.get_project(&row.project_id)?;
-        if row.cwd == project.path {
-            let peers = self.store.list_threads(&row.project_id)?;
-            let live = self.live.lock();
-            if peers.iter().any(|peer| {
-                peer.id != thread_id
-                    && peer.cwd == row.cwd
-                    && live
-                        .get(&peer.id)
-                        .is_some_and(|process| !process.client.is_exited() && process.is_busy())
-            }) {
-                return Err(AppError::new(
-                    "Another thread is working in this checkout. Create a new isolated thread to avoid mixing their changes.",
-                ));
+        let key = Self::checkout_key(&row.cwd);
+        let already_owned = self
+            .checkout_owners
+            .lock()
+            .get(&key)
+            .is_some_and(|owner| owner == thread_id);
+        self.reserve_checkout(&row.cwd, thread_id)?;
+        let client = match self.client_for(thread_id).await {
+            Ok(client) => client,
+            Err(error) => {
+                if !already_owned {
+                    self.release_checkout(&row.cwd, thread_id);
+                }
+                return Err(error);
             }
-        }
-        let client = self.client_for(thread_id).await?;
+        };
         let command = match mode {
             "steer" => "steer",
             "follow_up" => "follow_up",
             _ => "prompt",
         };
         let args = Map::from_iter([("message".into(), json!(message))]);
-        client.call(command, args).await?;
-        self.set_status(thread_id, "active");
+        let data = match client.call(command, args).await {
+            Ok(data) => data,
+            Err(error) => {
+                if !already_owned {
+                    self.release_checkout(&row.cwd, thread_id);
+                    self.set_status(thread_id, "failed");
+                }
+                return Err(error);
+            }
+        };
+        let busy = self
+            .live
+            .lock()
+            .get(thread_id)
+            .is_some_and(|live| live.is_busy());
+        let invoked = match row.harness {
+            HarnessKind::Omp => prompt_invokes_agent(row.harness, &data),
+            HarnessKind::Pi => busy,
+        };
+        if invoked {
+            self.set_status(thread_id, "active");
+        } else {
+            self.set_streaming(thread_id, false);
+            self.set_status(thread_id, "completed");
+            self.release_checkout(&row.cwd, thread_id);
+        }
         self.touch_activity(thread_id);
         Ok(())
     }
-
     pub async fn abort(&self, thread_id: &str) -> AppResult<()> {
         let Some(client) = self.live_client(thread_id) else {
             return Ok(()); // nothing running
@@ -1126,6 +1351,8 @@ impl ThreadManager {
         thread_id: &str,
         live_map: Arc<Mutex<HashMap<String, Arc<LiveThread>>>>,
         store: Arc<Store>,
+        owners: Arc<Mutex<HashMap<String, String>>>,
+        cwd: String,
         idle_for: Duration,
     ) {
         let tid = thread_id.to_string();
@@ -1155,6 +1382,7 @@ impl ThreadManager {
                     watched.client.expect_exit();
                     watched.client.shutdown().await;
                     let _ = store.update_thread_status(&tid, "idle");
+                    release_owner(&owners, &cwd, &tid);
                     return;
                 };
                 if remaining.is_zero() {
@@ -1174,11 +1402,20 @@ impl ThreadManager {
 
     /// Stop every live process (app shutdown).
     pub async fn shutdown_all(&self) {
-        let lives: Vec<Arc<LiveThread>> = self.live.lock().values().cloned().collect();
-        for l in lives {
-            l.cancel_idle_watch();
-            l.client.expect_exit();
-            l.client.shutdown().await;
+        let lives: Vec<(String, Arc<LiveThread>)> = self
+            .live
+            .lock()
+            .iter()
+            .map(|(id, live)| (id.clone(), live.clone()))
+            .collect();
+        for (id, live) in lives {
+            live.cancel_idle_watch();
+            live.client.expect_exit();
+            self.watcher.unwatch(&id);
+            if let Ok(row) = self.store.get_thread(&id) {
+                self.release_checkout(&row.cwd, &id);
+            }
+            live.client.shutdown().await;
         }
     }
 }
@@ -1414,6 +1651,81 @@ mod tests {
         assert_eq!(agent.tokens, Some(2048));
     }
 
+    #[test]
+    fn missing_mapped_session_fails_closed() {
+        let missing = std::env::temp_dir().join(format!("omp-missing-{}", uuid::Uuid::new_v4()));
+        assert!(
+            resume_arguments(HarnessKind::Omp, "session-1", &missing.to_string_lossy())
+                .unwrap_err()
+                .to_string()
+                .contains("missing or has moved")
+        );
+        assert!(resume_arguments(HarnessKind::Pi, "", "")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn local_omp_prompt_is_completed_without_agent() {
+        assert!(!prompt_invokes_agent(
+            HarnessKind::Omp,
+            &json!({"agentInvoked": false})
+        ));
+        assert!(prompt_invokes_agent(
+            HarnessKind::Omp,
+            &json!({"agentInvoked": true})
+        ));
+        assert!(prompt_invokes_agent(HarnessKind::Pi, &Value::Null));
+    }
+
+    #[test]
+    fn checkout_reservation_race_has_one_owner() {
+        let owners = Arc::new(Mutex::new(HashMap::new()));
+        let cwd = std::env::temp_dir().join(format!("omp-checkout-{}", uuid::Uuid::new_v4()));
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = ["a", "b"]
+            .into_iter()
+            .map(|id| {
+                let owners = owners.clone();
+                let barrier = barrier.clone();
+                let cwd = cwd.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    acquire_owner(&owners, &cwd.to_string_lossy(), id)
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert_eq!(results.iter().filter(|owned| **owned).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn expected_exit_is_never_reused() {
+        let old = live_cat();
+        let map = live_map_with("restart", &old);
+        old.client.expect_exit();
+        old.client.shutdown().await;
+        assert!(wait_exited(&old.client).await);
+        assert!(ThreadManager::take_reusable_live(&map, "restart").is_none());
+    }
+
+    #[tokio::test]
+    async fn stale_generation_cannot_remove_replacement() {
+        let old = live_cat();
+        let mut new = live_cat();
+        Arc::get_mut(&mut new).expect("unique live").generation = 2;
+        let map: Arc<Mutex<HashMap<String, Arc<LiveThread>>>> =
+            Arc::new(Mutex::new(HashMap::from([("thread".into(), new.clone())])));
+        assert!(ThreadManager::remove_generation(&map, "thread", old.generation).is_none());
+        assert!(Arc::ptr_eq(
+            map.lock().get("thread").expect("replacement remains"),
+            &new
+        ));
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn stale_page_discards_prior_rows_before_fallback_snapshot() {
@@ -1479,6 +1791,7 @@ printf '%s\n' '{"type":"response","id":"3","command":"get_messages","success":tr
     fn live_cat() -> Arc<LiveThread> {
         Arc::new(LiveThread {
             client: spawn_cat(),
+            generation: 1,
             last_activity: Mutex::new(Instant::now()),
             streaming: AtomicBool::new(false),
             failed: AtomicBool::new(false),
@@ -1515,7 +1828,15 @@ printf '%s\n' '{"type":"response","id":"3","command":"get_messages","success":tr
     async fn idle_watch_suspends_after_deadline() {
         let live = live_cat();
         let map = live_map_with("t1", &live);
-        ThreadManager::start_idle_watch(&live, "t1", map, test_store(), Duration::from_millis(50));
+        ThreadManager::start_idle_watch(
+            &live,
+            "t1",
+            map,
+            test_store(),
+            Arc::new(Mutex::new(HashMap::new())),
+            "/tmp".into(),
+            Duration::from_millis(50),
+        );
         assert!(wait_exited(&live.client).await);
         assert!(live.client.expected_exit());
     }
@@ -1525,7 +1846,15 @@ printf '%s\n' '{"type":"response","id":"3","command":"get_messages","success":tr
         let live = live_cat();
         live.streaming.store(true, Ordering::SeqCst);
         let map = live_map_with("t2", &live);
-        ThreadManager::start_idle_watch(&live, "t2", map, test_store(), Duration::from_millis(50));
+        ThreadManager::start_idle_watch(
+            &live,
+            "t2",
+            map,
+            test_store(),
+            Arc::new(Mutex::new(HashMap::new())),
+            "/tmp".into(),
+            Duration::from_millis(50),
+        );
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert!(!live.client.is_exited());
         live.streaming.store(false, Ordering::SeqCst);
@@ -1538,7 +1867,15 @@ printf '%s\n' '{"type":"response","id":"3","command":"get_messages","success":tr
         let live = live_cat();
         live.pending_ui_requests.lock().insert("req-1".to_string());
         let map = live_map_with("t3", &live);
-        ThreadManager::start_idle_watch(&live, "t3", map, test_store(), Duration::from_millis(50));
+        ThreadManager::start_idle_watch(
+            &live,
+            "t3",
+            map,
+            test_store(),
+            Arc::new(Mutex::new(HashMap::new())),
+            "/tmp".into(),
+            Duration::from_millis(50),
+        );
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert!(!live.client.is_exited());
         live.pending_ui_requests.lock().remove("req-1");
@@ -1551,7 +1888,15 @@ printf '%s\n' '{"type":"response","id":"3","command":"get_messages","success":tr
         let old = live_cat();
         let new = live_cat();
         let map = live_map_with("t4", &new);
-        ThreadManager::start_idle_watch(&old, "t4", map, test_store(), Duration::from_millis(50));
+        ThreadManager::start_idle_watch(
+            &old,
+            "t4",
+            map,
+            test_store(),
+            Arc::new(Mutex::new(HashMap::new())),
+            "/tmp".into(),
+            Duration::from_millis(50),
+        );
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert!(!old.client.is_exited());
         assert!(!new.client.is_exited());
@@ -1561,7 +1906,15 @@ printf '%s\n' '{"type":"response","id":"3","command":"get_messages","success":tr
     async fn cancelled_idle_watch_never_suspends() {
         let live = live_cat();
         let map = live_map_with("t5", &live);
-        ThreadManager::start_idle_watch(&live, "t5", map, test_store(), Duration::from_millis(50));
+        ThreadManager::start_idle_watch(
+            &live,
+            "t5",
+            map,
+            test_store(),
+            Arc::new(Mutex::new(HashMap::new())),
+            "/tmp".into(),
+            Duration::from_millis(50),
+        );
         live.cancel_idle_watch();
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert!(!live.client.is_exited());

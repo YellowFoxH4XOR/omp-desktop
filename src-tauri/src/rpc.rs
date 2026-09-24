@@ -5,7 +5,7 @@ use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
 use tokio::sync::{oneshot, Mutex};
 
@@ -14,6 +14,48 @@ const MAX_REASSEMBLED_BYTES: usize = 67_108_864; // 64 MiB reassembled
 const CHUNK_PAYLOAD_BYTES: usize = 262_144; // 256 KiB per chunk payload
 const STDERR_TAIL_BYTES: usize = 16 * 1024;
 const DEFAULT_CMD_TIMEOUT_SECS: u64 = 60;
+
+async fn read_bounded_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    max: usize,
+) -> std::io::Result<Option<String>> {
+    let mut buf = Vec::new();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            if buf.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+        if let Some(pos) = available.iter().position(|byte| *byte == b'\n') {
+            if buf.len() + pos > max {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "RPC line exceeded size limit",
+                ));
+            }
+            buf.extend_from_slice(&available[..pos]);
+            reader.consume(pos + 1);
+            break;
+        }
+        if buf.len() + available.len() > max {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "RPC line exceeded size limit",
+            ));
+        }
+        let len = available.len();
+        buf.extend_from_slice(available);
+        reader.consume(len);
+    }
+    if buf.last() == Some(&b'\r') {
+        buf.pop();
+    }
+    String::from_utf8(buf)
+        .map(Some)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
 
 /// One pending RPC request awaiting its `response` frame.
 struct Pending {
@@ -80,8 +122,8 @@ impl RpcClient {
         {
             let inner = inner.clone();
             tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
+                let mut stderr = BufReader::new(stderr);
+                while let Ok(Some(line)) = read_bounded_line(&mut stderr, MAX_FRAME_BYTES).await {
                     let mut tail = inner.stderr_tail.lock().await;
                     tail.push_str(&line);
                     tail.push('\n');
@@ -100,9 +142,9 @@ impl RpcClient {
             let inner = inner.clone();
             tokio::spawn(async move {
                 let mut chunk_state: Option<ChunkState> = None;
-                let mut lines = BufReader::new(stdout).lines();
+                let mut stdout = BufReader::new(stdout);
                 loop {
-                    match lines.next_line().await {
+                    match read_bounded_line(&mut stdout, MAX_FRAME_BYTES).await {
                         Ok(Some(line)) => {
                             if line.trim().is_empty() {
                                 continue;
@@ -151,10 +193,17 @@ impl RpcClient {
                             }
                         }
                         Ok(None) => break, // EOF
-                        Err(_) => break,
+                        Err(error) => {
+                            let msg = util::redact_secrets(&format!("RPC protocol error: {error}"));
+                            fail_all(&inner, &msg).await;
+                            let mut child = inner.child.lock().await;
+                            let _ = terminate_child(&mut child).await;
+                            drop(child);
+                            mark_exited(&inner, handlers.on_exit, None, msg).await;
+                            return;
+                        }
                     }
                 }
-                // stdout ended: wait briefly for exit status, then report.
                 let code = {
                     let mut child = inner.child.lock().await;
                     match tokio::time::timeout(std::time::Duration::from_secs(3), child.wait())
@@ -162,7 +211,7 @@ impl RpcClient {
                     {
                         Ok(Ok(status)) => status.code(),
                         _ => {
-                            let _ = child.kill().await;
+                            terminate_child(&mut child).await;
                             None
                         }
                     }
@@ -269,18 +318,33 @@ impl RpcClient {
 
 async fn terminate_child(child: &mut Child) -> bool {
     #[cfg(unix)]
-    {
-        if let Some(pid) = child.id() {
-            unsafe {
-                libc::kill(pid as i32, libc::SIGTERM);
+    if let Some(pid) = child.id() {
+        let pgid = pid as i32;
+        // The harness is spawned as its own process-group leader. Signal the
+        // group so tools/PTY descendants cannot outlive stop, restart, or app
+        // shutdown. A negative pid targets that group on Unix.
+        unsafe {
+            libc::kill(-pgid, libc::SIGTERM);
+        }
+        match tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await {
+            Ok(Ok(_)) => {
+                // The leader may exit before one of its descendants. Ensure the
+                // whole group is gone even when wait() returned successfully.
+                unsafe {
+                    libc::kill(-pgid, libc::SIGKILL);
+                }
+                return true;
             }
-            match tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await {
-                Ok(Ok(_)) => return true,
-                _ => {}
-            }
+            _ => unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            },
         }
     }
-    matches!(child.kill().await, Ok(()))
+    #[cfg(unix)]
+    if child.id().is_some() {
+        return matches!(child.kill().await, Ok(()));
+    }
+    false
 }
 
 async fn resolve_response(inner: &Arc<RpcInner>, mut frame: Value) -> Option<Value> {
@@ -672,5 +736,50 @@ mod tests {
             .expect("late RPC error must be forwarded")
             .unwrap();
         assert_eq!(late["error"], "Model could not start");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_group_shutdown_reaps_descendant() {
+        use std::process::Stdio;
+        let pid_file = std::env::temp_dir().join(format!("omp-pgid-{}", uuid::Uuid::new_v4()));
+        let script = format!("sleep 30 & echo $! > {}; wait", pid_file.display());
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .process_group(0)
+            .arg("-c")
+            .arg(script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let client = RpcClient::attach(
+            child,
+            stdout,
+            stderr,
+            RpcHandlers {
+                on_event: Box::new(|_| {}),
+                on_exit: Box::new(|_, _, _| {}),
+                on_ready: None,
+            },
+        );
+        let descendant: i32 = loop {
+            if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+                break pid.trim().parse().unwrap();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+        client.shutdown().await;
+        for _ in 0..100 {
+            if unsafe { libc::kill(descendant, 0) } != 0 {
+                std::fs::remove_file(pid_file).ok();
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("descendant survived process-group shutdown");
     }
 }

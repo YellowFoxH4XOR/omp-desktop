@@ -12,50 +12,116 @@
 
   let settled: MdSegment[] = [];
   let settledLength = 0;
-  let previousLength = 0;
+  let inspectedLength = 0;
+  let currentLine = '';
+  let openFence: string | undefined;
+  let openFenceStart = 0;
+  let openFenceContentStart = 0;
+  let openFenceLang: string | undefined;
+  let latestBoundary = 0;
+  let activeText = '';
+  let activeSegments: MdSegment[] = [];
+  let previousValue = '';
   let previouslyStreaming = false;
+  const MAX_ACTIVE_CHARS = 16_384;
 
-  // Commit blocks only at blank lines outside fences. The active tail is the
-  // only markdown reparsed on a streaming update; final text parses once in
-  // full so list/reference semantics are authoritative at completion.
-  function stableBoundary(input: string): number {
-    let fence: string | undefined;
-    let length = 0;
-    let boundary = 0;
-    for (const line of input.split('\n')) {
-      const trimmed = line.trimStart();
-      const marker = line.length - trimmed.length <= 3 ? /^(`{3,}|~{3,})/.exec(trimmed)?.[1] : undefined;
-      if (marker) {
-        if (!fence) fence = marker;
-        else if (marker[0] === fence[0] && marker.length >= fence.length) fence = undefined;
+  // Track blank-line boundaries and fences using only newly appended text.
+  // Complete blocks are parsed once; the active tail is capped while a long
+  // paragraph or fence grows. Completion reparses the authoritative full text.
+  function escapeHtml(value: string): string {
+    return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  function activeMarkdownSegments(input: string): MdSegment[] {
+    if (input.length <= MAX_ACTIVE_CHARS) return markdownSegments(input, true);
+    const split = input.length - MAX_ACTIVE_CHARS;
+    return [
+      { kind: 'html', html: `<span>${escapeHtml(input.slice(0, split))}</span>` },
+      ...markdownSegments(input.slice(split), true),
+    ];
+  }
+
+  function inspectAppended(value: string, start: number) {
+    for (let index = start; index < value.length; index += 1) {
+      const character = value[index];
+      if (character !== '\n') {
+        currentLine += character;
+        continue;
       }
-      length += line.length + 1;
-      if (!fence && line.trim() === '' && length <= input.length) boundary = length;
+
+      const trimmed = currentLine.trimStart();
+      const marker = currentLine.length - trimmed.length <= 3
+        ? /^(`{3,}|~{3,})/.exec(trimmed)?.[1]
+        : undefined;
+      if (marker) {
+        if (!openFence) {
+          openFence = marker;
+          openFenceStart = index - currentLine.length;
+          openFenceContentStart = index + 1;
+          openFenceLang = trimmed.slice(marker.length).trim().split(/\s+/, 1)[0] || undefined;
+        } else if (marker[0] === openFence[0] && marker.length >= openFence.length) {
+          openFence = undefined;
+          openFenceStart = 0;
+          openFenceContentStart = 0;
+          openFenceLang = undefined;
+        }
+      }
+      if (!openFence && currentLine.trim() === '') latestBoundary = index + 1;
+      currentLine = '';
     }
-    return boundary;
+    inspectedLength = value.length;
+  }
+
+  function reset() {
+    settled = [];
+    settledLength = 0;
+    inspectedLength = 0;
+    currentLine = '';
+    openFence = undefined;
+    openFenceStart = 0;
+    openFenceContentStart = 0;
+    openFenceLang = undefined;
+    latestBoundary = 0;
+    activeText = '';
+    activeSegments = [];
+    previousValue = '';
+    previouslyStreaming = false;
   }
 
   function renderSegments(value: string, active: boolean): MdSegment[] {
     if (!active) {
-      settled = [];
-      settledLength = 0;
-      previousLength = value.length;
-      previouslyStreaming = false;
+      reset();
+      previousValue = value;
       return markdownSegments(value, false);
     }
-    if (!previouslyStreaming || value.length < previousLength || settledLength > value.length) {
-      settled = [];
-      settledLength = 0;
-    }
+    if (!previouslyStreaming || !value.startsWith(previousValue)) reset();
     previouslyStreaming = true;
-    const tail = value.slice(settledLength);
-    const boundary = stableBoundary(tail);
-    if (boundary > 0) {
-      settled.push(...markdownSegments(tail.slice(0, boundary), false));
-      settledLength += boundary;
+    inspectAppended(value, inspectedLength);
+    previousValue = value;
+
+    if (latestBoundary > settledLength) {
+      settled.push(...markdownSegments(value.slice(settledLength, latestBoundary), false));
+      settledLength = latestBoundary;
     }
-    previousLength = value.length;
-    return [...settled, ...markdownSegments(value.slice(settledLength), true)];
+
+    const nextActiveText = value.slice(settledLength);
+    if (nextActiveText !== activeText) {
+      activeText = nextActiveText;
+      if (openFence) {
+        activeSegments = [
+          ...activeMarkdownSegments(value.slice(settledLength, openFenceStart)),
+          {
+            kind: 'code',
+            code: value.slice(openFenceContentStart),
+            lang: openFenceLang,
+            complete: false,
+          },
+        ];
+      } else {
+        activeSegments = activeMarkdownSegments(nextActiveText);
+      }
+    }
+    return [...settled, ...activeSegments];
   }
   const segments = $derived(renderSegments(text, streaming));
 </script>

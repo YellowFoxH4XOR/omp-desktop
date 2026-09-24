@@ -32,6 +32,8 @@ interface LiveBlock {
 	kind: 'text' | 'thinking' | 'tool';
 	item: ConversationItem;
 	rawArgs: string;
+	/** Snapshot text still expected from deltas that raced get_messages. */
+	seeded?: string;
 }
 
 interface LiveState {
@@ -107,24 +109,68 @@ function normalizeResult(v: unknown): ToolResult | undefined {
 	return r;
 }
 
-function fingerprint(m: RpcMessage): string {
-	const t = m.timestamp ?? 0;
-	if (m.role === 'toolResult') return `tr|${m.toolCallId}|${t}`;
-	if (m.role === 'bashExecution') return `bash|${m.command}|${m.exitCode}|${t}`;
-	const c = m.content;
-	if (typeof c === 'string') return `${m.role}|${t}|s${c.length}`;
-	if (Array.isArray(c)) {
-		let sig = '';
-		for (const b of c) {
-			if (!isRec(b)) continue;
-			sig +=
-				b.type === 'toolCall'
-					? `T${str(b.id)}`
-					: `${b.type}:${(str(b.text) ?? str(b.thinking) ?? '').length};`;
-		}
-		return `${m.role}|${t}|${c.length}|${sig}`;
+function messageIdentity(value: unknown): string | undefined {
+	if (typeof value === 'string' && value) return value;
+	if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+	return undefined;
+}
+
+function stableMessageIdentity(m: RpcMessage): string | undefined {
+	const record = m as unknown as Record<string, unknown>;
+	const id = messageIdentity(record.id) ?? messageIdentity(record.messageId) ?? messageIdentity(record.message_id);
+	return id === undefined ? undefined : `${m.role.length}:${m.role}:${id}`;
+}
+
+function hash128(value: string): string {
+	let a = 0x811c9dc5;
+	let b = 0x9e3779b9;
+	let c = 0x85ebca6b;
+	let d = 0xc2b2ae35;
+	for (let i = 0; i < value.length; i++) {
+		const code = value.charCodeAt(i);
+		a = Math.imul(a ^ code, 0x01000193);
+		b = Math.imul(b ^ code, 0x85ebca6b);
+		c = Math.imul(c ^ code, 0xc2b2ae35);
+		d = Math.imul(d ^ code, 0x27d4eb2f);
 	}
-	return `${m.role}|${t}|${str(m.customType) ?? ''}`;
+	a = Math.imul(a ^ (a >>> 16), 0x7feb352d);
+	b = Math.imul(b ^ (b >>> 15), 0x846ca68b);
+	c = Math.imul(c ^ (c >>> 13), 0x9e3779b1);
+	d = Math.imul(d ^ (d >>> 16), 0x85ebca77);
+	return [a, b, c, d].map(part => (part >>> 0).toString(16).padStart(8, '0')).join('');
+}
+
+function contentSignature(m: RpcMessage): string {
+	if (m.role === 'toolResult') return `tr:${m.toolCallId ?? ''}:${hash128(contentToText(m.content))}`;
+	if (m.role === 'bashExecution') {
+		return `bash:${hash128(m.command ?? '')}:${m.exitCode ?? ''}:${hash128(m.output ?? '')}`;
+	}
+	const blocks = Array.isArray(m.content)
+		? m.content
+		: typeof m.content === 'string'
+			? [{ type: 'text', text: m.content }]
+			: [];
+	const body = blocks.map(block => {
+		if (!isRec(block)) return '?';
+		if (block.type === 'toolCall') {
+			return `T:${str(block.id) ?? ''}:${str(block.name) ?? ''}:${hash128(JSON.stringify(block.arguments ?? {}))}`;
+		}
+		return `${block.type}:${hash128(str(block.text) ?? str(block.thinking) ?? '')}`;
+	}).join(';');
+	return `${body}|${hash128(str(m.customType) ?? '')}`;
+}
+
+/** Identity of the visible message. Usage, stop reason, provider, and model
+ * metadata are excluded: OMP sends the same assistant turn as message_end and
+ * again as turn_end with those fields added. */
+function fingerprint(m: RpcMessage): string {
+	const id = stableMessageIdentity(m);
+	const body = `${m.role}|${m.timestamp ?? ''}|${contentSignature(m)}`;
+	return id ? `id:${id}|${body}` : `content:${body}`;
+}
+
+function visibleFingerprint(m: RpcMessage): string {
+	return `visible:${m.role}|${m.timestamp ?? ''}|${contentSignature(m)}`;
 }
 
 function mapAgentStatus(s: string | undefined): AgentStatus | undefined {
@@ -853,8 +899,10 @@ export class SessionModel {
 
 	#ingestLive(msg: RpcMessage): void {
 		const fp = fingerprint(msg);
-		if (this.#seen.has(fp)) return;
+		const visible = visibleFingerprint(msg);
+		if (this.#seen.has(fp) || (!stableMessageIdentity(msg) && this.#seen.has(visible))) return;
 		this.#markSeen(fp);
+		this.#markSeen(visible);
 		if (msg.role === 'assistant') {
 			this.#reconcileAssistant(msg);
 			return;
@@ -899,7 +947,8 @@ export class SessionModel {
 			const item = this.#sink.pushBlock(b, msg.timestamp, true);
 			if (!item) return;
 			const kind = b.type === 'toolCall' ? 'tool' : b.type === 'thinking' ? 'thinking' : 'text';
-			live.blocks.set(i, { id: item.id, kind, item, rawArgs: '' });
+			const seeded = kind !== 'tool' && 'text' in item ? item.text : undefined;
+			live.blocks.set(i, { id: item.id, kind, item, rawArgs: '', seeded });
 			live.order.push(i);
 		});
 	}
@@ -908,6 +957,11 @@ export class SessionModel {
 		const i = num(ev.contentIndex);
 		if (i !== undefined) return i;
 		return live.order.length ? live.order[live.order.length - 1] : 0;
+	}
+
+	#blockFor(live: LiveState, ev: Record<string, unknown>, kind: LiveBlock['kind']): LiveBlock {
+		const idx = this.#contentIndex(live, ev);
+		return live.blocks.get(idx) ?? this.#createBlock(live, idx, kind, ev);
 	}
 
 	#createBlock(live: LiveState, idx: number, kind: LiveBlock['kind'], ev: Record<string, unknown>): LiveBlock {
@@ -934,11 +988,6 @@ export class SessionModel {
 		live.blocks.set(idx, b);
 		live.order.push(idx);
 		return b;
-	}
-
-	#blockFor(live: LiveState, ev: Record<string, unknown>, kind: LiveBlock['kind']): LiveBlock {
-		const idx = this.#contentIndex(live, ev);
-		return live.blocks.get(idx) ?? this.#createBlock(live, idx, kind, ev);
 	}
 
 	#settleLive(): void {
@@ -983,7 +1032,16 @@ export class SessionModel {
 			case 'text_delta':
 			case 'thinking_delta': {
 				const b = this.#blockFor(live, ev, et === 'text_delta' ? 'text' : 'thinking');
-				(b.item as TextItem).text += str(ev.delta) ?? '';
+				const delta = str(ev.delta) ?? '';
+				if (b.seeded !== undefined) {
+					if (b.seeded.startsWith(delta)) {
+						b.seeded = b.seeded.slice(delta.length);
+						if (!b.seeded) b.seeded = undefined;
+						return;
+					}
+					b.seeded = undefined;
+				}
+				(b.item as TextItem).text += delta;
 				return;
 			}
 			case 'text_end':

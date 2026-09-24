@@ -17,7 +17,7 @@
 </script>
 
 <section class="conversation" aria-label="Conversation">
-  <Transcript items={view.items} agents={view.agents} {onShowChanges} {onShowAgents} />
+  <Transcript items={view.items} agents={view.agents} status={view.status} {onShowChanges} {onShowAgents} />
 
   {#if view.pendingRequests.length > 0}
     <div class="requests" aria-live="polite">

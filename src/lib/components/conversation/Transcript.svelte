@@ -10,18 +10,24 @@
   interface Props {
     items: ConversationItem[];
     agents?: AgentInfo[];
+    status?: string;
     onShowChanges?: (path?: string) => void;
     onShowAgents?: () => void;
   }
 
-  let { items, agents = [], onShowChanges, onShowAgents }: Props = $props();
+  let { items, agents = [], status = 'idle', onShowChanges, onShowAgents }: Props = $props();
 
   let list = $state<VListHandle>();
   let wrap = $state<HTMLDivElement>();
   let stickToBottom = $state(true);
   let virtualCount = $state<number>();
   const renderedCount = $derived(virtualCount ?? items.length);
+  const renderedItems = $derived(
+    renderedCount >= items.length ? items : items.slice(0, renderedCount),
+  );
   let firstItemId: string | undefined;
+  let streamingTextId: string | undefined;
+  let completionAnnouncement = $state('');
 
   // A new array after a live append is still the same transcript. Reset
   // pinning only when navigation changes its first stable item.
@@ -36,10 +42,27 @@
     const distance = list.getScrollSize() - list.getViewportSize() - offset;
     stickToBottom = distance < 80;
   }
-  // While the user reads older messages, defer remounting the virtual list
-  // for new rows. A remount would otherwise reset its measured scroll anchor.
+  // While the user reads older messages, leave newly appended rows out of the
+  // list data. Updating that data preserves VList's measured scroll anchor;
+  // rendering the deferred rows later is an ordinary keyed append.
   $effect(() => {
-    if (stickToBottom) virtualCount = items.length;
+    if (stickToBottom && virtualCount !== items.length) virtualCount = items.length;
+  });
+
+  // Announce only when the run leaves streaming, not when one text block
+  // settles before a tool call or the next content block.
+  let announcedRun = false;
+  $effect(() => {
+    const running = status === 'active' || status === 'waiting';
+    if (running) {
+      announcedRun = true;
+      completionAnnouncement = '';
+      return;
+    }
+    if (announcedRun && (status === 'completed' || status === 'idle' || status === 'failed')) {
+      completionAnnouncement = status === 'failed' ? 'Assistant response failed.' : 'Assistant response complete.';
+      announcedRun = false;
+    }
   });
 
 
@@ -56,8 +79,9 @@
 
   $effect(() => {
     contentSig;
-    if (!stickToBottom || items.length === 0) return;
-    const pin = () => list?.scrollToIndex(items.length - 1, { align: 'end' });
+    const count = renderedItems.length;
+    if (!stickToBottom || count === 0) return;
+    const pin = () => list?.scrollToIndex(count - 1, { align: 'end' });
     let secondFrame = 0;
     const firstFrame = requestAnimationFrame(() => {
       pin();
@@ -74,7 +98,8 @@
     const spacer = wrap?.firstElementChild?.firstElementChild;
     if (!(spacer instanceof HTMLElement)) return;
     const observer = new ResizeObserver(() => {
-      if (stickToBottom && items.length > 0) list?.scrollToIndex(items.length - 1, { align: 'end' });
+      const count = renderedItems.length;
+      if (stickToBottom && count > 0) list?.scrollToIndex(count - 1, { align: 'end' });
     });
     observer.observe(spacer);
     return () => observer.disconnect();
@@ -83,7 +108,9 @@
 
   function scrollToBottom() {
     stickToBottom = true;
-    if (virtualCount === items.length && items.length > 0) list?.scrollToIndex(items.length - 1, { align: 'end' });
+    virtualCount = items.length;
+    if (items.length === 0) return;
+    requestAnimationFrame(() => list?.scrollToIndex(items.length - 1, { align: 'end' }));
   }
 
   type CustomItem = Extract<ConversationItem, { kind: 'custom' | 'notice' | 'advisor' }>;
@@ -119,14 +146,13 @@
     </div>
   {:else}
     <div class="list-wrap" bind:this={wrap}>
-      {#key renderedCount}
       <VList
         bind:this={list}
-        data={items}
+        data={renderedItems}
         getKey={(item) => item.id}
         onscroll={onScroll}
         bufferSize={400}
-        ssrCount={Math.min(renderedCount, 12)}
+        ssrCount={12}
       >
         {#snippet children(item)}
           <div class="row">
@@ -184,7 +210,6 @@
           </div>
         {/snippet}
       </VList>
-      {/key}
     </div>
 
     {#if !stickToBottom}
@@ -193,6 +218,9 @@
       </button>
     {/if}
   {/if}
+  <div class="sr-only" role="status" aria-live="polite" aria-atomic="true">
+    {completionAnnouncement}
+  </div>
 </div>
 
 <style>
@@ -202,6 +230,17 @@
     min-height: 0;
     display: flex;
     flex-direction: column;
+  }
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
   }
   .list-wrap {
     flex: 1;

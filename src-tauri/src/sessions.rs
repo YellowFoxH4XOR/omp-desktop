@@ -45,7 +45,7 @@ pub fn scan_sessions(kind: HarnessKind, cwd: &Path) -> Vec<ScannedSession> {
 
 type CacheEntry = (u64, std::time::SystemTime, ScannedSession);
 static SESSION_CACHE: std::sync::LazyLock<
-    Mutex<std::collections::HashMap<std::path::PathBuf, CacheEntry>>,
+    Mutex<std::collections::HashMap<(HarnessKind, std::path::PathBuf), CacheEntry>>,
 > = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
 /// Parse the head of a session JSONL file.
@@ -56,7 +56,8 @@ fn parse_session_file(kind: HarnessKind, path: &Path) -> Option<ScannedSession> 
     let file = std::fs::File::open(path).ok()?;
     let metadata = file.metadata().ok()?;
     let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
-    if let Some((len, time, session)) = SESSION_CACHE.lock().get(path) {
+    let cache_key = (kind, path.to_path_buf());
+    if let Some((len, time, session)) = SESSION_CACHE.lock().get(&cache_key) {
         if *len == metadata.len() && *time == modified {
             return Some(session.clone());
         }
@@ -70,6 +71,7 @@ fn parse_session_file(kind: HarnessKind, path: &Path) -> Option<ScannedSession> 
     let mut created_at = String::new();
     let mut title = String::new();
     let mut first_user = None;
+    let mut omp_title_slot = false;
     for (index, line) in std::io::BufReader::new(file).lines().enumerate() {
         let Ok(line) = line else { break };
         // After the fixed header, parse only possible title changes and the
@@ -102,6 +104,7 @@ fn parse_session_file(kind: HarnessKind, path: &Path) -> Option<ScannedSession> 
                     .to_string();
             }
             Some("title") => {
+                omp_title_slot = true;
                 if let Some(name) = value.get("title").and_then(Value::as_str) {
                     if !name.trim().is_empty() {
                         title = name.trim().to_string();
@@ -144,6 +147,12 @@ fn parse_session_file(kind: HarnessKind, path: &Path) -> Option<ScannedSession> 
             break;
         }
     }
+    // OMP reserves a fixed-width title slot; Pi does not. In a shared flat
+    // directory this is the reliable discriminator between otherwise
+    // schema-compatible session headers.
+    if (kind == HarnessKind::Omp) != omp_title_slot {
+        return None;
+    }
     if session_id.is_empty() || cwd.is_empty() {
         return None;
     }
@@ -158,10 +167,9 @@ fn parse_session_file(kind: HarnessKind, path: &Path) -> Option<ScannedSession> 
         created_at,
         modified_unix,
     };
-    SESSION_CACHE.lock().insert(
-        path.to_path_buf(),
-        (metadata.len(), modified, session.clone()),
-    );
+    SESSION_CACHE
+        .lock()
+        .insert(cache_key, (metadata.len(), modified, session.clone()));
     Some(session)
 }
 
@@ -374,6 +382,29 @@ mod tests {
                 .title,
             "Investigate race condition"
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn flat_directory_uses_title_slot_to_classify_harness() {
+        let dir = std::env::temp_dir().join(format!("omp-flat-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let omp = dir.join("omp.jsonl");
+        std::fs::write(&omp, "{\"type\":\"title\",\"v\":1,\"title\":\"OMP\"}\n{\"type\":\"session\",\"version\":3,\"id\":\"omp\",\"timestamp\":\"2026-09-23T00:00:00Z\",\"cwd\":\"/tmp/repo\"}\n").unwrap();
+        let pi = dir.join("pi.jsonl");
+        std::fs::write(&pi, "{\"type\":\"session\",\"version\":3,\"id\":\"pi\",\"timestamp\":\"2026-09-23T00:00:00Z\",\"cwd\":\"/tmp/repo\"}\n").unwrap();
+        assert_eq!(
+            parse_session_file(HarnessKind::Omp, &omp)
+                .unwrap()
+                .session_id,
+            "omp"
+        );
+        assert!(parse_session_file(HarnessKind::Pi, &omp).is_none());
+        assert_eq!(
+            parse_session_file(HarnessKind::Pi, &pi).unwrap().session_id,
+            "pi"
+        );
+        assert!(parse_session_file(HarnessKind::Omp, &pi).is_none());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

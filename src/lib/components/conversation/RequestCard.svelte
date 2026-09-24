@@ -80,6 +80,9 @@
     <div class="url-row">
       <code class="url">{request.url}</code>
     </div>
+    {#if request.launchUrl && request.launchUrl !== request.url}
+      <p class="launch-note">Open uses the destination shown above. Copy preserves the harness sign-in shortcut.</p>
+    {/if}
   {/if}
   {#if linkFeedback}<p class="link-feedback" role="status">{linkFeedback}</p>{/if}
 
@@ -141,21 +144,21 @@
           type="button"
           class="btn primary"
           onclick={async () => {
-            const opened = await openExternal(request.launchUrl ?? request.url ?? '');
+            const opened = await openExternal(request.url ?? '');
             if (opened) await respond({ confirmed: true });
-            else linkFeedback = 'Could not open the link. Copy it and open it in your browser.';
+            else linkFeedback = 'Could not open the destination. Copy the sign-in shortcut or use the URL above.';
           }}
         >
-          Open link
+          Open destination
         </button>
         <button type="button" class="btn ghost" onclick={async () => {
           try {
             await navigator.clipboard.writeText(request.launchUrl ?? request.url ?? '');
-            linkFeedback = 'Link copied. Open it in your browser to continue sign-in.';
+            linkFeedback = 'Sign-in shortcut copied. Open it in your browser to continue.';
           } catch {
             linkFeedback = 'Clipboard unavailable; select and copy the URL above.';
           }
-        }}>Copy link</button>
+        }}>Copy sign-in shortcut</button>
         <button type="button" class="btn ghost" onclick={() => respond({ cancelled: true })}>Dismiss</button>
       </div>
     {:else if request.options && request.options.length > 0}
@@ -213,6 +216,11 @@
     font-weight: 600;
     font-size: 12.5px;
     min-width: 0;
+  }
+  .launch-note {
+    margin: 3px 0 0;
+    color: var(--muted);
+    font-size: 10.5px;
   }
   .timeout {
     flex: none;

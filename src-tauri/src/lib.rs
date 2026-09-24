@@ -70,6 +70,7 @@ pub fn run() {
             commands::git_file,
             commands::git_revert_file,
             commands::git_write_if_unchanged,
+            commands::open_changed_file,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

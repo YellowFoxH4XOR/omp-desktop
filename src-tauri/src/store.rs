@@ -339,7 +339,10 @@ impl Store {
     ) -> AppResult<()> {
         let conn = self.conn.lock();
         conn.execute(
-            "UPDATE threads SET session_id = ?2, session_file = ?3 WHERE id = ?1",
+            "UPDATE threads SET
+               session_id = CASE WHEN ?2 != '' THEN ?2 ELSE threads.session_id END,
+               session_file = CASE WHEN ?3 != '' THEN ?3 ELSE threads.session_file END
+             WHERE id = ?1",
             params![id, session_id, session_file],
         )?;
         Ok(())
@@ -387,7 +390,8 @@ impl Store {
         Ok(())
     }
 
-    /// Mark threads whose processes are gone after an app restart.
+    /// Mark interrupted runs disconnected. Idle and completed threads have no
+    /// live process by design and must not look like crashes.
     pub fn mark_all_threads_disconnected(&self) -> AppResult<()> {
         let conn = self.conn.lock();
         conn.execute(
@@ -450,6 +454,83 @@ mod tests {
             assert!(store.get_thread(&thread_id).is_err());
         }
         assert_eq!(std::fs::read_to_string(source).unwrap(), "keep me");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn startup_marks_interrupted_threads_disconnected() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let dir = std::env::temp_dir().join(format!("omp-store-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let project = store
+            .add_project(&dir.to_string_lossy(), "Fixture", HarnessKind::Omp, false)
+            .unwrap();
+        for (index, status) in ["idle", "completed", "active", "waiting"]
+            .iter()
+            .enumerate()
+        {
+            store
+                .upsert_thread(
+                    &format!("thread-{index}"),
+                    &project.id,
+                    HarnessKind::Omp,
+                    "",
+                    "",
+                    &dir.to_string_lossy(),
+                    "",
+                    status,
+                    None,
+                    None,
+                )
+                .unwrap();
+        }
+        store.mark_all_threads_disconnected().unwrap();
+        let statuses: Vec<_> = store
+            .list_threads(&project.id)
+            .unwrap()
+            .into_iter()
+            .map(|thread| thread.status)
+            .collect();
+        assert!(statuses.contains(&"idle".to_string()));
+        assert!(statuses.contains(&"completed".to_string()));
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|status| *status == "disconnected")
+                .count(),
+            2
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn omitted_state_fields_do_not_erase_session_mapping() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let dir = std::env::temp_dir().join(format!("omp-store-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let project = store
+            .add_project(&dir.to_string_lossy(), "Fixture", HarnessKind::Omp, false)
+            .unwrap();
+        store
+            .upsert_thread(
+                "thread",
+                &project.id,
+                HarnessKind::Omp,
+                "session",
+                "/tmp/session.jsonl",
+                &dir.to_string_lossy(),
+                "",
+                "idle",
+                None,
+                None,
+            )
+            .unwrap();
+        store
+            .update_thread_session("thread", "session", "")
+            .unwrap();
+        let thread = store.get_thread("thread").unwrap();
+        assert_eq!(thread.session_id, "session");
+        assert_eq!(thread.session_file, "/tmp/session.jsonl");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
