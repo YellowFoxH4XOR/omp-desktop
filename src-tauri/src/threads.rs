@@ -761,7 +761,17 @@ impl ThreadManager {
                 HarnessKind::Pi => None,
             },
         };
-        let client = Arc::new(RpcClient::attach(child, stdout, stderr, handlers));
+        let frame_limit = match kind {
+            HarnessKind::Omp => crate::rpc::MAX_FRAME_BYTES,
+            HarnessKind::Pi => crate::rpc::MAX_PI_FRAME_BYTES,
+        };
+        let client = Arc::new(RpcClient::attach_with_frame_limit(
+            child,
+            stdout,
+            stderr,
+            handlers,
+            frame_limit,
+        ));
         let live = Arc::new(LiveThread {
             client: client.clone(),
             generation,

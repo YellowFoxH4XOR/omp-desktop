@@ -9,7 +9,8 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
 use tokio::sync::{oneshot, Mutex};
 
-const MAX_FRAME_BYTES: usize = 1_048_576; // 1 MiB per wire frame
+pub const MAX_FRAME_BYTES: usize = 1_048_576; // 1 MiB per OMP wire frame
+pub const MAX_PI_FRAME_BYTES: usize = 8 * 1024 * 1024; // bounded Pi monolithic history frame
 const MAX_REASSEMBLED_BYTES: usize = 67_108_864; // 64 MiB reassembled
 const CHUNK_PAYLOAD_BYTES: usize = 262_144; // 256 KiB per chunk payload
 const STDERR_TAIL_BYTES: usize = 16 * 1024;
@@ -108,10 +109,22 @@ pub struct RpcHandlers {
 impl RpcClient {
     /// Spawn the reader/stderr/monitor tasks around an already-spawned child.
     pub fn attach(
+        child: Child,
+        stdout: ChildStdout,
+        stderr: ChildStderr,
+        handlers: RpcHandlers,
+    ) -> Self {
+        Self::attach_with_frame_limit(child, stdout, stderr, handlers, MAX_FRAME_BYTES)
+    }
+
+    /// Attach with a harness-specific unchunked line ceiling. Pi returns one
+    /// monolithic history frame, while OMP uses chunked v2 frames.
+    pub fn attach_with_frame_limit(
         mut child: Child,
         stdout: ChildStdout,
         stderr: ChildStderr,
         handlers: RpcHandlers,
+        max_frame_bytes: usize,
     ) -> Self {
         let stdin = child.stdin.take().expect("child stdin piped");
         #[cfg(unix)]
@@ -132,7 +145,7 @@ impl RpcClient {
             let inner = inner.clone();
             tokio::spawn(async move {
                 let mut stderr = BufReader::new(stderr);
-                while let Ok(Some(line)) = read_bounded_line(&mut stderr, MAX_FRAME_BYTES).await {
+                while let Ok(Some(line)) = read_bounded_line(&mut stderr, max_frame_bytes).await {
                     let mut tail = inner.stderr_tail.lock().await;
                     tail.push_str(&line);
                     tail.push('\n');
@@ -187,7 +200,7 @@ impl RpcClient {
                 let mut chunk_state: Option<ChunkState> = None;
                 let mut stdout = BufReader::new(stdout);
                 loop {
-                    match read_bounded_line(&mut stdout, MAX_FRAME_BYTES).await {
+                    match read_bounded_line(&mut stdout, max_frame_bytes).await {
                         Ok(Some(line)) => {
                             if line.trim().is_empty() {
                                 continue;
