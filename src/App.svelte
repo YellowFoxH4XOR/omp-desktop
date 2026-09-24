@@ -18,11 +18,21 @@
   interface PendingSessionOpen {
     projectId: string;
     frames: RpcFrame[];
+    estimatedBytes: number;
     discarded: boolean;
+    failure?: Error;
+    reject?: (reason: Error) => void;
     promise?: Promise<OpenedSession>;
   }
 
   const MAX_CACHED_SESSIONS = 8;
+  const MAX_PENDING_SESSION_FRAMES = 1_024;
+  const MAX_PENDING_SESSION_BYTES = 8 * 1024 * 1024;
+  const MAX_INVALIDATED_THREADS = 1_024;
+  const MAX_CRASH_DETAILS = 8;
+  const MAX_CRASH_DETAIL_BYTES = 64 * 1024;
+  const MAX_CRASH_DETAILS_BYTES = 256 * 1024;
+  const utf8Encoder = new TextEncoder();
 
   let projects = $state<Project[]>([]);
   let threadsByProject = $state<Record<string, Thread[]>>({});
@@ -33,6 +43,7 @@
   let errorDetailsOpen = $state(false);
   let activeProject = $state<Project | null>(null);
   let activeThread = $state<Thread | null>(null);
+  let selectedThreadId = $state<string | null>(null);
   let activeSession = $state<SessionModel | null>(null);
   let loadingThread = $state(false);
   let pendingAction = $state(false);
@@ -63,7 +74,8 @@
   const sessionProjects = new Map<string, string>();
   const openingSessions = new Map<string, PendingSessionOpen>();
   const invalidatedProjects = new Set<string>();
-  const stopGeneration = new Map<string, number>();
+  const invalidatedThreads = new Set<string>();
+  const invalidatedThreadOrder: string[] = [];
   const stopping = new Map<string, Promise<void>>();
   let projectSelectionToken = 0;
   let threadSelectionToken = 0;
@@ -75,6 +87,98 @@
     ...(threadsByProject[project.id] ?? []).filter(t => !t.archived).map(thread => ({ kind: 'thread' as const, label: thread.title || 'New thread', subtitle: project.displayName, project, thread }))
   ]).filter(entry => `${entry.label} ${entry.subtitle}`.toLowerCase().includes(switchQuery.toLowerCase())).slice(0, 40));
 
+  function utf8Bytes(value: string): number {
+    return utf8Encoder.encode(value).byteLength;
+  }
+  function jsonStringBytes(value: string, maxBytes: number): number {
+    let bytes = 2;
+    for (const character of value) {
+      const code = character.codePointAt(0)!;
+      if (code === 0x22 || code === 0x5c || code === 0x08 || code === 0x0c || code === 0x0a || code === 0x0d || code === 0x09) bytes += 2;
+      else if (code < 0x20) bytes += 6;
+      else if (code <= 0x7f) bytes += 1;
+      else if (code <= 0x7ff) bytes += 2;
+      else if (code <= 0xffff) bytes += 3;
+      else bytes += 4;
+      if (bytes > maxBytes) break;
+    }
+    return bytes;
+  }
+  function estimateJsonBytes(value: unknown, maxBytes: number, seen = new WeakSet<object>()): number {
+    let bytes = 0;
+    let steps = 0;
+    const visit = (current: unknown, depth = 0): void => {
+      if (bytes > maxBytes || ++steps > 100_000 || depth > 512) { bytes = maxBytes + 1; return; }
+      if (current === null) { bytes += 4; return; }
+      if (typeof current === 'string') { bytes += jsonStringBytes(current, maxBytes); return; }
+      if (typeof current === 'number') { bytes += 24; return; }
+      if (typeof current === 'boolean') { bytes += current ? 4 : 5; return; }
+      if (current === undefined || typeof current === 'function' || typeof current === 'symbol') return;
+      if (typeof current !== 'object') { bytes += 8; return; }
+      if (seen.has(current)) return;
+      seen.add(current);
+      if (Array.isArray(current)) {
+        bytes += 2;
+        for (let index = 0; index < current.length && bytes <= maxBytes; index++) {
+          if (index) bytes += 1;
+          visit(current[index], depth + 1);
+        }
+      } else {
+        bytes += 2;
+        let first = true;
+        for (const key in current) {
+          if (!Object.prototype.hasOwnProperty.call(current, key)) continue;
+          if (!first) bytes += 1;
+          first = false;
+          bytes += jsonStringBytes(key, maxBytes) + 1;
+          visit((current as Record<string, unknown>)[key], depth + 1);
+          if (bytes > maxBytes) break;
+        }
+      }
+    };
+    visit(value);
+    return bytes;
+  }
+  function addInvalidatedThread(threadId: string) {
+    if (invalidatedThreads.has(threadId)) return;
+    invalidatedThreads.add(threadId);
+    invalidatedThreadOrder.push(threadId);
+    while (invalidatedThreadOrder.length > MAX_INVALIDATED_THREADS) invalidatedThreads.delete(invalidatedThreadOrder.shift()!);
+  }
+  function removeInvalidatedThread(threadId: string) {
+    invalidatedThreads.delete(threadId);
+    const index = invalidatedThreadOrder.indexOf(threadId);
+    if (index >= 0) invalidatedThreadOrder.splice(index, 1);
+  }
+  function truncateUtf8(value: string, maxBytes: number): string {
+    if (utf8Bytes(value) <= maxBytes) return value;
+    let low = 0;
+    let high = Math.min(value.length, maxBytes);
+    while (low < high) {
+      const middle = Math.ceil((low + high) / 2);
+      if (utf8Bytes(value.slice(0, middle)) <= maxBytes) low = middle;
+      else high = middle - 1;
+    }
+    return value.slice(0, low);
+  }
+  function recordCrashDetails(threadId: string, stderr: string) {
+    if (invalidatedThreads.has(threadId)) return;
+    const next = { ...crashDetails };
+    delete next[threadId];
+    next[threadId] = truncateUtf8(stderr, MAX_CRASH_DETAIL_BYTES);
+    let keys = Object.keys(next);
+    while (keys.length > MAX_CRASH_DETAILS) {
+      delete next[keys.shift()!];
+      keys = Object.keys(next);
+    }
+    let totalBytes = Object.values(next).reduce((total, value) => total + utf8Bytes(value), 0);
+    while (totalBytes > MAX_CRASH_DETAILS_BYTES && keys.length > 1) {
+      const oldest = keys.shift()!;
+      totalBytes -= utf8Bytes(next[oldest]);
+      delete next[oldest];
+    }
+    crashDetails = next;
+  }
   function errorText(error: unknown): string { return error instanceof Error ? error.message : String(error); }
   function beginPendingAction() {
     pendingActionCount += 1;
@@ -105,24 +209,28 @@
   function stopInactiveSession(threadId: string, expected: SessionModel): boolean {
     if (activeThread?.id === threadId || openingSessions.has(threadId) || !isSessionInactive(expected)) return false;
     cancelIdleStop(threadId);
-    const generation = stopGeneration.get(threadId) ?? 0;
-    const job = api.stopThread(threadId).then(() => {
-      if ((stopGeneration.get(threadId) ?? 0) !== generation) return;
-      if (activeThread?.id === threadId) return;
-      if (removeCachedSession(threadId, expected)) enforceSessionLimit();
-    }).catch(() => {
-      if ((stopGeneration.get(threadId) ?? 0) !== generation) return;
-      if (liveSessions.get(threadId) === expected && activeThread?.id !== threadId) scheduleIdleStop(threadId);
-    }).finally(() => {
+    removeCachedSession(threadId, expected);
+    let job: Promise<void>;
+    job = api.stopThread(threadId).catch(() => undefined).finally(() => {
       if (stopping.get(threadId) === job) stopping.delete(threadId);
     });
     stopping.set(threadId, job);
     return true;
   }
+  function failPendingSessionOpen(threadId: string, pending: PendingSessionOpen, message: string) {
+    if (pending.failure) return;
+    const failure = new Error(message);
+    pending.failure = failure;
+    pending.frames.length = 0;
+    pending.estimatedBytes = 0;
+    pending.reject?.(failure);
+    void api.stopThread(threadId).catch(() => undefined);
+  }
   function enforceSessionLimit() {
-    if (liveSessions.size <= MAX_CACHED_SESSIONS) return;
+    let excess = liveSessions.size - MAX_CACHED_SESSIONS;
     for (const [threadId, model] of liveSessions) {
-      if (stopInactiveSession(threadId, model)) return;
+      if (excess <= 0) return;
+      if (stopInactiveSession(threadId, model)) excess -= 1;
     }
   }
   function applyRpcFrame(threadId: string, frame: RpcFrame) {
@@ -151,26 +259,34 @@
   function openSessionModel(thread: Thread): Promise<OpenedSession> {
     const existing = openingSessions.get(thread.id);
     if (existing?.promise) return existing.promise;
-    const pending: PendingSessionOpen = { projectId: thread.projectId, frames: [], discarded: false };
+    const pending: PendingSessionOpen = { projectId: thread.projectId, frames: [], estimatedBytes: 0, discarded: false };
     openingSessions.set(thread.id, pending);
-    const promise = api.openThread(thread.id).then(snapshot => {
-      if (pending.discarded || invalidatedProjects.has(pending.projectId)) {
+    const promise = new Promise<OpenedSession>((resolve, reject) => {
+      pending.reject = reject;
+      void api.openThread(thread.id).then(snapshot => {
+        if (pending.failure || pending.discarded || invalidatedProjects.has(pending.projectId)) {
+          if (openingSessions.get(thread.id) === pending) openingSessions.delete(thread.id);
+          pending.frames.length = 0;
+          pending.estimatedBytes = 0;
+          throw pending.failure ?? new Error('Thread opening was cancelled because its project was removed.');
+        }
+        if (invalidatedThreads.has(thread.id)) throw new Error('Thread opening was cancelled because the thread is no longer available.');
+        const model = new SessionModel(snapshot);
+        liveSessions.delete(thread.id);
+        liveSessions.set(thread.id, model);
+        sessionProjects.set(thread.id, snapshot.thread.projectId);
+        for (const frame of pending.frames.splice(0)) applyRpcFrame(thread.id, frame);
+        pending.estimatedBytes = 0;
+        if (openingSessions.get(thread.id) === pending) openingSessions.delete(thread.id);
+        enforceSessionLimit();
+        resolve({ model, thread: snapshot.thread });
+      }).catch(error => {
         if (openingSessions.get(thread.id) === pending) openingSessions.delete(thread.id);
         pending.frames.length = 0;
-        throw new Error('Thread opening was cancelled because its project was removed.');
-      }
-      const model = new SessionModel(snapshot);
-      liveSessions.delete(thread.id);
-      liveSessions.set(thread.id, model);
-      sessionProjects.set(thread.id, snapshot.thread.projectId);
-      for (const frame of pending.frames.splice(0)) applyRpcFrame(thread.id, frame);
-      if (openingSessions.get(thread.id) === pending) openingSessions.delete(thread.id);
-      enforceSessionLimit();
-      return { model, thread: snapshot.thread };
-    }, error => {
-      if (openingSessions.get(thread.id) === pending) openingSessions.delete(thread.id);
-      pending.frames.length = 0;
-      throw error;
+        pending.estimatedBytes = 0;
+        if (pending.discarded) removeInvalidatedThread(thread.id);
+        reject(error);
+      });
     });
     pending.promise = promise;
     return promise;
@@ -208,13 +324,24 @@
     idleStopTimers.delete(threadId);
   }
   function handleBackendEvent(event: BackendEvent) {
+    if ('threadId' in event && invalidatedThreads.has(event.threadId)) return;
     if (event.type === 'rpc') {
       const pending = openingSessions.get(event.threadId);
-      if (pending) pending.frames.push(event.frame);
-      else applyRpcFrame(event.threadId, event.frame);
+      if (pending) {
+        if (pending.failure) return;
+        const frameBytes = estimateJsonBytes(event.frame, MAX_PENDING_SESSION_BYTES);
+        if (pending.frames.length >= MAX_PENDING_SESSION_FRAMES || pending.estimatedBytes + frameBytes > MAX_PENDING_SESSION_BYTES) {
+          failPendingSessionOpen(event.threadId, pending, 'Thread opening received too many events and was stopped.');
+          return;
+        }
+        pending.frames.push(event.frame);
+        pending.estimatedBytes += frameBytes;
+      } else {
+        applyRpcFrame(event.threadId, event.frame);
+      }
     } else if (event.type === 'exited') {
       if (!event.expected) {
-        crashDetails[event.threadId] = event.stderr;
+        recordCrashDetails(event.threadId, event.stderr);
         liveSessions.get(event.threadId)?.setError(`${activeThread?.id === event.threadId ? activeThread.harness.toUpperCase() : 'Harness'} stopped unexpectedly. Your visible conversation is preserved.`);
         updateThreadStatus(event.threadId, 'disconnected');
       } else {
@@ -234,7 +361,8 @@
     if (savedTheme === 'light' || savedTheme === 'dark') theme = savedTheme;
     applyTheme();
     let unlisten: (() => void) | undefined;
-    void onBackendEvent(handleBackendEvent).then(fn => { unlisten = fn; }).catch(err => { startupError = errorText(err); });
+    let disposed = false;
+    void onBackendEvent(handleBackendEvent).then(fn => { if (disposed) fn(); else unlisten = fn; }).catch(err => { if (!disposed) startupError = errorText(err); });
     void Promise.allSettled([refreshHarnesses(), refreshProjects()]).then(() => { detecting = false; });
     const onKey = (event: KeyboardEvent) => {
       if (!event.metaKey && event.key !== 'Escape') return;
@@ -264,7 +392,7 @@
     };
     window.addEventListener('mousemove', move);
     window.addEventListener('mouseup', up);
-    return () => { unlisten?.(); window.removeEventListener('keydown', onKey); window.removeEventListener('mousemove', move); window.removeEventListener('mouseup', up); for (const timer of idleStopTimers.values()) clearTimeout(timer); };
+    return () => { disposed = true; unlisten?.(); window.removeEventListener('keydown', onKey); window.removeEventListener('mousemove', move); window.removeEventListener('mouseup', up); for (const timer of idleStopTimers.values()) clearTimeout(timer); idleStopTimers.clear(); };
   });
   function applyTheme() { document.documentElement.dataset.theme = theme === 'system' ? '' : theme; localStorage.setItem('theme', theme); }
   async function refreshHarnesses() { try { harnesses = await api.detectHarnesses(); if (harnesses.length === 1) newHarness = harnesses[0].kind; } catch (error) { startupError = `Could not detect harnesses: ${errorText(error)}`; } }
@@ -293,7 +421,7 @@
     ++threadSelectionToken;
     activeProject = project;
     newHarness = project.preferredHarness;
-    activeThread = null;
+    selectedThreadId = null;
     activeSession = null;
     loadingThread = false;
     rightPanel = null;
@@ -305,19 +433,26 @@
     const selectionToken = beginProjectSelection(project);
     const restoreToken = threadSelectionToken;
     const threads = await refreshThreads(project.id, selectionToken);
+    if (invalidatedProjects.has(project.id) || selectionToken !== projectSelectionToken) return;
     if (selectionToken !== projectSelectionToken || !threads) return;
     if (restore && restoreToken === threadSelectionToken) {
       const savedId = localStorage.getItem('lastThread');
-      const savedThread = threads.find(thread => thread.id === savedId);
-      if (savedThread) await selectThread(savedThread);
+      selectedThreadId = threads.some(thread => thread.id === savedId) ? savedId : null;
     }
   }
   function clearProjectCache(projectId: string) {
     const threadIds = new Set((threadsByProject[projectId] ?? []).map(thread => thread.id));
     for (const [threadId, cachedProjectId] of sessionProjects) if (cachedProjectId === projectId) threadIds.add(threadId);
-    for (const [threadId, pending] of openingSessions) if (pending.projectId === projectId) { pending.discarded = true; threadIds.add(threadId); }
+    for (const [threadId, pending] of openingSessions) {
+      if (pending.projectId !== projectId) continue;
+      pending.discarded = true;
+      threadIds.add(threadId);
+      addInvalidatedThread(threadId);
+      pending.reject?.(new Error('Thread opening was cancelled because its project was removed.'));
+    }
     delete threadsByProject[projectId];
     for (const threadId of threadIds) {
+      addInvalidatedThread(threadId);
       cancelIdleStop(threadId);
       removeCachedSession(threadId);
       delete crashDetails[threadId];
@@ -334,7 +469,7 @@
       const project = await api.addProject(path, availableKinds.has(newHarness) ? newHarness : harnesses[0]?.kind ?? 'omp');
       const existing = projects.find(candidate => candidate.path === project.path);
       if (!existing) projects = [...projects, project];
-      if (projectToken === projectSelectionToken && threadToken === threadSelectionToken) await selectProject(existing ?? project);
+      if (projectToken === projectSelectionToken && threadToken === threadSelectionToken && !invalidatedProjects.has(project.id)) await selectProject(existing ?? project);
     } catch (error) {
       if (projectToken === projectSelectionToken && threadToken === threadSelectionToken) startupError = `Could not add project: ${errorText(error)}`;
     } finally { endPendingAction(); }
@@ -377,19 +512,20 @@
       }
       if (activeProject?.id === project.id && projectToken === projectSelectionToken && threadToken === threadSelectionToken) await selectThread(thread);
     } catch (error) {
-      if (projectToken === projectSelectionToken && threadToken === threadSelectionToken) startupError = `Could not start thread: ${errorText(error)}`;
+      if (projectToken === projectSelectionToken && threadToken === threadSelectionToken && !invalidatedProjects.has(project.id)) startupError = `Could not start thread: ${errorText(error)}`;
     } finally { endPendingAction(); }
   }
   async function selectThread(thread: Thread) {
-    stopGeneration.set(thread.id, (stopGeneration.get(thread.id) ?? 0) + 1);
+    const selectionToken = ++threadSelectionToken;
     const inflightStop = stopping.get(thread.id);
     if (inflightStop) {
       removeCachedSession(thread.id);
       await inflightStop.catch(() => undefined);
+      if (selectionToken !== threadSelectionToken || invalidatedProjects.has(thread.projectId) || invalidatedThreads.has(thread.id)) return;
     }
-    const selectionToken = ++threadSelectionToken;
     leaveCurrentThread(thread.id);
     cancelIdleStop(thread.id);
+    selectedThreadId = thread.id;
     activeThread = thread;
     loadingThread = true;
     rightPanel = null;
@@ -401,17 +537,16 @@
         if (selectionToken === threadSelectionToken) activeSession = cached;
       } else {
         const opened = await openSessionModel(thread);
-        if (selectionToken === threadSelectionToken && activeProject?.id === thread.projectId) {
-          activeThread = opened.thread;
-          activeSession = opened.model;
-        }
+        if (selectionToken !== threadSelectionToken || activeProject?.id !== thread.projectId || invalidatedProjects.has(thread.projectId) || invalidatedThreads.has(thread.id)) return;
+        activeThread = opened.thread;
+        activeSession = opened.model;
       }
       const viewedAt = new Date().toISOString();
       thread.lastViewedAt = viewedAt;
       const row = threadsByProject[thread.projectId]?.find(candidate => candidate.id === thread.id);
       if (row) row.lastViewedAt = viewedAt;
     } catch (error) {
-      if (selectionToken === threadSelectionToken && activeProject?.id === thread.projectId) {
+      if (selectionToken === threadSelectionToken && activeProject?.id === thread.projectId && !invalidatedProjects.has(thread.projectId)) {
         startupError = `Could not open thread: ${errorText(error)}`;
         activeSession = null;
       }
@@ -422,15 +557,19 @@
   async function openPanel(panel: 'changes' | 'agents') {
     if (panel === 'agents' && !activeSession?.view.capabilities.agents) return;
     const threadId = activeThread?.id;
+    const projectId = activeThread?.projectId;
+    const selectionToken = threadSelectionToken;
     rightPanel = panel;
     try {
       if (panel === 'agents' && !AgentsPanel) {
-        AgentsPanel = (await import('$lib/components/agents/AgentsPanel.svelte')).default;
+        const component = (await import('$lib/components/agents/AgentsPanel.svelte')).default;
+        if (activeThread?.id === threadId && activeProject?.id === projectId && rightPanel === panel && threadSelectionToken === selectionToken && !invalidatedProjects.has(projectId ?? '')) AgentsPanel = component;
       } else if (panel === 'changes' && !ChangesPanel) {
-        ChangesPanel = (await import('$lib/components/diff/ChangesPanel.svelte')).default;
+        const component = (await import('$lib/components/diff/ChangesPanel.svelte')).default;
+        if (activeThread?.id === threadId && activeProject?.id === projectId && rightPanel === panel && threadSelectionToken === selectionToken && !invalidatedProjects.has(projectId ?? '')) ChangesPanel = component;
       }
     } catch (error) {
-      if (activeThread?.id === threadId) {
+      if (activeThread?.id === threadId && rightPanel === panel && threadSelectionToken === selectionToken && !invalidatedProjects.has(projectId ?? '')) {
         rightPanel = null;
         startupError = `Could not open ${panel}: ${errorText(error)}`;
       }
@@ -450,36 +589,42 @@
   }
   async function send(message: string, mode: 'prompt' | 'steer' | 'follow_up') {
     const targetThread = activeThread;
-    const selectionToken = threadSelectionToken;
     if (!targetThread) return;
+    const projectId = targetThread.projectId;
+    const selectionToken = threadSelectionToken;
     try {
       await api.sendPrompt(targetThread.id, message, mode);
-      if (activeThread?.id === targetThread.id) startupError = '';
-      if (!targetThread.title || targetThread.title === 'New thread') {
+      if (activeThread?.id === targetThread.id && threadSelectionToken === selectionToken && !invalidatedProjects.has(projectId)) startupError = '';
+      if (!invalidatedProjects.has(projectId) && !invalidatedThreads.has(targetThread.id) && (!targetThread.title || targetThread.title === 'New thread')) {
         const title = message.trim().split('\n')[0].slice(0, 70);
         if (title) await renameThread(targetThread, title, selectionToken);
       }
     } catch (error) {
-      if (activeThread?.id === targetThread.id) startupError = `Could not send message: ${errorText(error)}`;
+      if (activeThread?.id === targetThread.id && threadSelectionToken === selectionToken && !invalidatedProjects.has(projectId)) startupError = `Could not send message: ${errorText(error)}`;
       throw error;
     }
   }
   async function stop() {
     const targetThread = activeThread;
     if (!targetThread) return;
+    const projectId = targetThread.projectId;
+    const selectionToken = threadSelectionToken;
     try { await api.abortThread(targetThread.id); }
-    catch (error) { if (activeThread?.id === targetThread.id) startupError = `Could not stop operation: ${errorText(error)}`; }
+    catch (error) { if (activeThread?.id === targetThread.id && threadSelectionToken === selectionToken && !invalidatedProjects.has(projectId)) startupError = `Could not stop operation: ${errorText(error)}`; }
   }
   async function respond(requestId: string, response: UiResponse) {
     const targetThread = activeThread;
     const targetSession = activeSession;
     if (!targetThread) return;
+    const projectId = targetThread.projectId;
+    const selectionToken = threadSelectionToken;
     try {
       await api.respondUi(targetThread.id, requestId, response);
+      if (invalidatedProjects.has(projectId) || invalidatedThreads.has(targetThread.id)) return;
       targetSession?.dismissRequest(requestId);
       updateThreadStatus(targetThread.id, 'active');
     } catch (error) {
-      if (activeThread?.id === targetThread.id) startupError = `Could not respond: ${errorText(error)}`;
+      if (activeThread?.id === targetThread.id && threadSelectionToken === selectionToken && !invalidatedProjects.has(projectId)) startupError = `Could not respond: ${errorText(error)}`;
       throw error;
     }
   }
@@ -487,31 +632,36 @@
     const targetThread = activeThread;
     const targetSession = activeSession;
     if (!targetThread) return;
+    const projectId = targetThread.projectId;
+    const selectionToken = threadSelectionToken;
     try {
       const snapshot = await api.restartThread(targetThread.id);
+      if (invalidatedProjects.has(projectId) || invalidatedThreads.has(targetThread.id)) return;
       const existing = liveSessions.get(targetThread.id) ?? targetSession;
-      if (existing) {
-        existing.reconnect(snapshot);
-        cacheSession(targetThread.id, snapshot.thread.projectId, existing);
-      } else {
-        cacheSession(targetThread.id, snapshot.thread.projectId, new SessionModel(snapshot));
-      }
+      const model = existing ?? new SessionModel(snapshot);
+      model.reconnect(snapshot);
+      cacheSession(targetThread.id, snapshot.thread.projectId, model);
       Object.assign(targetThread, snapshot.thread);
-      if (activeThread?.id === targetThread.id) {
+      const rows = threadsByProject[snapshot.thread.projectId];
+      const row = rows?.find(candidate => candidate.id === snapshot.thread.id);
+      if (row) Object.assign(row, snapshot.thread);
+      if (activeThread?.id === targetThread.id && activeSession === model && threadSelectionToken === selectionToken) {
         activeThread = snapshot.thread;
-        activeSession = liveSessions.get(targetThread.id) ?? null;
+        activeSession = model;
       }
       delete crashDetails[targetThread.id];
     } catch (error) {
-      if (activeThread?.id === targetThread.id) startupError = `Could not restart session: ${errorText(error)}`;
+      if (activeThread?.id === targetThread.id && activeSession === targetSession && threadSelectionToken === selectionToken && !invalidatedProjects.has(projectId)) startupError = `Could not restart session: ${errorText(error)}`;
     }
   }
   async function renameThread(thread: Thread, title: string, expectedSelectionToken?: number) {
     const clean = title.trim();
     if (expectedSelectionToken === undefined) renaming = null;
     if (!clean) return;
+    const projectId = thread.projectId;
     try {
       const updated = await api.renameThread(thread.id, clean);
+      if (invalidatedProjects.has(projectId) || invalidatedThreads.has(thread.id)) return;
       Object.assign(thread, updated);
       const rows = threadsByProject[updated.projectId];
       const row = rows?.find(candidate => candidate.id === updated.id);
@@ -521,39 +671,49 @@
       }
       if (activeThread?.id === updated.id) Object.assign(activeThread, updated);
     } catch (error) {
-      if (expectedSelectionToken === undefined || expectedSelectionToken === threadSelectionToken) startupError = errorText(error);
+      if (!invalidatedProjects.has(projectId) && (expectedSelectionToken === undefined || expectedSelectionToken === threadSelectionToken)) startupError = errorText(error);
     }
   }
   async function setFlag(thread: Thread, kind: 'pinned' | 'archived') {
+    const projectId = thread.projectId;
     const projectToken = projectSelectionToken;
     const threadToken = threadSelectionToken;
-    try { Object.assign(thread, await api.setThreadFlags(thread.id, kind === 'pinned' ? !thread.pinned : undefined, kind === 'archived' ? !thread.archived : undefined)); }
-    catch (error) {
-      if (projectToken === projectSelectionToken && threadToken === threadSelectionToken) startupError = errorText(error);
+    try {
+      const updated = await api.setThreadFlags(thread.id, kind === 'pinned' ? !thread.pinned : undefined, kind === 'archived' ? !thread.archived : undefined);
+      if (invalidatedProjects.has(projectId) || invalidatedThreads.has(thread.id)) return;
+      Object.assign(thread, updated);
+    } catch (error) {
+      if (projectToken === projectSelectionToken && threadToken === threadSelectionToken && !invalidatedProjects.has(projectId)) startupError = errorText(error);
     }
   }
   async function setModel(value: string) {
     const targetThread = activeThread;
     const targetSession = activeSession;
     if (!targetThread) return;
+    const projectId = targetThread.projectId;
+    const selectionToken = threadSelectionToken;
     const slash = value.indexOf('/'); if (slash < 0) return;
     try {
       const state = await api.setThreadModel(targetThread.id, value.slice(0, slash), value.slice(slash + 1));
-      if (state.model && targetSession) targetSession.view.model = state.model;
-      if (targetSession) targetSession.view.effort = state.thinkingLevel;
+      if (activeThread?.id === targetThread.id && activeSession === targetSession && threadSelectionToken === selectionToken && !invalidatedProjects.has(projectId) && !invalidatedThreads.has(targetThread.id)) {
+        if (state.model && targetSession) targetSession.view.model = state.model;
+        if (targetSession) targetSession.view.effort = state.thinkingLevel;
+      }
     } catch (error) {
-      if (activeThread?.id === targetThread.id) startupError = `Could not change model: ${errorText(error)}`;
+      if (activeThread?.id === targetThread.id && activeSession === targetSession && threadSelectionToken === selectionToken && !invalidatedProjects.has(projectId)) startupError = `Could not change model: ${errorText(error)}`;
     }
   }
   async function setEffort(level: string) {
     const targetThread = activeThread;
     const targetSession = activeSession;
     if (!targetThread) return;
+    const projectId = targetThread.projectId;
+    const selectionToken = threadSelectionToken;
     try {
       const state = await api.setThreadEffort(targetThread.id, level);
-      if (targetSession) targetSession.view.effort = state.thinkingLevel;
+      if (activeThread?.id === targetThread.id && activeSession === targetSession && threadSelectionToken === selectionToken && !invalidatedProjects.has(projectId) && !invalidatedThreads.has(targetThread.id) && targetSession) targetSession.view.effort = state.thinkingLevel;
     } catch (error) {
-      if (activeThread?.id === targetThread.id) startupError = `Could not change effort: ${errorText(error)}`;
+      if (activeThread?.id === targetThread.id && activeSession === targetSession && threadSelectionToken === selectionToken && !invalidatedProjects.has(projectId)) startupError = `Could not change effort: ${errorText(error)}`;
     }
   }
   async function install(kind: HarnessKind) {
@@ -574,29 +734,32 @@
     settingsOpen = true;
     loginProviders = [];
     const targetThread = activeThread;
-    if (targetThread?.harness === 'omp') {
-      try {
-        const providers = await api.getLoginProviders(targetThread.id);
-        if (activeThread?.id === targetThread.id) loginProviders = providers;
-      } catch (error) {
-        if (activeThread?.id === targetThread.id) startupError = `Could not load providers: ${errorText(error)}`;
-      }
+    if (targetThread?.harness !== 'omp') return;
+    const projectId = targetThread.projectId;
+    const selectionToken = threadSelectionToken;
+    try {
+      const providers = await api.getLoginProviders(targetThread.id);
+      if (activeThread?.id === targetThread.id && threadSelectionToken === selectionToken && !invalidatedProjects.has(projectId) && !invalidatedThreads.has(targetThread.id)) loginProviders = providers;
+    } catch (error) {
+      if (activeThread?.id === targetThread.id && threadSelectionToken === selectionToken && !invalidatedProjects.has(projectId)) startupError = `Could not load providers: ${errorText(error)}`;
     }
   }
   async function login(providerId: string) {
     const targetThread = activeThread;
     if (!targetThread) return;
+    const projectId = targetThread.projectId;
+    const selectionToken = threadSelectionToken;
     loggingIn = providerId;
     settingsOpen = false;
     try {
       await api.loginProvider(targetThread.id, providerId);
       const providers = await api.getLoginProviders(targetThread.id);
-      if (activeThread?.id === targetThread.id) {
+      if (activeThread?.id === targetThread.id && threadSelectionToken === selectionToken && !invalidatedProjects.has(projectId) && !invalidatedThreads.has(targetThread.id)) {
         loginProviders = providers;
         settingsOpen = true;
       }
     } catch (error) {
-      if (activeThread?.id === targetThread.id) startupError = `Sign-in failed: ${errorText(error)}`;
+      if (activeThread?.id === targetThread.id && threadSelectionToken === selectionToken && !invalidatedProjects.has(projectId)) startupError = `Sign-in failed: ${errorText(error)}`;
     } finally {
       if (loggingIn === providerId) loggingIn = null;
     }
@@ -680,7 +843,7 @@
                 {#if visible.length}
                   <VList data={visible} getKey={thread => thread.id} style={`height: min(55vh, ${visible.length * 31 + (renaming ? 90 : 0)}px);`}>
                     {#snippet children(thread)}
-                      <div class:active={activeThread?.id === thread.id} class="thread-row">
+                      <div class:active={selectedThreadId === thread.id} class="thread-row">
                         <button class="thread-link" onclick={() => void selectThread(thread)} title={thread.title}>
                           <span class={`status-icon ${thread.status}`} aria-label={thread.status}>{statusMark(thread.status)}</span><span class="thread-title">{thread.title || 'New thread'}</span>
                         </button>

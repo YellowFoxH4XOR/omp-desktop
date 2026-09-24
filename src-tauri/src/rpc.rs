@@ -9,11 +9,14 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
 use tokio::sync::{oneshot, Mutex};
 
-const MAX_FRAME_BYTES: usize = 1_048_576; // 1 MiB per wire frame
+pub const MAX_FRAME_BYTES: usize = 1_048_576; // 1 MiB per OMP wire frame
+pub const MAX_PI_FRAME_BYTES: usize = 8 * 1024 * 1024; // bounded Pi monolithic history frame
 const MAX_REASSEMBLED_BYTES: usize = 67_108_864; // 64 MiB reassembled
 const CHUNK_PAYLOAD_BYTES: usize = 262_144; // 256 KiB per chunk payload
 const STDERR_TAIL_BYTES: usize = 16 * 1024;
 const DEFAULT_CMD_TIMEOUT_SECS: u64 = 60;
+const STDIN_IO_TIMEOUT_SECS: u64 = 10;
+const MAX_PENDING_REQUESTS: usize = 256;
 
 async fn read_bounded_line<R: AsyncBufRead + Unpin>(
     reader: &mut R,
@@ -86,6 +89,9 @@ struct RpcInner {
     exited: AtomicBool,
     expected_exit: AtomicBool,
     stderr_tail: Mutex<String>,
+    /// Process-group id captured before the leader can be reaped. Kept so a
+    /// descendant cannot inherit stdout and keep a dead leader alive.
+    process_group_id: Option<i32>,
 }
 
 /// Callbacks the process supervisor supplies.
@@ -103,12 +109,26 @@ pub struct RpcHandlers {
 impl RpcClient {
     /// Spawn the reader/stderr/monitor tasks around an already-spawned child.
     pub fn attach(
-        mut child: Child,
+        child: Child,
         stdout: ChildStdout,
         stderr: ChildStderr,
         handlers: RpcHandlers,
     ) -> Self {
+        Self::attach_with_frame_limit(child, stdout, stderr, handlers, MAX_FRAME_BYTES)
+    }
+
+    /// Attach with a harness-specific unchunked line ceiling. Pi returns one
+    /// monolithic history frame, while OMP uses chunked v2 frames.
+    pub fn attach_with_frame_limit(
+        mut child: Child,
+        stdout: ChildStdout,
+        stderr: ChildStderr,
+        handlers: RpcHandlers,
+        max_frame_bytes: usize,
+    ) -> Self {
         let stdin = child.stdin.take().expect("child stdin piped");
+        #[cfg(unix)]
+        let process_group_id = child.id().map(|pid| pid as i32);
         let inner = Arc::new(RpcInner {
             stdin: Mutex::new(stdin),
             pending: Mutex::new(HashMap::new()),
@@ -117,13 +137,15 @@ impl RpcClient {
             exited: AtomicBool::new(false),
             expected_exit: AtomicBool::new(false),
             stderr_tail: Mutex::new(String::new()),
+            process_group_id,
         });
+        let on_exit = Arc::new(handlers.on_exit);
         // stderr tail collector
         {
             let inner = inner.clone();
             tokio::spawn(async move {
                 let mut stderr = BufReader::new(stderr);
-                while let Ok(Some(line)) = read_bounded_line(&mut stderr, MAX_FRAME_BYTES).await {
+                while let Ok(Some(line)) = read_bounded_line(&mut stderr, max_frame_bytes).await {
                     let mut tail = inner.stderr_tail.lock().await;
                     tail.push_str(&line);
                     tail.push('\n');
@@ -137,40 +159,68 @@ impl RpcClient {
                 }
             });
         }
-        // stdout reader + exit monitor
+        // Poll the leader independently of stdout. A descendant may inherit
+        // the pipe forever, but it must not make a dead leader reusable.
+        {
+            let inner = inner.clone();
+            let on_exit = on_exit.clone();
+            tokio::spawn(async move {
+                loop {
+                    let status = {
+                        let mut child = inner.child.lock().await;
+                        child.try_wait()
+                    };
+                    match status {
+                        Ok(Some(status)) => {
+                            kill_process_group(inner.process_group_id);
+                            let tail = inner.stderr_tail.lock().await.clone();
+                            mark_exited(&inner, on_exit, status.code(), tail).await;
+                            return;
+                        }
+                        Ok(None) => tokio::time::sleep(std::time::Duration::from_millis(25)).await,
+                        Err(error) => {
+                            let tail = inner.stderr_tail.lock().await.clone();
+                            mark_exited(
+                                &inner,
+                                on_exit,
+                                None,
+                                format!("{tail}\nCould not wait for harness process: {error}"),
+                            )
+                            .await;
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+        // stdout reader. Process exit is supervised independently above.
         {
             let inner = inner.clone();
             tokio::spawn(async move {
                 let mut chunk_state: Option<ChunkState> = None;
                 let mut stdout = BufReader::new(stdout);
                 loop {
-                    match read_bounded_line(&mut stdout, MAX_FRAME_BYTES).await {
+                    match read_bounded_line(&mut stdout, max_frame_bytes).await {
                         Ok(Some(line)) => {
                             if line.trim().is_empty() {
                                 continue;
                             }
-                            let parsed: Result<Value, _> = serde_json::from_str(&line);
-                            let frame = match parsed {
-                                Ok(v) => v,
-                                Err(_) => continue, // non-JSON noise on stdout
+                            let Ok(frame) = serde_json::from_str::<Value>(&line) else {
+                                continue; // non-JSON noise on stdout
                             };
-                            // Reassemble rpc_chunk streams (OMP protocol v2).
                             let frame = match push_chunk(&mut chunk_state, frame) {
-                                Ok(Some(f)) => f,
+                                Ok(Some(frame)) => frame,
                                 Ok(None) => continue,
-                                Err(e) => {
-                                    // Protocol violation: treat as fatal.
+                                Err(error) => {
                                     let tail = inner.stderr_tail.lock().await.clone();
                                     let msg = util::redact_secrets(&if tail.is_empty() {
-                                        format!("RPC protocol error: {e}")
+                                        format!("RPC protocol error: {error}")
                                     } else {
-                                        format!("RPC protocol error: {e}. Stderr: {tail}")
+                                        format!("RPC protocol error: {error}. Stderr: {tail}")
                                     });
-                                    fail_all(&inner, &msg).await;
+                                    mark_exited(&inner, on_exit.clone(), None, msg).await;
                                     let mut child = inner.child.lock().await;
-                                    let _ = terminate_child(&mut child).await;
-                                    drop(child);
-                                    mark_exited(&inner, handlers.on_exit, None, msg).await;
+                                    terminate_child(&mut child, inner.process_group_id).await;
                                     return;
                                 }
                             };
@@ -192,33 +242,22 @@ impl RpcClient {
                                 _ => (handlers.on_event)(frame),
                             }
                         }
-                        Ok(None) => break, // EOF
+                        Ok(None) => {
+                            let tail = inner.stderr_tail.lock().await.clone();
+                            mark_exited(&inner, on_exit.clone(), None, tail).await;
+                            let mut child = inner.child.lock().await;
+                            terminate_child(&mut child, inner.process_group_id).await;
+                            return;
+                        }
                         Err(error) => {
                             let msg = util::redact_secrets(&format!("RPC protocol error: {error}"));
-                            fail_all(&inner, &msg).await;
+                            mark_exited(&inner, on_exit.clone(), None, msg).await;
                             let mut child = inner.child.lock().await;
-                            let _ = terminate_child(&mut child).await;
-                            drop(child);
-                            mark_exited(&inner, handlers.on_exit, None, msg).await;
+                            terminate_child(&mut child, inner.process_group_id).await;
                             return;
                         }
                     }
                 }
-                let code = {
-                    let mut child = inner.child.lock().await;
-                    match tokio::time::timeout(std::time::Duration::from_secs(3), child.wait())
-                        .await
-                    {
-                        Ok(Ok(status)) => status.code(),
-                        _ => {
-                            terminate_child(&mut child).await;
-                            None
-                        }
-                    }
-                };
-                let tail = inner.stderr_tail.lock().await.clone();
-                fail_all(&inner, "Harness process ended").await;
-                mark_exited(&inner, handlers.on_exit, code, tail).await;
             });
         }
         Self { inner }
@@ -261,22 +300,34 @@ impl RpcClient {
         let (tx, rx) = oneshot::channel();
         {
             let mut pending = self.inner.pending.lock().await;
+            if pending.len() >= MAX_PENDING_REQUESTS {
+                return Err(AppError::new(
+                    "Too many harness requests are still pending.",
+                ));
+            }
             pending.insert(id, Pending { tx });
+            if self.inner.exited.load(Ordering::SeqCst) {
+                pending.remove(&id);
+                return Err(AppError::new("The harness process has exited."));
+            }
         }
         args.insert("id".to_string(), json!(id.to_string()));
         args.insert("type".to_string(), json!(command));
         let mut frame = serde_json::to_string(&Value::Object(args))
             .map_err(|e| AppError::new(format!("Could not encode request: {e}")))?;
         frame.push('\n');
-        {
+        let write = async {
             let mut stdin = self.inner.stdin.lock().await;
-            if let Err(e) = stdin.write_all(frame.as_bytes()).await {
-                self.inner.pending.lock().await.remove(&id);
-                return Err(AppError::new(format!(
-                    "Could not write to the harness process: {e}"
-                )));
-            }
-            let _ = stdin.flush().await;
+            stdin.write_all(frame.as_bytes()).await?;
+            stdin.flush().await
+        };
+        if let Err(error) =
+            tokio::time::timeout(std::time::Duration::from_secs(STDIN_IO_TIMEOUT_SECS), write).await
+        {
+            self.inner.pending.lock().await.remove(&id);
+            return Err(AppError::new(format!(
+                "Could not write to the harness process: {error}"
+            )));
         }
         match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx).await {
             Ok(Ok(Ok(data))) => Ok(data),
@@ -299,52 +350,59 @@ impl RpcClient {
         let mut s = serde_json::to_string(&frame)
             .map_err(|e| AppError::new(format!("Could not encode frame: {e}")))?;
         s.push('\n');
-        let mut stdin = self.inner.stdin.lock().await;
-        stdin
-            .write_all(s.as_bytes())
+        let write = async {
+            let mut stdin = self.inner.stdin.lock().await;
+            stdin.write_all(s.as_bytes()).await?;
+            stdin.flush().await
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(STDIN_IO_TIMEOUT_SECS), write)
             .await
-            .map_err(|e| AppError::new(format!("Could not write to the harness process: {e}")))?;
-        let _ = stdin.flush().await;
-        Ok(())
+            .map_err(|_| AppError::new("Timed out writing to the harness process."))?
+            .map_err(|e| AppError::new(format!("Could not write to the harness process: {e}")))
     }
 
     /// Graceful stop: SIGTERM, then SIGKILL after a grace period.
     pub async fn shutdown(&self) {
         self.expect_exit();
         let mut child = self.inner.child.lock().await;
-        terminate_child(&mut child).await;
+        terminate_child(&mut child, self.inner.process_group_id).await;
     }
 }
 
-async fn terminate_child(child: &mut Child) -> bool {
+async fn terminate_child(child: &mut Child, process_group_id: Option<i32>) -> bool {
     #[cfg(unix)]
-    if let Some(pid) = child.id() {
-        let pgid = pid as i32;
-        // The harness is spawned as its own process-group leader. Signal the
-        // group so tools/PTY descendants cannot outlive stop, restart, or app
-        // shutdown. A negative pid targets that group on Unix.
+    if let Some(pgid) = process_group_id {
         unsafe {
             libc::kill(-pgid, libc::SIGTERM);
         }
-        match tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await {
-            Ok(Ok(_)) => {
-                // The leader may exit before one of its descendants. Ensure the
-                // whole group is gone even when wait() returned successfully.
-                unsafe {
-                    libc::kill(-pgid, libc::SIGKILL);
-                }
-                return true;
-            }
-            _ => unsafe {
-                libc::kill(-pgid, libc::SIGKILL);
-            },
+        if matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await,
+            Ok(Ok(_))
+        ) {
+            kill_process_group(process_group_id);
+            return true;
+        }
+        kill_process_group(process_group_id);
+        let _ = child.start_kill();
+        return matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await,
+            Ok(Ok(_))
+        );
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await {
+        Ok(Ok(_)) => true,
+        _ => matches!(child.kill().await, Ok(())),
+    }
+}
+
+fn kill_process_group(process_group_id: Option<i32>) {
+    #[cfg(unix)]
+    if let Some(pgid) = process_group_id {
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
         }
     }
-    #[cfg(unix)]
-    if child.id().is_some() {
-        return matches!(child.kill().await, Ok(()));
-    }
-    false
+    let _ = process_group_id;
 }
 
 async fn resolve_response(inner: &Arc<RpcInner>, mut frame: Value) -> Option<Value> {
@@ -404,13 +462,14 @@ async fn fail_all(inner: &Arc<RpcInner>, msg: &str) {
 
 async fn mark_exited(
     inner: &Arc<RpcInner>,
-    on_exit: Box<dyn Fn(Option<i32>, String, bool) + Send + Sync>,
+    on_exit: Arc<Box<dyn Fn(Option<i32>, String, bool) + Send + Sync>>,
     code: Option<i32>,
     stderr: String,
 ) {
     if inner.exited.swap(true, Ordering::SeqCst) {
         return;
     }
+    fail_all(inner, "Harness process ended").await;
     let expected = inner.expected_exit.load(Ordering::SeqCst);
     on_exit(code, util::redact_secrets(&stderr), expected);
 }

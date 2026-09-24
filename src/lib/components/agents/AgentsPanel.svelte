@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onDestroy } from 'svelte';
   import { api } from '$lib/api';
   import { messagesToItems } from '$lib/session.svelte';
   import Transcript from '$lib/components/conversation/Transcript.svelte';
@@ -175,11 +176,13 @@
   }
 
   // --- Selection + transcript ----------------------------------------------
+  const MAX_DETAIL_ITEMS = 5_000;
   let selectedId = $state<string | null>(null);
   let detailItems = $state<ConversationItem[]>([]);
   let detailLoading = $state(false);
   let detailError = $state<string | null>(null);
   let fetchSeq = 0;
+  let progressTimer: ReturnType<typeof setTimeout> | undefined;
   // Non-reactive: only compared inside the refresh effect.
   let lastFingerprint = '';
 
@@ -198,7 +201,7 @@
     try {
       const messages = await api.getSubagentMessages(view.threadId, agentId);
       if (seq !== fetchSeq) return;
-      detailItems = messagesToItems(messages);
+      detailItems = messagesToItems(messages.slice(-MAX_DETAIL_ITEMS));
     } catch (e) {
       if (seq !== fetchSeq) return;
       detailItems = [];
@@ -209,18 +212,23 @@
   }
 
   // Event-driven refresh: re-fetch the open transcript when the agent's
-  // progress fields change; debounced so event bursts coalesce into one fetch.
+  // progress fields change; coalesce bursts into one request per window.
   $effect(() => {
     const sel = selected;
-    if (!sel || sel.id === MAIN_ID) return;
+    if (!sel || sel.id === MAIN_ID) {
+      clearTimeout(progressTimer);
+      progressTimer = undefined;
+      return;
+    }
     const threadId = view.threadId;
     const fingerprint = fingerprintOf(sel);
     if (fingerprint === lastFingerprint) return;
     lastFingerprint = fingerprint;
-    const timer = setTimeout(() => {
-      if (view.threadId === threadId) void loadTranscript(sel.id);
-    }, 150);
-    return () => clearTimeout(timer);
+    clearTimeout(progressTimer);
+    progressTimer = setTimeout(() => {
+      progressTimer = undefined;
+      if (view.threadId === threadId && selected?.id === sel.id) void loadTranscript(sel.id);
+    }, 250);
   });
 
   // Reset when the panel is reused for a different thread. Invalidate any
@@ -254,13 +262,17 @@
     detailLoading = false;
     lastFingerprint = '';
   }
-
   function retry() {
     const sel = selected;
     if (!sel || sel.id === MAIN_ID) return;
     lastFingerprint = '';
     void loadTranscript(sel.id);
   }
+
+  onDestroy(() => {
+    fetchSeq += 1;
+    clearTimeout(progressTimer);
+  });
 </script>
 
 <aside class="panel" aria-label="Agents">

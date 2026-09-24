@@ -31,11 +31,14 @@ interface Scenario {
   titles?: [string, string];
   openDelay?: Record<string, number>;
   sendDelay?: number;
+  rememberedThreadId?: string;
 }
 
 async function installDesktopMock(page: Page, scenario: Scenario = {}) {
   const [firstTitle, secondTitle] = scenario.titles ?? ['Alpha', 'Beta'];
-  await page.addInitScript(({ project, threads, openDelay, sendDelay }) => {
+  await page.addInitScript(({ project, threads, openDelay, sendDelay, rememberedThreadId }) => {
+    localStorage.setItem('lastProject', project.id);
+    if (rememberedThreadId) localStorage.setItem('lastThread', rememberedThreadId);
     const callbacks = new Map<number, (event: unknown) => void>();
     const listeners = new Map<number, { event: string; handler: number }>();
     const calls: Array<{ command: string; args: Record<string, unknown> }> = [];
@@ -131,6 +134,7 @@ async function installDesktopMock(page: Page, scenario: Scenario = {}) {
     ],
     openDelay: scenario.openDelay ?? {},
     sendDelay: scenario.sendDelay ?? 0,
+    rememberedThreadId: scenario.rememberedThreadId,
   });
 }
 
@@ -147,6 +151,14 @@ test('startup does not spawn a harness and newer thread selection wins', async (
   await page.waitForTimeout(250);
   await expect(page.locator('.top-thread')).toHaveText('Beta');
   await expect(page.getByText('History a')).toHaveCount(0);
+});
+
+test('remembered thread is selected without starting its harness', async ({ page }) => {
+  await installDesktopMock(page, { rememberedThreadId: 'a' });
+  await page.goto('/');
+  await expect(page.getByRole('heading', { name: 'What shall we work on?' })).toBeVisible();
+  await expect(page.locator('.thread-row.active .thread-title')).toHaveText('Alpha');
+  expect(await page.evaluate(() => (window as any).__mockDesktop.calls.filter((call: { command: string }) => call.command === 'open_thread'))).toHaveLength(0);
 });
 
 test('approval emitted while opening remains actionable', async ({ page }) => {

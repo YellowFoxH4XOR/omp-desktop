@@ -204,25 +204,25 @@
   }
 
   async function loadLanguage() {
-    if (path !== langPath) {
-      langPath = path;
+    const requestedPath = path;
+    if (requestedPath !== langPath) {
+      langPath = requestedPath;
       loadedSupport = null;
     }
     if (loadedSupport) return;
     const seq = buildSeq;
-    const support = await languageFor(path);
+    const support = await languageFor(requestedPath);
     if (!support || seq !== buildSeq || !hostEl?.isConnected) return;
     loadedSupport = support;
-    // Rebuild so unified deleted-chunk widgets (rendered lazily, capturing the
-    // language facet at build time) pick up the grammar too.
-    const scroller = activeView()?.scrollDOM;
-    const top = scroller?.scrollTop ?? 0;
-    const left = scroller?.scrollLeft ?? 0;
-    build();
-    const scroller2 = activeView()?.scrollDOM;
-    if (scroller2) {
-      scroller2.scrollTop = top;
-      scroller2.scrollLeft = left;
+    // Language is isolated in a compartment. Reconfigure the existing editor
+    // instead of rebuilding the entire diff view when a grammar finishes
+    // loading, preserving undo/scroll/merge widget state.
+    const language = [support];
+    if (mergeView) {
+      mergeView.a.dispatch({ effects: langCompartment.reconfigure(language) });
+      mergeView.b.dispatch({ effects: langCompartment.reconfigure(language) });
+    } else {
+      view?.dispatch({ effects: langCompartment.reconfigure(language) });
     }
   }
 

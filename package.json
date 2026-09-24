@@ -15,7 +15,7 @@
     "test": "vitest run --exclude 'tests/e2e/**'",
     "test:watch": "vitest --exclude 'tests/e2e/**'",
     "test:e2e": "playwright test tests/e2e --pass-with-no-tests",
-    "test:rust": "cd src-tauri && cargo test --lib --locked",
+    "test:rust": "cd src-tauri && cargo test --locked",
     "validate": "./scripts/validate.sh",
     "bundle:macos": "bun run tauri build --bundles app && ./scripts/sign-macos-bundle.sh"
   },

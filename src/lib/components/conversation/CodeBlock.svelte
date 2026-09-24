@@ -24,6 +24,7 @@
     }
     const source = code;
     const language = lang;
+    html = null;
     let stale = false;
     void highlightCode(source, language).then((result) => {
       if (!stale) html = result ? sanitizeHtml(result) : null;
@@ -56,6 +57,10 @@
   </div>
   {#if html}
     <div class="shiki-wrap">{@html html}</div>
+  {:else if !complete}
+    <!-- Keep an open fence as text while it streams; replacing a growing HTML
+         string on every token defeats incremental rendering and can flicker. -->
+    <div class="shiki-wrap"><pre class="shiki-plain"><code>{code}</code></pre></div>
   {:else}
     <div class="shiki-wrap">{@html plainCodeHtml(code)}</div>
   {/if}

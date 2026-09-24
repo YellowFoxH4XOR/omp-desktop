@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onDestroy } from 'svelte';
   import { VList, type VListHandle } from 'virtua/svelte';
   import { Brain, ChevronDown, ChevronRight, Info, Sparkles, TriangleAlert } from '@lucide/svelte';
   import type { AgentInfo, ConversationItem } from '../../types';
@@ -25,9 +26,22 @@
   const renderedItems = $derived(
     renderedCount >= items.length ? items : items.slice(0, renderedCount),
   );
+  let pinFrame: number | undefined;
   let firstItemId: string | undefined;
-  let streamingTextId: string | undefined;
   let completionAnnouncement = $state('');
+
+  function scheduleBottomPin() {
+    if (pinFrame !== undefined) return;
+    pinFrame = requestAnimationFrame(() => {
+      pinFrame = undefined;
+      const count = renderedItems.length;
+      if (stickToBottom && count > 0) list?.scrollToIndex(count - 1, { align: 'end' });
+    });
+  }
+
+  onDestroy(() => {
+    if (pinFrame !== undefined) cancelAnimationFrame(pinFrame);
+  });
 
   // A new array after a live append is still the same transcript. Reset
   // pinning only when navigation changes its first stable item.
@@ -79,18 +93,7 @@
 
   $effect(() => {
     contentSig;
-    const count = renderedItems.length;
-    if (!stickToBottom || count === 0) return;
-    const pin = () => list?.scrollToIndex(count - 1, { align: 'end' });
-    let secondFrame = 0;
-    const firstFrame = requestAnimationFrame(() => {
-      pin();
-      secondFrame = requestAnimationFrame(pin);
-    });
-    return () => {
-      cancelAnimationFrame(firstFrame);
-      cancelAnimationFrame(secondFrame);
-    };
+    if (stickToBottom) scheduleBottomPin();
   });
   // CodeMirror/tool cards and virtual rows change height after mount. Follow
   // those measurements only while the user is at the bottom, without polling.
@@ -98,8 +101,7 @@
     const spacer = wrap?.firstElementChild?.firstElementChild;
     if (!(spacer instanceof HTMLElement)) return;
     const observer = new ResizeObserver(() => {
-      const count = renderedItems.length;
-      if (stickToBottom && count > 0) list?.scrollToIndex(count - 1, { align: 'end' });
+      if (stickToBottom) scheduleBottomPin();
     });
     observer.observe(spacer);
     return () => observer.disconnect();
@@ -109,8 +111,7 @@
   function scrollToBottom() {
     stickToBottom = true;
     virtualCount = items.length;
-    if (items.length === 0) return;
-    requestAnimationFrame(() => list?.scrollToIndex(items.length - 1, { align: 'end' }));
+    scheduleBottomPin();
   }
 
   type CustomItem = Extract<ConversationItem, { kind: 'custom' | 'notice' | 'advisor' }>;
