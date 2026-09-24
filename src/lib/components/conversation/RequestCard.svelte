@@ -15,6 +15,7 @@
   let answered = $state(false);
   let secondsLeft = $state<number | null>(null);
   let linkFeedback = $state('');
+  let responding = false;
 
   const isSecret = $derived(/password|secret|token|api[-_ ]?key|credential|auth code|oauth/i.test(
     `${request.title} ${request.message ?? ''} ${request.placeholder ?? ''}`,
@@ -23,6 +24,7 @@
   $effect(() => {
     text = request.prefill ?? '';
     answered = false;
+    responding = false;
     linkFeedback = '';
   });
 
@@ -41,10 +43,16 @@
   });
 
   async function respond(response: UiResponse) {
-    if (answered) return;
+    const requestId = request.id;
+    if (answered || responding) return;
     answered = true;
-    try { await onRespond(request.id, response); }
-    catch { answered = false; }
+    responding = true;
+    try { await onRespond(requestId, response); }
+    catch {
+      if (request.id === requestId) answered = false;
+    } finally {
+      if (request.id === requestId) responding = false;
+    }
   }
 
   /** Compact arg summary: scalar values inline, rest in the disclosure. */
@@ -144,19 +152,33 @@
           type="button"
           class="btn primary"
           onclick={async () => {
-            const opened = await openExternal(request.url ?? '');
-            if (opened) await respond({ confirmed: true });
-            else linkFeedback = 'Could not open the destination. Copy the sign-in shortcut or use the URL above.';
+            if (answered || responding) return;
+            responding = true;
+            const requestId = request.id;
+            try {
+              const opened = await openExternal(request.url ?? '');
+              if (request.id !== requestId) return;
+              if (opened) {
+                answered = true;
+                try { await onRespond(requestId, { confirmed: true }); }
+                catch { if (request.id === requestId) answered = false; }
+              } else {
+                linkFeedback = 'Could not open the destination. Copy the sign-in shortcut or use the URL above.';
+              }
+            } finally {
+              if (request.id === requestId) responding = false;
+            }
           }}
         >
           Open destination
         </button>
         <button type="button" class="btn ghost" onclick={async () => {
+          const requestId = request.id;
           try {
             await navigator.clipboard.writeText(request.launchUrl ?? request.url ?? '');
-            linkFeedback = 'Sign-in shortcut copied. Open it in your browser to continue.';
+            if (request.id === requestId) linkFeedback = 'Sign-in shortcut copied. Open it in your browser to continue.';
           } catch {
-            linkFeedback = 'Clipboard unavailable; select and copy the URL above.';
+            if (request.id === requestId) linkFeedback = 'Clipboard unavailable; select and copy the URL above.';
           }
         }}>Copy sign-in shortcut</button>
         <button type="button" class="btn ghost" onclick={() => respond({ cancelled: true })}>Dismiss</button>

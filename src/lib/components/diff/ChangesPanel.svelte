@@ -67,6 +67,7 @@
   let copied = $state<'path' | 'selection' | null>(null);
 
   let fileSeq = 0;
+  let refreshSeq = 0;
   let refreshTimer: ReturnType<typeof setTimeout> | undefined;
   let noticeTimer: ReturnType<typeof setTimeout> | undefined;
   let copiedTimer: ReturnType<typeof setTimeout> | undefined;
@@ -153,15 +154,16 @@
 
   async function loadFile(path: string) {
     const seq = ++fileSeq;
+    const threadId = thread.id;
     fileLoading = true;
     fileError = null;
     try {
-      const f = await api.gitFile(thread.id, path);
-      if (seq !== fileSeq || selectedPath !== path) return;
+      const f = await api.gitFile(threadId, path);
+      if (seq !== fileSeq || selectedPath !== path || thread.id !== threadId) return;
       gitFile = f;
       fileEol = { orig: detectEol(f.old), cur: detectEol(f.current) };
     } catch (err) {
-      if (seq !== fileSeq || selectedPath !== path) return;
+      if (seq !== fileSeq || selectedPath !== path || thread.id !== threadId) return;
       gitFile = null;
       fileError = errorMessage(err);
     } finally {
@@ -177,12 +179,13 @@
     fileError = null;
     void loadFile(path);
   }
-
   /** Reload the changed-file list and the open file. Exported as a refresh hook. */
   export async function refresh() {
+    const seq = ++refreshSeq;
     refreshing = true;
     try {
       const s = await api.gitStatus(thread.id);
+      if (seq !== refreshSeq) return;
       summary = s;
       error = null;
       if (!s.isRepo) {
@@ -208,10 +211,12 @@
       }
       if (requestedPath) lastFocus = requestedPath;
     } catch (err) {
-      error = errorMessage(err);
+      if (seq === refreshSeq) error = errorMessage(err);
     } finally {
-      loading = false;
-      refreshing = false;
+      if (seq === refreshSeq) {
+        loading = false;
+        refreshing = false;
+      }
     }
   }
 
@@ -318,6 +323,8 @@
 
     return () => {
       disposed = true;
+      refreshSeq += 1;
+      fileSeq += 1;
       unlisten?.();
       ro.disconnect();
       clearTimeout(refreshTimer);

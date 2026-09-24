@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 use tokio::process::Command;
-use tokio::sync::Notify;
+use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 /// Idle threads are suspended after this long without activity.
 const IDLE_SUSPEND: Duration = Duration::from_secs(15 * 60);
@@ -29,6 +29,10 @@ const READY_TIMEOUT_SECS: u64 = 30;
 const PI_READY_TIMEOUT_SECS: u64 = 45;
 /// Login flows can wait on user interaction.
 const LOGIN_TIMEOUT_SECS: u64 = 600;
+/// Hard cap prevents an unbounded number of live harness process trees.
+const MAX_LIVE_THREADS: usize = 16;
+/// Same-thread prompts are serialized so an older failed/reservation release
+/// cannot tear down a newer accepted turn.
 
 pub struct LiveThread {
     client: Arc<RpcClient>,
@@ -194,13 +198,21 @@ pub struct ThreadManager {
     watcher: Arc<WatcherManager>,
     app: AppHandle,
     live: Arc<Mutex<HashMap<String, Arc<LiveThread>>>>,
-    /// Threads currently being spawned (prevents double-spawn races).
-    spawning: Mutex<std::collections::HashSet<String>>,
+    /// One async lock per thread serializes spawn/stop and prompt calls. The
+    /// entry is retained so stop/shutdown can join an in-flight spawn.
+    lifecycles: Arc<Mutex<HashMap<String, Arc<ThreadLocks>>>>,
     next_generation: AtomicU64,
     /// Exclusive owner of a non-isolated checkout. A reservation is made
     /// before a prompt starts and lives until that turn becomes terminal or
     /// its process exits.
     checkout_owners: Arc<Mutex<HashMap<String, String>>>,
+    shutting_down: AtomicBool,
+    live_admissions: Mutex<usize>,
+}
+
+struct ThreadLocks {
+    lifecycle: AsyncMutex<()>,
+    prompt: AsyncMutex<()>,
 }
 
 impl ThreadManager {
@@ -216,9 +228,11 @@ impl ThreadManager {
             watcher,
             app,
             live: Arc::new(Mutex::new(HashMap::new())),
-            spawning: Mutex::new(std::collections::HashSet::new()),
+            lifecycles: Arc::new(Mutex::new(HashMap::new())),
             next_generation: AtomicU64::new(1),
             checkout_owners: Arc::new(Mutex::new(HashMap::new())),
+            shutting_down: AtomicBool::new(false),
+            live_admissions: Mutex::new(0),
         })
     }
     fn touch_activity(&self, thread_id: &str) {
@@ -232,6 +246,39 @@ impl ThreadManager {
             l.streaming.store(streaming, Ordering::SeqCst);
             l.note_activity();
         }
+    }
+    fn thread_locks(&self, thread_id: &str) -> Arc<ThreadLocks> {
+        self.lifecycles
+            .lock()
+            .entry(thread_id.to_string())
+            .or_insert_with(|| {
+                Arc::new(ThreadLocks {
+                    lifecycle: AsyncMutex::new(()),
+                    prompt: AsyncMutex::new(()),
+                })
+            })
+            .clone()
+    }
+
+    fn admit_live(&self, thread_id: &str) -> AppResult<()> {
+        let mut live = self.live.lock();
+        live.retain(|_, process| !process.client.is_exited());
+        if live.contains_key(thread_id) {
+            return Ok(());
+        }
+        let mut admissions = self.live_admissions.lock();
+        if live.len() + *admissions >= MAX_LIVE_THREADS {
+            return Err(AppError::new(
+                "The app has reached its live session limit. Stop a session and try again.",
+            ));
+        }
+        *admissions += 1;
+        Ok(())
+    }
+
+    fn finish_live_admission(&self) {
+        let mut admissions = self.live_admissions.lock();
+        *admissions = admissions.saturating_sub(1);
     }
 
     fn checkout_key(cwd: &str) -> String {
@@ -391,39 +438,25 @@ impl ThreadManager {
     /// Spawn (or resume) the harness process for a thread. Returns the live
     /// handle. Idempotent: returns the existing process when still running.
     pub async fn ensure_running(&self, thread_id: &str) -> AppResult<Arc<LiveThread>> {
-        if let Some(l) = Self::take_reusable_live(&self.live, thread_id) {
-            l.note_activity();
-            return Ok(l);
+        // Register the lifecycle before checking the shutdown flag. This makes
+        // shutdown_all's snapshot include every operation that passed the
+        // pre-shutdown check, while the second check still prevents spawning
+        // once shutdown has started.
+        let locks = self.thread_locks(thread_id);
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return Err(AppError::new("The app is shutting down."));
         }
-        // Serialize concurrent spawns for the same thread.
-        let already_spawning = {
-            let mut spawning = self.spawning.lock();
-            if spawning.contains(thread_id) {
-                true
-            } else {
-                spawning.insert(thread_id.to_string());
-                false
-            }
-        };
-        if already_spawning {
-            // Never return a mapped handle until the reader has observed exit.
-            for _ in 0..200 {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                if let Some(l) = Self::take_reusable_live(&self.live, thread_id) {
-                    return Ok(l);
-                }
-                if !self.spawning.lock().contains(thread_id) {
-                    return Err(AppError::new(
-                        "The session failed to start. Try again in a moment.",
-                    ));
-                }
-            }
-            return Err(AppError::new(
-                "The session is still starting. Try again in a moment.",
-            ));
+        let _lifecycle = locks.lifecycle.lock().await;
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return Err(AppError::new("The app is shutting down."));
         }
+        if let Some(live) = Self::take_reusable_live(&self.live, thread_id) {
+            live.note_activity();
+            return Ok(live);
+        }
+        self.admit_live(thread_id)?;
         let result = self.spawn(thread_id).await;
-        self.spawning.lock().remove(thread_id);
+        self.finish_live_admission();
         result
     }
 
@@ -884,13 +917,18 @@ impl ThreadManager {
 
     /// Graceful stop: SIGTERM → SIGKILL; emits `exited` with expected=true.
     pub async fn stop(&self, thread_id: &str) -> AppResult<()> {
+        let locks = self.thread_locks(thread_id);
+        let _prompt = locks.prompt.lock().await;
+        let _lifecycle = locks.lifecycle.lock().await;
         let live = self.live.lock().remove(thread_id);
-        if let Some(l) = live {
-            l.cancel_idle_watch();
-            l.client.expect_exit();
+        if let Some(live) = live {
+            live.cancel_idle_watch();
+            live.client.expect_exit();
             self.watcher.unwatch(thread_id);
-            self.release_checkout(&self.store.get_thread(thread_id)?.cwd, thread_id);
-            l.client.shutdown().await;
+            live.client.shutdown().await;
+            if let Ok(row) = self.store.get_thread(thread_id) {
+                self.release_checkout(&row.cwd, thread_id);
+            }
         }
         self.set_status(thread_id, "idle");
         Ok(())
@@ -1074,6 +1112,8 @@ impl ThreadManager {
     // ------------------------------------------------------------------
 
     pub async fn send_prompt(&self, thread_id: &str, message: &str, mode: &str) -> AppResult<()> {
+        let locks = self.thread_locks(thread_id);
+        let _prompt = locks.prompt.lock().await;
         let row = self.store.get_thread(thread_id)?;
         let key = Self::checkout_key(&row.cwd);
         let already_owned = self
@@ -1201,20 +1241,18 @@ impl ThreadManager {
         request_id: &str,
         response: crate::dto::UiResponse,
     ) -> AppResult<()> {
-        // Fire-and-forget requests (open_url, widgets) never expect a response;
-        // the UI only acknowledges them locally.
-        if let Some(l) = self.live.lock().get(thread_id) {
-            if l.ui_fire_and_forget.lock().remove(request_id) {
-                return Ok(());
-            }
-            l.pending_ui_requests.lock().remove(request_id);
-            l.note_activity();
+        // Capture one incarnation and keep its request tracked until the frame
+        // is accepted by that exact client. A replacement can never inherit
+        // this response.
+        let live = self.live.lock().get(thread_id).cloned().ok_or_else(|| {
+            AppError::new("The session is no longer running; the request has expired.")
+        })?;
+        if live.ui_fire_and_forget.lock().remove(request_id) {
+            return Ok(());
         }
-        let Some(client) = self.live_client(thread_id) else {
-            return Err(AppError::new(
-                "The session is no longer running; the request has expired.",
-            ));
-        };
+        if !live.pending_ui_requests.lock().contains(request_id) {
+            return Err(AppError::new("The UI request has already expired."));
+        }
         let mut frame = Map::from_iter([
             ("type".into(), json!("extension_ui_response")),
             ("id".into(), json!(request_id)),
@@ -1228,8 +1266,17 @@ impl ThreadManager {
         if let Some(c) = response.cancelled {
             frame.insert("cancelled".into(), json!(c));
         }
-        client.send(Value::Object(frame)).await?;
-        self.set_status(thread_id, "active");
+        live.client.send(Value::Object(frame)).await?;
+        live.pending_ui_requests.lock().remove(request_id);
+        live.note_activity();
+        if self
+            .live
+            .lock()
+            .get(thread_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &live))
+        {
+            self.set_status(thread_id, "active");
+        }
         Ok(())
     }
 
@@ -1402,20 +1449,24 @@ impl ThreadManager {
 
     /// Stop every live process (app shutdown).
     pub async fn shutdown_all(&self) {
-        let lives: Vec<(String, Arc<LiveThread>)> = self
-            .live
+        self.shutting_down.store(true, Ordering::SeqCst);
+        let entries: Vec<(String, Arc<ThreadLocks>)> = self
+            .lifecycles
             .lock()
             .iter()
-            .map(|(id, live)| (id.clone(), live.clone()))
+            .map(|(id, locks)| (id.clone(), locks.clone()))
             .collect();
-        for (id, live) in lives {
-            live.cancel_idle_watch();
-            live.client.expect_exit();
-            self.watcher.unwatch(&id);
-            if let Ok(row) = self.store.get_thread(&id) {
-                self.release_checkout(&row.cwd, &id);
+        for (id, locks) in entries {
+            let _lifecycle = locks.lifecycle.lock().await;
+            if let Some(live) = self.live.lock().remove(&id) {
+                live.cancel_idle_watch();
+                live.client.expect_exit();
+                self.watcher.unwatch(&id);
+                live.client.shutdown().await;
+                if let Ok(row) = self.store.get_thread(&id) {
+                    self.release_checkout(&row.cwd, &id);
+                }
             }
-            live.client.shutdown().await;
         }
     }
 }

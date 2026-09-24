@@ -40,6 +40,51 @@ fn git(cwd: &Path, args: &[&str]) -> AppResult<std::process::Output> {
     Ok(out)
 }
 
+const MAX_CHANGED_FILE_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+
+/// Collect bounded command output without allowing `Command::output` to buffer
+/// an attacker-controlled status or diff response in memory.
+fn git_ok_capped(cwd: &Path, args: &[&str], cap: usize) -> AppResult<Vec<u8>> {
+    use std::io::Read;
+
+    let mut child = Command::new("git")
+        .arg("--literal-pathspecs")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| AppError::new(format!("Could not run git: {e}")))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| AppError::new("Could not read git output."))?
+        .take((cap + 1) as u64);
+    let mut output = Vec::with_capacity(cap.min(64 * 1024));
+    stdout
+        .read_to_end(&mut output)
+        .map_err(|e| AppError::new(format!("Could not read git output: {e}")))?;
+    if output.len() > cap {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(AppError::new(format!(
+            "git {} output exceeded the {cap}-byte safety limit.",
+            args.first().copied().unwrap_or("")
+        )));
+    }
+    let status = child
+        .wait()
+        .map_err(|e| AppError::new(format!("Could not finish git: {e}")))?;
+    if !status.success() {
+        return Err(AppError::new(format!(
+            "git {} failed.",
+            args.first().copied().unwrap_or("")
+        )));
+    }
+    Ok(output)
+}
 fn git_ok(cwd: &Path, args: &[&str]) -> AppResult<Vec<u8>> {
     let out = git(cwd, args)?;
     if !out.status.success() {
@@ -139,15 +184,20 @@ fn status_at(root: &Path) -> AppResult<ChangesSummary> {
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .filter(|b| !b.is_empty() && b != "HEAD");
-    let porcelain = git_ok(
+    let porcelain = git_ok_capped(
         root,
         &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        MAX_CHANGED_FILE_OUTPUT_BYTES,
     )?;
     let has_head = git(root, &["rev-parse", "--verify", "HEAD"])
         .map(|o| o.status.success())
         .unwrap_or(false);
     let numstat_map = if has_head {
-        parse_numstat(&git_ok(root, &["diff", "--numstat", "-z", "HEAD", "--"])?)
+        parse_numstat(&git_ok_capped(
+            root,
+            &["diff", "--numstat", "-z", "HEAD", "--"],
+            MAX_CHANGED_FILE_OUTPUT_BYTES,
+        )?)
     } else {
         std::collections::HashMap::new()
     };
@@ -182,9 +232,10 @@ fn status_at(root: &Path) -> AppResult<ChangesSummary> {
 /// Review commands operate only on files Git currently reports as changed.
 /// This prevents the webview from turning a diff action into arbitrary writes.
 fn ensure_changed_path_at(root: &Path, rel: &str) -> AppResult<()> {
-    let porcelain = git_ok(
+    let porcelain = git_ok_capped(
         root,
         &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        MAX_CHANGED_FILE_OUTPUT_BYTES,
     )?;
     if !parse_porcelain(&porcelain)
         .iter()
@@ -310,6 +361,14 @@ fn open_checked_file(root: &Path, abs: &Path) -> AppResult<std::fs::File> {
 }
 
 #[cfg(unix)]
+fn unlink_at(parent: &std::fs::File, name: &std::ffi::CString) {
+    use std::os::fd::AsRawFd;
+    unsafe {
+        libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0);
+    }
+}
+
+#[cfg(unix)]
 fn write_checked_unix(
     root: &Path,
     abs: &Path,
@@ -382,7 +441,7 @@ fn write_checked_unix(
         .write_all(content.as_bytes())
         .and_then(|_| temp.sync_all());
     if let Err(error) = write_result {
-        let _ = std::fs::remove_file(parent.join(&temp_name));
+        unlink_at(&parent_dir, &temp_c);
         return Err(AppError::new(format!("Could not write file: {error}")));
     }
 
@@ -390,23 +449,23 @@ fn write_checked_unix(
         let mut original = match open_checked_file(root, abs) {
             Ok(file) => file,
             Err(error) => {
-                let _ = std::fs::remove_file(parent.join(&temp_name));
+                unlink_at(&parent_dir, &temp_c);
                 return Err(error);
             }
         };
         if let Err(error) = original.seek(SeekFrom::Start(0)) {
-            let _ = std::fs::remove_file(parent.join(&temp_name));
+            unlink_at(&parent_dir, &temp_c);
             return Err(AppError::new(format!("Could not recheck file: {error}")));
         }
         let after = match hash_reader(root, &mut original) {
             Ok(hash) => hash,
             Err(error) => {
-                let _ = std::fs::remove_file(parent.join(&temp_name));
+                unlink_at(&parent_dir, &temp_c);
                 return Err(error);
             }
         };
         if after != expected_hash {
-            let _ = std::fs::remove_file(parent.join(&temp_name));
+            unlink_at(&parent_dir, &temp_c);
             return Err(AppError::new(
                 "The file changed on disk while saving. Refresh the diff and try again.",
             ));
@@ -437,17 +496,21 @@ fn atomic_replace(
 ) -> AppResult<()> {
     use std::os::fd::AsRawFd;
     if !current_was_present {
+        // `renameat` replaces a destination created after the initial probe.
+        // `RENAME_EXCL` preserves that concurrent creation instead.
         let renamed = unsafe {
-            libc::renameat(
+            libc::renameatx_np(
                 parent.as_raw_fd(),
                 temp.as_ptr(),
                 parent.as_raw_fd(),
                 name.as_ptr(),
+                libc::RENAME_EXCL,
             )
         };
         if renamed != 0 {
+            unlink_at(parent, temp);
             return Err(AppError::new(format!(
-                "Could not atomically create file: {}",
+                "Could not atomically create file without replacing concurrent work: {}",
                 std::io::Error::last_os_error()
             )));
         }
@@ -463,13 +526,35 @@ fn atomic_replace(
         )
     };
     if swapped != 0 {
+        unlink_at(parent, temp);
         return Err(AppError::new(format!(
             "Could not atomically replace file: {}",
             std::io::Error::last_os_error()
         )));
     }
     let old_path = abs.with_file_name(temp.to_string_lossy().as_ref());
-    let old_hash = hash_file(root, &old_path)?;
+    let old_hash = match hash_file(root, &old_path) {
+        Ok(hash) => hash,
+        Err(error) => {
+            let rollback = unsafe {
+                libc::renameatx_np(
+                    parent.as_raw_fd(),
+                    temp.as_ptr(),
+                    parent.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::RENAME_SWAP,
+                )
+            };
+            return if rollback == 0 {
+                unlink_at(parent, temp);
+                Err(error)
+            } else {
+                Err(AppError::new(
+                    "Could not verify swapped file; rollback failed.",
+                ))
+            };
+        }
+    };
     if old_hash != expected_hash {
         let rollback = unsafe {
             libc::renameatx_np(
@@ -483,16 +568,17 @@ fn atomic_replace(
         if rollback != 0 {
             return Err(AppError::new("Concurrent edit detected; rollback failed."));
         }
-        let _ = std::fs::remove_file(&old_path);
+        unlink_at(parent, temp);
         return Err(AppError::new(
             "The file changed on disk while saving. Refresh the diff and try again.",
         ));
     }
-    let _ = std::fs::remove_file(&old_path);
+    unlink_at(parent, temp);
     Ok(())
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(target_os = "linux")]
 fn atomic_replace(
     parent: &std::fs::File,
     temp: &std::ffi::CString,
@@ -500,9 +586,80 @@ fn atomic_replace(
     _root: &Path,
     _abs: &Path,
     _expected_hash: &str,
-    _current_was_present: bool,
+    current_was_present: bool,
 ) -> AppResult<()> {
     use std::os::fd::AsRawFd;
+    if current_was_present {
+        let renamed = unsafe {
+            libc::renameat(
+                parent.as_raw_fd(),
+                temp.as_ptr(),
+                parent.as_raw_fd(),
+                name.as_ptr(),
+            )
+        };
+        if renamed != 0 {
+            unlink_at(parent, temp);
+            return Err(AppError::new(format!(
+                "Could not atomically replace file: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        return Ok(());
+    }
+    let renamed = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            parent.as_raw_fd(),
+            temp.as_ptr(),
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if renamed != 0 {
+        unlink_at(parent, temp);
+        return Err(AppError::new(format!(
+            "Could not atomically create file without replacing concurrent work: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "macos"), not(target_os = "linux")))]
+fn atomic_replace(
+    parent: &std::fs::File,
+    temp: &std::ffi::CString,
+    name: &std::ffi::CString,
+    _root: &Path,
+    _abs: &Path,
+    _expected_hash: &str,
+    current_was_present: bool,
+) -> AppResult<()> {
+    use std::os::fd::AsRawFd;
+    if !current_was_present {
+        // POSIX rename has no portable no-replace primitive. Linking the
+        // temporary inode into place is atomic and fails if the name appeared.
+        let linked = unsafe {
+            libc::linkat(
+                parent.as_raw_fd(),
+                temp.as_ptr(),
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                0,
+            )
+        };
+        if linked != 0 {
+            unlink_at(parent, temp);
+            return Err(AppError::new(format!(
+                "Could not atomically create file without replacing concurrent work: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        unlink_at(parent, temp);
+        return Ok(());
+    }
     let renamed = unsafe {
         libc::renameat(
             parent.as_raw_fd(),
@@ -512,6 +669,7 @@ fn atomic_replace(
         )
     };
     if renamed != 0 {
+        unlink_at(parent, temp);
         return Err(AppError::new(format!(
             "Could not atomically replace file: {}",
             std::io::Error::last_os_error()
@@ -939,6 +1097,57 @@ mod tests {
     use super::*;
 
     use std::io::Write;
+
+    #[cfg(unix)]
+    #[test]
+    fn absent_file_creation_preserves_concurrent_destination_and_cleans_temp() {
+        let root =
+            std::env::temp_dir().join(format!("omp-git-create-race-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let parent = std::fs::File::open(&root).unwrap();
+        let temp = c_path(Path::new("pending.tmp")).unwrap();
+        let name = c_path(Path::new("new.txt")).unwrap();
+        std::fs::write(root.join("pending.tmp"), "ours\n").unwrap();
+        std::fs::write(root.join("new.txt"), "theirs\n").unwrap();
+
+        let result = atomic_replace(
+            &parent,
+            &temp,
+            &name,
+            &root,
+            &root.join("new.txt"),
+            "",
+            false,
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read_to_string(root.join("new.txt")).unwrap(),
+            "theirs\n"
+        );
+        assert!(!root.join("pending.tmp").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn changed_file_git_output_is_hard_capped() {
+        let root =
+            std::env::temp_dir().join(format!("omp-git-output-cap-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(Command::new("git")
+            .args(["-C", root.to_str().unwrap(), "init", "-q"])
+            .status()
+            .unwrap()
+            .success());
+        std::fs::write(root.join("changed.txt"), "changed\n").unwrap();
+        let error = git_ok_capped(
+            &root,
+            &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            1,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("safety limit"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
     /// `git status --porcelain=v1 -z` emits "XY new\0old\0" for renames.
     #[test]
     fn porcelain_rename_order() {

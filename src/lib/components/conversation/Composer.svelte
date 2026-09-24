@@ -24,6 +24,7 @@
   const commandListId = 'composer-command-suggestions';
   const optionId = (index: number) => `${commandListId}-option-${index}`;
   let cmdDismissed = $state(false);
+  let submitGeneration = 0;
 
   const streaming = $derived(status === 'active');
   const disabled = $derived(status === 'disconnected');
@@ -42,6 +43,8 @@
   // Focus the composer on mount and whenever a different thread is shown.
   $effect(() => {
     threadId;
+    submitGeneration += 1;
+    submitting = false;
     text = '';
     cmdDismissed = false;
     area?.focus();
@@ -69,15 +72,16 @@
   async function submit() {
     const message = text.trim();
     if (!message || disabled || submitting) return;
+    const operation = ++submitGeneration;
+    const originThreadId = threadId;
     submitting = true;
     try {
       await onSend(message, streaming ? streamMode : 'prompt');
-      // If the user started a new draft during the request, leave it alone.
-      if (text.trim() === message) text = '';
+      if (operation === submitGeneration && threadId === originThreadId && text.trim() === message) text = '';
     } catch {
-      area?.focus();
+      if (operation === submitGeneration && threadId === originThreadId) area?.focus();
     } finally {
-      submitting = false;
+      if (operation === submitGeneration && threadId === originThreadId) submitting = false;
     }
   }
 

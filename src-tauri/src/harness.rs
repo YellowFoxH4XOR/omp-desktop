@@ -6,11 +6,13 @@ use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 
 const SETTING_OVERRIDE_OMP: &str = "executable_override.omp";
 const SETTING_OVERRIDE_PI: &str = "executable_override.pi";
+
+const MAX_PROBE_OUTPUT_BYTES: u64 = 1_048_576;
 
 /// Fixed, allowlisted install commands. These are exactly what the onboarding
 /// UI displays; nothing else may be executed by install_harness.
@@ -64,27 +66,76 @@ fn known_locations(kind: HarnessKind) -> Vec<PathBuf> {
     v
 }
 
+async fn run_probe(
+    path: &Path,
+    args: &[&str],
+    timeout: std::time::Duration,
+    timeout_error: AppError,
+) -> AppResult<std::process::Output> {
+    let mut child = Command::new(path)
+        .args(args)
+        .env("PATH", util::merged_path())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| AppError::new(format!("Could not run {}: {e}", path.display())))?;
+    let stdout = child.stdout.take().expect("probe stdout piped");
+    let stderr = child.stderr.take().expect("probe stderr piped");
+    let stdout_task = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        let _ = stdout
+            .take(MAX_PROBE_OUTPUT_BYTES)
+            .read_to_end(&mut bytes)
+            .await;
+        bytes
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        let _ = stderr
+            .take(MAX_PROBE_OUTPUT_BYTES)
+            .read_to_end(&mut bytes)
+            .await;
+        bytes
+    });
+    let status = match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(error)) => {
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await;
+            return Err(AppError::new(format!(
+                "Could not inspect {}: {error}",
+                path.display()
+            )));
+        }
+        Err(_) => {
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await;
+            return Err(timeout_error);
+        }
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: stdout_task.await.unwrap_or_default(),
+        stderr: stderr_task.await.unwrap_or_default(),
+    })
+}
+
 /// Validate a candidate executable by running `<path> --version`.
 /// Returns the parsed version string on success.
 async fn validate_executable(path: &Path, kind: HarnessKind) -> AppResult<String> {
-    let out = tokio::time::timeout(
+    let out = run_probe(
+        path,
+        &["--version"],
         std::time::Duration::from_secs(15),
-        Command::new(path)
-            .arg("--version")
-            .env("PATH", util::merged_path())
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .output(),
-    )
-    .await
-    .map_err(|_| {
         AppError::new(format!(
             "{} at {} did not answer --version in time.",
             kind.display_name(),
             path.display()
-        ))
-    })?
-    .map_err(|e| AppError::new(format!("Could not run {}: {e}", path.display())))?;
+        )),
+    )
+    .await?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     if !out.status.success() {
@@ -112,18 +163,13 @@ async fn validate_executable(path: &Path, kind: HarnessKind) -> AppResult<String
         HarnessKind::Pi => {
             // Pi's --version prints a bare semver; confirm its identity from
             // its CLI help without launching an agent or reading credentials.
-            let help = tokio::time::timeout(
+            let help = run_probe(
+                path,
+                &["--help"],
                 std::time::Duration::from_secs(15),
-                Command::new(path)
-                    .arg("--help")
-                    .env("PATH", util::merged_path())
-                    .stdin(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .output(),
+                AppError::new("Pi --help did not respond in time."),
             )
-            .await
-            .map_err(|_| AppError::new("Pi --help did not respond in time."))?
-            .map_err(|e| AppError::new(format!("Could not inspect Pi: {e}")))?;
+            .await?;
             let help_text = String::from_utf8_lossy(&help.stdout).to_ascii_lowercase();
             if !help.status.success()
                 || !help_text.contains("pi - ai coding assistant")

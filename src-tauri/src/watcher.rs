@@ -3,7 +3,7 @@ use notify::{Event, EventKind, RecursiveMode, Watcher};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{channel, Sender};
+use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
 
@@ -14,50 +14,65 @@ use tauri::{AppHandle, Emitter};
 /// on one dedicated thread driven by a command channel; the manager itself is
 /// a cheap `Send + Sync` handle.
 pub struct WatcherManager {
-    cmd: Sender<Cmd>,
-    /// thread_id → cwd (kept here for fast membership checks)
-    threads: Arc<Mutex<HashMap<String, PathBuf>>>,
+    cmd: SyncSender<Cmd>,
+    /// thread_id → (cwd, generation); the generation rejects stale commands.
+    threads: Arc<Mutex<HashMap<String, (PathBuf, u64)>>>,
+    next_generation: std::sync::atomic::AtomicU64,
 }
 
 enum Cmd {
-    Watch { thread_id: String, cwd: PathBuf },
-    Unwatch { thread_id: String },
+    Watch {
+        thread_id: String,
+        cwd: PathBuf,
+        generation: u64,
+    },
+    Unwatch {
+        thread_id: String,
+        generation: u64,
+    },
 }
 
 const DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(400);
+const COMMAND_CAPACITY: usize = 256;
+const EVENT_CAPACITY: usize = 8;
+const MAX_WATCHED_DIRS: usize = 32;
 
 impl WatcherManager {
     pub fn new(app: AppHandle) -> Self {
-        let (cmd_tx, cmd_rx) = channel::<Cmd>();
-        let threads = Arc::new(Mutex::new(HashMap::<String, PathBuf>::new()));
+        let (cmd_tx, cmd_rx) = sync_channel::<Cmd>(COMMAND_CAPACITY);
+        let threads = Arc::new(Mutex::new(HashMap::<String, (PathBuf, u64)>::new()));
         let threads2 = threads.clone();
         std::thread::spawn(move || watcher_thread(cmd_rx, threads2, app));
         Self {
             cmd: cmd_tx,
             threads,
+            next_generation: std::sync::atomic::AtomicU64::new(1),
         }
     }
 
     /// Start watching `cwd` for `thread_id` (idempotent).
     pub fn watch(&self, thread_id: &str, cwd: &Path) {
-        let cwd = cwd.to_path_buf();
-        {
-            let mut threads = self.threads.lock();
-            if threads.get(thread_id) == Some(&cwd) {
-                return;
-            }
-            threads.insert(thread_id.to_string(), cwd.clone());
-        }
+        let generation = self
+            .next_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.threads
+            .lock()
+            .insert(thread_id.to_string(), (cwd.to_path_buf(), generation));
         let _ = self.cmd.send(Cmd::Watch {
             thread_id: thread_id.to_string(),
-            cwd,
+            cwd: cwd.to_path_buf(),
+            generation,
         });
     }
 
     pub fn unwatch(&self, thread_id: &str) {
+        let generation = self
+            .next_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.threads.lock().remove(thread_id);
         let _ = self.cmd.send(Cmd::Unwatch {
             thread_id: thread_id.to_string(),
+            generation,
         });
     }
 
@@ -75,27 +90,44 @@ struct WatchedDir {
 
 fn watcher_thread(
     rx: std::sync::mpsc::Receiver<Cmd>,
-    threads: Arc<Mutex<HashMap<String, PathBuf>>>,
+    threads: Arc<Mutex<HashMap<String, (PathBuf, u64)>>>,
     app: AppHandle,
 ) {
     let mut watchers: HashMap<PathBuf, WatchedDir> = HashMap::new();
+    let mut applied: HashMap<String, u64> = HashMap::new();
     while let Ok(cmd) = rx.recv() {
         match cmd {
-            Cmd::Watch { thread_id, cwd } => {
-                // Remove from any previous directory first.
-                for (_, wd) in watchers.iter_mut() {
-                    wd.threads.retain(|t| t != &thread_id);
-                }
-                watchers.retain(|_, wd| !wd.threads.is_empty());
-                if watchers.contains_key(&cwd) {
-                    watchers
-                        .get_mut(&cwd)
-                        .expect("checked")
-                        .threads
-                        .push(thread_id);
+            Cmd::Watch {
+                thread_id,
+                cwd,
+                generation,
+            } => {
+                if applied
+                    .get(&thread_id)
+                    .is_some_and(|current| *current >= generation)
+                {
                     continue;
                 }
-                let (tx, event_rx) = channel::<()>();
+                applied.insert(thread_id.clone(), generation);
+                if !threads
+                    .lock()
+                    .get(&thread_id)
+                    .is_some_and(|(current, latest)| *current == cwd && *latest == generation)
+                {
+                    continue;
+                }
+                for (_, watched) in watchers.iter_mut() {
+                    watched.threads.retain(|t| t != &thread_id);
+                }
+                watchers.retain(|_, watched| !watched.threads.is_empty());
+                if let Some(watched) = watchers.get_mut(&cwd) {
+                    watched.threads.push(thread_id);
+                    continue;
+                }
+                if watchers.len() >= MAX_WATCHED_DIRS {
+                    continue;
+                }
+                let (tx, event_rx) = sync_channel::<()>(EVENT_CAPACITY);
                 let watched = cwd.clone();
                 let event_tx = tx.clone();
                 let watcher =
@@ -110,20 +142,17 @@ fn watcher_thread(
                         ) {
                             return;
                         }
-                        if !event_paths_relevant(&event.paths, &watched) {
-                            return;
+                        if event_paths_relevant(&event.paths, &watched) {
+                            let _ = event_tx.try_send(());
                         }
-                        let _ = event_tx.send(());
                     });
                 let mut watcher = match watcher {
-                    Ok(w) => w,
+                    Ok(watcher) => watcher,
                     Err(_) => continue,
                 };
                 if watcher.watch(&cwd, RecursiveMode::Recursive).is_err() {
                     continue;
                 }
-                // A linked worktree has a `.git` pointer file; its index and
-                // HEAD live outside `cwd`. Watch that Git directory separately.
                 let git_watcher = worktree_git_watcher(&cwd, tx.clone());
                 watchers.insert(
                     cwd.clone(),
@@ -133,7 +162,6 @@ fn watcher_thread(
                         threads: vec![thread_id],
                     },
                 );
-                // Fan-out thread: debounce bursts, emit per interested thread.
                 let app = app.clone();
                 let threads = threads.clone();
                 let dir = cwd.clone();
@@ -149,31 +177,38 @@ fn watcher_thread(
                         let interested: Vec<String> = {
                             let map = threads.lock();
                             map.iter()
-                                .filter(|(_, c)| **c == dir)
-                                .map(|(t, _)| t.clone())
+                                .filter(|(_, (cwd, _))| *cwd == dir)
+                                .map(|(thread_id, _)| thread_id.clone())
                                 .collect()
                         };
-                        if interested.is_empty() {
-                            return;
-                        }
-                        for tid in interested {
-                            let _ = app
-                                .emit("desktop-event", BackendEvent::GitChanged { thread_id: tid });
+                        for thread_id in interested {
+                            let _ =
+                                app.emit("desktop-event", BackendEvent::GitChanged { thread_id });
                         }
                     }
                 });
             }
-            Cmd::Unwatch { thread_id } => {
-                for (_, wd) in watchers.iter_mut() {
-                    wd.threads.retain(|t| t != &thread_id);
+            Cmd::Unwatch {
+                thread_id,
+                generation,
+            } => {
+                if applied
+                    .get(&thread_id)
+                    .is_some_and(|current| *current >= generation)
+                {
+                    continue;
                 }
-                watchers.retain(|_, wd| !wd.threads.is_empty());
+                applied.insert(thread_id.clone(), generation);
+                for (_, watched) in watchers.iter_mut() {
+                    watched.threads.retain(|t| t != &thread_id);
+                }
+                watchers.retain(|_, watched| !watched.threads.is_empty());
             }
         }
     }
 }
 
-fn worktree_git_watcher(cwd: &Path, tx: Sender<()>) -> Option<notify::RecommendedWatcher> {
+fn worktree_git_watcher(cwd: &Path, tx: SyncSender<()>) -> Option<notify::RecommendedWatcher> {
     let output = std::process::Command::new("git")
         .arg("-C")
         .arg(cwd)
@@ -197,7 +232,7 @@ fn worktree_git_watcher(cwd: &Path, tx: Sender<()>) -> Option<notify::Recommende
             return;
         }
         if git_metadata_relevant(&event.paths, &watched) {
-            let _ = tx.send(());
+            let _ = tx.try_send(());
         }
     })
     .ok()?;
@@ -250,16 +285,59 @@ mod tests {
 
     #[test]
     fn unwatch_removes_failed_start_membership() {
-        let (tx, _rx) = channel();
+        let (tx, _rx) = sync_channel(COMMAND_CAPACITY);
         let threads = Arc::new(Mutex::new(HashMap::new()));
         let manager = WatcherManager {
             cmd: tx,
             threads: threads.clone(),
+            next_generation: std::sync::atomic::AtomicU64::new(1),
         };
         manager.watch("failed", Path::new("/tmp"));
         assert!(manager.is_watching("failed"));
         manager.unwatch("failed");
         assert!(!manager.is_watching("failed"));
+    }
+
+    #[test]
+    fn replacement_generation_wins_over_stale_unwatch() {
+        let (tx, rx) = sync_channel(COMMAND_CAPACITY);
+        let threads = Arc::new(Mutex::new(HashMap::new()));
+        let manager = WatcherManager {
+            cmd: tx,
+            threads,
+            next_generation: std::sync::atomic::AtomicU64::new(10),
+        };
+        manager.watch("thread", Path::new("/tmp/new"));
+        manager.unwatch("thread");
+        manager.watch("thread", Path::new("/tmp/replacement"));
+        let commands: Vec<Cmd> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let mut applied = HashMap::new();
+        for command in commands {
+            match command {
+                Cmd::Watch {
+                    thread_id,
+                    generation,
+                    ..
+                }
+                | Cmd::Unwatch {
+                    thread_id,
+                    generation,
+                } => {
+                    if applied
+                        .get(&thread_id)
+                        .is_some_and(|current| *current > generation)
+                    {
+                        continue;
+                    }
+                    applied.insert(thread_id, generation);
+                }
+            }
+        }
+        assert_eq!(applied.get("thread"), Some(&12));
+        assert_eq!(
+            manager.threads.lock().get("thread").unwrap().0,
+            Path::new("/tmp/replacement")
+        );
     }
     use std::process::Command;
 
@@ -300,7 +378,7 @@ mod tests {
             .unwrap()
             .success());
         git::create_worktree(&source, &worktree).unwrap();
-        let (tx, rx) = channel();
+        let (tx, rx) = sync_channel(EVENT_CAPACITY);
         let watcher = worktree_git_watcher(&worktree, tx)
             .expect("linked worktree Git directory is watchable");
         std::fs::write(worktree.join("tracked.txt"), "staged\n").unwrap();
