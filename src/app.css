@@ -1,0 +1,88 @@
+:root {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  color-scheme: dark;
+  --bg: #101216;
+  --sidebar: #15171c;
+  --surface: #1c1f25;
+  --surface-2: #252931;
+  --surface-3: #2d323b;
+  --line: #30343c;
+  --text: #e7e8eb;
+  --muted: #9a9fa9;
+  --subtle: #717783;
+  --accent: #9faafa;
+  --accent-bg: #303752;
+  --good: #83c9a2;
+  --warn: #e2b879;
+  --bad: #eb9293;
+  --diff-add: #203d30;
+  --diff-del: #46282d;
+  --shadow: 0 20px 60px #0008;
+  --radius: 8px;
+  --mono: SFMono-Regular, Menlo, Consolas, monospace;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme='dark']) {
+    color-scheme: light;
+    --bg: #fafafa;
+    --sidebar: #f3f4f6;
+    --surface: #fff;
+    --surface-2: #ebedf1;
+    --surface-3: #e1e4ea;
+    --line: #dfe2e7;
+    --text: #242830;
+    --muted: #686f7c;
+    --subtle: #9299a5;
+    --accent: #485ba8;
+    --accent-bg: #e5e9fa;
+    --good: #277656;
+    --warn: #996322;
+    --bad: #b4444c;
+    --diff-add: #d9f2e1;
+    --diff-del: #f8dfe2;
+    --shadow: 0 20px 60px #3333;
+  }
+}
+:root[data-theme='light'] {
+  color-scheme: light;
+  --bg: #fafafa;
+  --sidebar: #f3f4f6;
+  --surface: #fff;
+  --surface-2: #ebedf1;
+  --surface-3: #e1e4ea;
+  --line: #dfe2e7;
+  --text: #242830;
+  --muted: #686f7c;
+  --subtle: #9299a5;
+  --accent: #485ba8;
+  --accent-bg: #e5e9fa;
+  --good: #277656;
+  --warn: #996322;
+  --bad: #b4444c;
+  --diff-add: #d9f2e1;
+  --diff-del: #f8dfe2;
+  --shadow: 0 20px 60px #3333;
+}
+* { box-sizing: border-box; }
+html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+body { background: var(--bg); color: var(--text); font-size: 13px; line-height: 1.45; }
+button, input, textarea, select { font: inherit; color: inherit; }
+button { cursor: pointer; }
+button:disabled { cursor: not-allowed; opacity: .45; }
+a { color: var(--accent); }
+button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+::selection { background: #8a9ff055; }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { border: 3px solid transparent; border-radius: 8px; background: var(--surface-3); background-clip: padding-box; }
+code, pre, kbd { font-family: var(--mono); }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
