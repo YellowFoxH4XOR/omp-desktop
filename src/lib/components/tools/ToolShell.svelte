@@ -39,8 +39,8 @@
     class="head"
     onclick={() => detail && (open = !open)}
     aria-expanded={detail ? open : undefined}
-    aria-label={detail ? undefined : statusLabel[status]}
   >
+    <span class="sr-only">{statusLabel[status]}</span>
     <span class="icon" aria-hidden="true">
       {#if status === 'running'}
         <LoaderCircle size={13} class="spin" />
@@ -66,8 +66,19 @@
     <div class="detail">{@render detail()}</div>
   {/if}
 </div>
-
 <style>
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+
   .tool {
     margin: 3px 0;
     border: 1px solid var(--line);

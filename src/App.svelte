@@ -10,6 +10,19 @@
   import type { BackendEvent, HarnessInstallation, HarnessKind, LoginProvider, Project, Thread, ThreadStatus, UiResponse } from '$lib/types';
   type AgentsPanelComponent = (typeof import('$lib/components/agents/AgentsPanel.svelte'))['default'];
   type ChangesPanelComponent = (typeof import('$lib/components/diff/ChangesPanel.svelte'))['default'];
+  type RpcFrame = Record<string, unknown>;
+  interface OpenedSession {
+    model: SessionModel;
+    thread: Thread;
+  }
+  interface PendingSessionOpen {
+    projectId: string;
+    frames: RpcFrame[];
+    discarded: boolean;
+    promise?: Promise<OpenedSession>;
+  }
+
+  const MAX_CACHED_SESSIONS = 8;
 
   let projects = $state<Project[]>([]);
   let threadsByProject = $state<Record<string, Thread[]>>({});
@@ -23,6 +36,7 @@
   let activeSession = $state<SessionModel | null>(null);
   let loadingThread = $state(false);
   let pendingAction = $state(false);
+  let pendingActionCount = 0;
   let rightPanel = $state<'changes' | 'agents' | null>(null);
   let AgentsPanel = $state<AgentsPanelComponent | null>(null);
   let ChangesPanel = $state<ChangesPanelComponent | null>(null);
@@ -46,6 +60,13 @@
   let panelResizing = false;
   const liveSessions = new Map<string, SessionModel>();
   const idleStopTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const sessionProjects = new Map<string, string>();
+  const openingSessions = new Map<string, PendingSessionOpen>();
+  const invalidatedProjects = new Set<string>();
+  const stopGeneration = new Map<string, number>();
+  const stopping = new Map<string, Promise<void>>();
+  let projectSelectionToken = 0;
+  let threadSelectionToken = 0;
   const currentView = $derived(activeSession?.view);
   const availableKinds = $derived(new Set(harnesses.map(h => h.kind)));
   const onboarding = $derived(!detecting && harnesses.length === 0);
@@ -55,6 +76,105 @@
   ]).filter(entry => `${entry.label} ${entry.subtitle}`.toLowerCase().includes(switchQuery.toLowerCase())).slice(0, 40));
 
   function errorText(error: unknown): string { return error instanceof Error ? error.message : String(error); }
+  function beginPendingAction() {
+    pendingActionCount += 1;
+    pendingAction = true;
+  }
+  function endPendingAction() {
+    pendingActionCount = Math.max(0, pendingActionCount - 1);
+    pendingAction = pendingActionCount > 0;
+  }
+  function isSessionInactive(model: SessionModel): boolean {
+    const view = model.view;
+    return view.status !== 'active' && view.status !== 'waiting' &&
+      !view.agents.some(agent => agent.status === 'running' || agent.status === 'waiting');
+  }
+  function removeCachedSession(threadId: string, expected?: SessionModel) {
+    const model = liveSessions.get(threadId);
+    if (!model || (expected && model !== expected)) return false;
+    liveSessions.delete(threadId);
+    sessionProjects.delete(threadId);
+    return true;
+  }
+  function cacheSession(threadId: string, projectId: string, model: SessionModel) {
+    liveSessions.delete(threadId);
+    liveSessions.set(threadId, model);
+    sessionProjects.set(threadId, projectId);
+    enforceSessionLimit();
+  }
+  function stopInactiveSession(threadId: string, expected: SessionModel): boolean {
+    if (activeThread?.id === threadId || openingSessions.has(threadId) || !isSessionInactive(expected)) return false;
+    cancelIdleStop(threadId);
+    const generation = stopGeneration.get(threadId) ?? 0;
+    const job = api.stopThread(threadId).then(() => {
+      if ((stopGeneration.get(threadId) ?? 0) !== generation) return;
+      if (activeThread?.id === threadId) return;
+      if (removeCachedSession(threadId, expected)) enforceSessionLimit();
+    }).catch(() => {
+      if ((stopGeneration.get(threadId) ?? 0) !== generation) return;
+      if (liveSessions.get(threadId) === expected && activeThread?.id !== threadId) scheduleIdleStop(threadId);
+    }).finally(() => {
+      if (stopping.get(threadId) === job) stopping.delete(threadId);
+    });
+    stopping.set(threadId, job);
+    return true;
+  }
+  function enforceSessionLimit() {
+    if (liveSessions.size <= MAX_CACHED_SESSIONS) return;
+    for (const [threadId, model] of liveSessions) {
+      if (stopInactiveSession(threadId, model)) return;
+    }
+  }
+  function applyRpcFrame(threadId: string, frame: RpcFrame) {
+    const model = liveSessions.get(threadId);
+    model?.apply(frame);
+    const kind = frame.type;
+    if (kind === 'agent_start') updateThreadStatus(threadId, 'active');
+    if (kind === 'response' && frame.success === false && model?.view.status === 'failed') {
+      updateThreadStatus(threadId, 'failed');
+    }
+    if (kind === 'agent_settled' || (kind === 'agent_end' && frame.isTerminal !== false && frame.willRetry !== true)) {
+      const harness = kind === 'agent_end' ? (activeThread?.id === threadId ? activeThread.harness : Object.values(threadsByProject).flat().find(thread => thread.id === threadId)?.harness) : undefined;
+      if (kind !== 'agent_end' || harness !== 'pi') {
+        const runningChild = model?.view.agents.some(agent => agent.status === 'running');
+        updateThreadStatus(threadId, model?.view.status === 'failed' ? 'failed' : runningChild ? 'active' : 'completed');
+      }
+    }
+    if (kind === 'extension_ui_request' && ['select', 'confirm', 'input', 'editor'].includes(String(frame.method))) updateThreadStatus(threadId, 'waiting');
+    if (kind === 'subagent_lifecycle' || kind === 'subagent_progress') {
+      const runningChild = model?.view.agents.some(agent => agent.status === 'running');
+      if (runningChild) updateThreadStatus(threadId, 'active');
+    }
+    if (model && activeThread?.id !== threadId && isSessionInactive(model)) scheduleIdleStop(threadId);
+    enforceSessionLimit();
+  }
+  function openSessionModel(thread: Thread): Promise<OpenedSession> {
+    const existing = openingSessions.get(thread.id);
+    if (existing?.promise) return existing.promise;
+    const pending: PendingSessionOpen = { projectId: thread.projectId, frames: [], discarded: false };
+    openingSessions.set(thread.id, pending);
+    const promise = api.openThread(thread.id).then(snapshot => {
+      if (pending.discarded || invalidatedProjects.has(pending.projectId)) {
+        if (openingSessions.get(thread.id) === pending) openingSessions.delete(thread.id);
+        pending.frames.length = 0;
+        throw new Error('Thread opening was cancelled because its project was removed.');
+      }
+      const model = new SessionModel(snapshot);
+      liveSessions.delete(thread.id);
+      liveSessions.set(thread.id, model);
+      sessionProjects.set(thread.id, snapshot.thread.projectId);
+      for (const frame of pending.frames.splice(0)) applyRpcFrame(thread.id, frame);
+      if (openingSessions.get(thread.id) === pending) openingSessions.delete(thread.id);
+      enforceSessionLimit();
+      return { model, thread: snapshot.thread };
+    }, error => {
+      if (openingSessions.get(thread.id) === pending) openingSessions.delete(thread.id);
+      pending.frames.length = 0;
+      throw error;
+    });
+    pending.promise = promise;
+    return promise;
+  }
   function visibleThreads(projectId: string): Thread[] {
     return (threadsByProject[projectId] ?? []).filter(t => showArchived || !t.archived)
       .sort((a, b) => Number(b.pinned) - Number(a.pinned) || b.lastViewedAt.localeCompare(a.lastViewedAt));
@@ -67,21 +187,20 @@
   }
   function scheduleIdleStop(threadId: string) {
     if (idleStopTimers.has(threadId)) return;
+    const expected = liveSessions.get(threadId);
+    if (!expected) return;
     const timer = setTimeout(() => {
       idleStopTimers.delete(threadId);
-      const view = liveSessions.get(threadId)?.view;
-      if (activeThread?.id !== threadId && view &&
-          view.status !== 'active' && view.status !== 'waiting' &&
-          !view.agents.some(agent => agent.status === 'running' || agent.status === 'waiting')) {
-        void api.stopThread(threadId).catch(() => {});
+      if (activeThread?.id !== threadId && isSessionInactive(expected)) {
+        stopInactiveSession(threadId, expected);
       }
     }, 30_000);
     idleStopTimers.set(threadId, timer);
   }
   function leaveCurrentThread(nextId?: string) {
     if (!activeThread || activeThread.id === nextId) return;
-    const view = liveSessions.get(activeThread.id)?.view;
-    if (view && view.status !== 'active' && view.status !== 'waiting') scheduleIdleStop(activeThread.id);
+    const model = liveSessions.get(activeThread.id);
+    if (model && isSessionInactive(model)) scheduleIdleStop(activeThread.id);
   }
   function cancelIdleStop(threadId: string) {
     const timer = idleStopTimers.get(threadId);
@@ -90,37 +209,22 @@
   }
   function handleBackendEvent(event: BackendEvent) {
     if (event.type === 'rpc') {
-      const model = liveSessions.get(event.threadId);
-      model?.apply(event.frame);
-      const kind = event.frame.type;
-      if (kind === 'agent_start') updateThreadStatus(event.threadId, 'active');
-      if (kind === 'response' && event.frame.success === false && model?.view.status === 'failed') {
-        updateThreadStatus(event.threadId, 'failed');
-      }
-      if (kind === 'agent_settled' || (kind === 'agent_end' && event.frame.isTerminal !== false && event.frame.willRetry !== true)) {
-        const harness = kind === 'agent_end' ? (activeThread?.id === event.threadId ? activeThread.harness : Object.values(threadsByProject).flat().find(thread => thread.id === event.threadId)?.harness) : undefined;
-        if (kind !== 'agent_end' || harness !== 'pi') {
-          const runningChild = model?.view.agents.some(agent => agent.status === 'running');
-          updateThreadStatus(event.threadId, model?.view.status === 'failed' ? 'failed' : runningChild ? 'active' : 'completed');
-        }
-      }
-      if (kind === 'extension_ui_request' && ['select', 'confirm', 'input', 'editor'].includes(String(event.frame.method))) updateThreadStatus(event.threadId, 'waiting');
-      if (kind === 'subagent_lifecycle' || kind === 'subagent_progress') {
-        const runningChild = model?.view.agents.some(agent => agent.status === 'running');
-        if (runningChild) updateThreadStatus(event.threadId, 'active');
-      }
+      const pending = openingSessions.get(event.threadId);
+      if (pending) pending.frames.push(event.frame);
+      else applyRpcFrame(event.threadId, event.frame);
     } else if (event.type === 'exited') {
       if (!event.expected) {
         crashDetails[event.threadId] = event.stderr;
         liveSessions.get(event.threadId)?.setError(`${activeThread?.id === event.threadId ? activeThread.harness.toUpperCase() : 'Harness'} stopped unexpectedly. Your visible conversation is preserved.`);
         updateThreadStatus(event.threadId, 'disconnected');
-      } else updateThreadStatus(event.threadId, 'idle');
-    } else if (event.type === 'install_progress') {
+      } else {
+        updateThreadStatus(event.threadId, 'idle');
+        if (activeThread?.id !== event.threadId) removeCachedSession(event.threadId);
+      }
+    } else if (event.type === 'install_progress' && installInProgress === event.kind) {
       installLog = [...installLog.slice(-199), event.line];
-    } else if (event.type === 'install_finished') {
-      installInProgress = null;
+    } else if (event.type === 'install_finished' && installInProgress === event.kind) {
       if (!event.success && event.error) installLog = [...installLog, event.error];
-      void refreshHarnesses();
     }
   }
   onMount(() => {
@@ -172,59 +276,118 @@
       if (selected) await selectProject(selected, true);
     } catch (error) { startupError = `Could not load projects: ${errorText(error)}`; }
   }
-  async function refreshThreads(projectId: string) {
-    try { threadsByProject[projectId] = await api.listThreads(projectId); }
-    catch (error) { startupError = `Could not list threads: ${errorText(error)}`; }
+  async function refreshThreads(projectId: string, selectionToken?: number): Promise<Thread[] | null> {
+    try {
+      const threads = await api.listThreads(projectId);
+      if (invalidatedProjects.has(projectId)) return null;
+      if (selectionToken === undefined || selectionToken === projectSelectionToken) threadsByProject[projectId] = threads;
+      return threads;
+    } catch (error) {
+      if (selectionToken === undefined || selectionToken === projectSelectionToken) startupError = `Could not list threads: ${errorText(error)}`;
+      return null;
+    }
   }
-  async function selectProject(project: Project, restore = false) {
+  function beginProjectSelection(project: Project): number {
     leaveCurrentThread();
+    const selectionToken = ++projectSelectionToken;
+    ++threadSelectionToken;
     activeProject = project;
     newHarness = project.preferredHarness;
     activeThread = null;
     activeSession = null;
+    loadingThread = false;
+    rightPanel = null;
+    diffPath = undefined;
     localStorage.setItem('lastProject', project.id);
-    await refreshThreads(project.id);
-    if (restore) {
+    return selectionToken;
+  }
+  async function selectProject(project: Project, restore = false) {
+    const selectionToken = beginProjectSelection(project);
+    const restoreToken = threadSelectionToken;
+    const threads = await refreshThreads(project.id, selectionToken);
+    if (selectionToken !== projectSelectionToken || !threads) return;
+    if (restore && restoreToken === threadSelectionToken) {
       const savedId = localStorage.getItem('lastThread');
-      const savedThread = threadsByProject[project.id]?.find(t => t.id === savedId);
+      const savedThread = threads.find(thread => thread.id === savedId);
       if (savedThread) await selectThread(savedThread);
     }
   }
+  function clearProjectCache(projectId: string) {
+    const threadIds = new Set((threadsByProject[projectId] ?? []).map(thread => thread.id));
+    for (const [threadId, cachedProjectId] of sessionProjects) if (cachedProjectId === projectId) threadIds.add(threadId);
+    for (const [threadId, pending] of openingSessions) if (pending.projectId === projectId) { pending.discarded = true; threadIds.add(threadId); }
+    delete threadsByProject[projectId];
+    for (const threadId of threadIds) {
+      cancelIdleStop(threadId);
+      removeCachedSession(threadId);
+      delete crashDetails[threadId];
+    }
+  }
   async function addProject() {
+    const projectToken = projectSelectionToken;
+    const threadToken = threadSelectionToken;
     const result = await open({ directory: true, multiple: false, title: 'Choose a project directory' });
     const path = Array.isArray(result) ? result[0] : result;
     if (!path) return;
-    pendingAction = true;
+    beginPendingAction();
     try {
       const project = await api.addProject(path, availableKinds.has(newHarness) ? newHarness : harnesses[0]?.kind ?? 'omp');
-      const existing = projects.find(p => p.path === project.path);
+      const existing = projects.find(candidate => candidate.path === project.path);
       if (!existing) projects = [...projects, project];
-      await selectProject(existing ?? project);
-    } catch (error) { startupError = `Could not add project: ${errorText(error)}`; }
-    finally { pendingAction = false; }
+      if (projectToken === projectSelectionToken && threadToken === threadSelectionToken) await selectProject(existing ?? project);
+    } catch (error) {
+      if (projectToken === projectSelectionToken && threadToken === threadSelectionToken) startupError = `Could not add project: ${errorText(error)}`;
+    } finally { endPendingAction(); }
   }
   async function removeProject(project: Project) {
     if (!window.confirm(`Remove “${project.displayName}” from OMP Desktop?\n\nRepository files, Git history, and harness sessions will not be deleted.`)) return;
     try {
       await api.removeProject(project.id);
-      projects = projects.filter(p => p.id !== project.id);
-      if (activeProject?.id === project.id) { activeProject = null; activeThread = null; activeSession = null; if (projects[0]) await selectProject(projects[0]); }
-    } catch (error) { startupError = errorText(error); }
+      invalidatedProjects.add(project.id);
+      const removingActiveProject = activeProject?.id === project.id;
+      if (removingActiveProject) {
+        ++projectSelectionToken;
+        ++threadSelectionToken;
+        activeProject = null;
+        activeThread = null;
+        activeSession = null;
+        loadingThread = false;
+        rightPanel = null;
+        diffPath = undefined;
+      }
+      clearProjectCache(project.id);
+      projects = projects.filter(candidate => candidate.id !== project.id);
+      if (removingActiveProject) {
+        if (projects[0]) await selectProject(projects[0]);
+        else localStorage.removeItem('lastProject');
+      }
+    } catch (error) { startupError = `Could not remove project: ${errorText(error)}`; }
   }
   async function createThread(project: Project) {
-    pendingAction = true;
+    const projectToken = projectSelectionToken;
+    const threadToken = threadSelectionToken;
+    beginPendingAction();
     try {
-      const activePeer = (threadsByProject[project.id] ?? []).some(t => t.status === 'active' || t.status === 'waiting');
+      const activePeer = (threadsByProject[project.id] ?? []).some(thread => thread.status === 'active' || thread.status === 'waiting');
       const isolated = activePeer && project.isGit;
       const harness = availableKinds.has(newHarness) ? newHarness : harnesses[0]?.kind ?? project.preferredHarness;
       const thread = await api.createThread(project.id, harness, isolated);
-      threadsByProject[project.id] = [thread, ...(threadsByProject[project.id] ?? []).filter(t => t.id !== thread.id)];
-      if (activeProject?.id !== project.id) activeProject = project;
-      await selectThread(thread);
-    } catch (error) { startupError = `Could not start thread: ${errorText(error)}`; }
-    finally { pendingAction = false; }
+      if (!invalidatedProjects.has(project.id)) {
+        threadsByProject[project.id] = [thread, ...(threadsByProject[project.id] ?? []).filter(candidate => candidate.id !== thread.id)];
+      }
+      if (activeProject?.id === project.id && projectToken === projectSelectionToken && threadToken === threadSelectionToken) await selectThread(thread);
+    } catch (error) {
+      if (projectToken === projectSelectionToken && threadToken === threadSelectionToken) startupError = `Could not start thread: ${errorText(error)}`;
+    } finally { endPendingAction(); }
   }
   async function selectThread(thread: Thread) {
+    stopGeneration.set(thread.id, (stopGeneration.get(thread.id) ?? 0) + 1);
+    const inflightStop = stopping.get(thread.id);
+    if (inflightStop) {
+      removeCachedSession(thread.id);
+      await inflightStop.catch(() => undefined);
+    }
+    const selectionToken = ++threadSelectionToken;
     leaveCurrentThread(thread.id);
     cancelIdleStop(thread.id);
     activeThread = thread;
@@ -233,20 +396,32 @@
     localStorage.setItem('lastThread', thread.id);
     try {
       const cached = liveSessions.get(thread.id);
-      if (cached) activeSession = cached;
-      else {
-        const snapshot = await api.openThread(thread.id);
-        activeThread = snapshot.thread;
-        const model = new SessionModel(snapshot);
-        liveSessions.set(thread.id, model);
-        activeSession = model;
+      if (cached) {
+        cacheSession(thread.id, thread.projectId, cached);
+        if (selectionToken === threadSelectionToken) activeSession = cached;
+      } else {
+        const opened = await openSessionModel(thread);
+        if (selectionToken === threadSelectionToken && activeProject?.id === thread.projectId) {
+          activeThread = opened.thread;
+          activeSession = opened.model;
+        }
       }
-      thread.lastViewedAt = new Date().toISOString();
-    } catch (error) { startupError = `Could not open thread: ${errorText(error)}`; activeSession = null; }
-    finally { loadingThread = false; }
+      const viewedAt = new Date().toISOString();
+      thread.lastViewedAt = viewedAt;
+      const row = threadsByProject[thread.projectId]?.find(candidate => candidate.id === thread.id);
+      if (row) row.lastViewedAt = viewedAt;
+    } catch (error) {
+      if (selectionToken === threadSelectionToken && activeProject?.id === thread.projectId) {
+        startupError = `Could not open thread: ${errorText(error)}`;
+        activeSession = null;
+      }
+    } finally {
+      if (selectionToken === threadSelectionToken) loadingThread = false;
+    }
   }
   async function openPanel(panel: 'changes' | 'agents') {
     if (panel === 'agents' && !activeSession?.view.capabilities.agents) return;
+    const threadId = activeThread?.id;
     rightPanel = panel;
     try {
       if (panel === 'agents' && !AgentsPanel) {
@@ -255,8 +430,10 @@
         ChangesPanel = (await import('$lib/components/diff/ChangesPanel.svelte')).default;
       }
     } catch (error) {
-      rightPanel = null;
-      startupError = `Could not open ${panel}: ${errorText(error)}`;
+      if (activeThread?.id === threadId) {
+        rightPanel = null;
+        startupError = `Could not open ${panel}: ${errorText(error)}`;
+      }
     }
   }
   function togglePanel(panel: 'changes' | 'agents') {
@@ -272,45 +449,66 @@
     void openPanel('changes');
   }
   async function send(message: string, mode: 'prompt' | 'steer' | 'follow_up') {
-    if (!activeThread) return;
+    const targetThread = activeThread;
+    const selectionToken = threadSelectionToken;
+    if (!targetThread) return;
     try {
-      await api.sendPrompt(activeThread.id, message, mode);
-      startupError = '';
-      if (!activeThread.title || activeThread.title === 'New thread') {
+      await api.sendPrompt(targetThread.id, message, mode);
+      if (activeThread?.id === targetThread.id) startupError = '';
+      if (!targetThread.title || targetThread.title === 'New thread') {
         const title = message.trim().split('\n')[0].slice(0, 70);
-        if (title) await renameThread(activeThread, title);
+        if (title) await renameThread(targetThread, title, selectionToken);
       }
-    } catch (error) { startupError = `Could not send message: ${errorText(error)}`; throw error; }
-  }
-  async function stop() { if (activeThread) { try { await api.abortThread(activeThread.id); } catch (error) { startupError = `Could not stop operation: ${errorText(error)}`; } } }
-  async function respond(requestId: string, response: UiResponse) {
-    if (!activeThread) return;
-    try {
-      await api.respondUi(activeThread.id, requestId, response);
-      activeSession?.dismissRequest(requestId);
-      updateThreadStatus(activeThread.id, 'active');
+    } catch (error) {
+      if (activeThread?.id === targetThread.id) startupError = `Could not send message: ${errorText(error)}`;
+      throw error;
     }
-    catch (error) { startupError = `Could not respond: ${errorText(error)}`; throw error; }
+  }
+  async function stop() {
+    const targetThread = activeThread;
+    if (!targetThread) return;
+    try { await api.abortThread(targetThread.id); }
+    catch (error) { if (activeThread?.id === targetThread.id) startupError = `Could not stop operation: ${errorText(error)}`; }
+  }
+  async function respond(requestId: string, response: UiResponse) {
+    const targetThread = activeThread;
+    const targetSession = activeSession;
+    if (!targetThread) return;
+    try {
+      await api.respondUi(targetThread.id, requestId, response);
+      targetSession?.dismissRequest(requestId);
+      updateThreadStatus(targetThread.id, 'active');
+    } catch (error) {
+      if (activeThread?.id === targetThread.id) startupError = `Could not respond: ${errorText(error)}`;
+      throw error;
+    }
   }
   async function restart() {
-    if (!activeThread) return;
+    const targetThread = activeThread;
+    const targetSession = activeSession;
+    if (!targetThread) return;
     try {
-      const snapshot = await api.restartThread(activeThread.id);
-      const existing = liveSessions.get(activeThread.id);
+      const snapshot = await api.restartThread(targetThread.id);
+      const existing = liveSessions.get(targetThread.id) ?? targetSession;
       if (existing) {
         existing.reconnect(snapshot);
-        activeSession = existing;
+        cacheSession(targetThread.id, snapshot.thread.projectId, existing);
       } else {
-        const restored = new SessionModel(snapshot);
-        liveSessions.set(activeThread.id, restored);
-        activeSession = restored;
+        cacheSession(targetThread.id, snapshot.thread.projectId, new SessionModel(snapshot));
       }
-      Object.assign(activeThread, snapshot.thread);
-      delete crashDetails[activeThread.id];
-    } catch (error) { startupError = `Could not restart session: ${errorText(error)}`; }
+      Object.assign(targetThread, snapshot.thread);
+      if (activeThread?.id === targetThread.id) {
+        activeThread = snapshot.thread;
+        activeSession = liveSessions.get(targetThread.id) ?? null;
+      }
+      delete crashDetails[targetThread.id];
+    } catch (error) {
+      if (activeThread?.id === targetThread.id) startupError = `Could not restart session: ${errorText(error)}`;
+    }
   }
-  async function renameThread(thread: Thread, title: string) {
-    const clean = title.trim(); renaming = null;
+  async function renameThread(thread: Thread, title: string, expectedSelectionToken?: number) {
+    const clean = title.trim();
+    if (expectedSelectionToken === undefined) renaming = null;
     if (!clean) return;
     try {
       const updated = await api.renameThread(thread.id, clean);
@@ -322,24 +520,44 @@
         threadsByProject[updated.projectId] = [...rows];
       }
       if (activeThread?.id === updated.id) Object.assign(activeThread, updated);
-    } catch (error) { startupError = errorText(error); }
+    } catch (error) {
+      if (expectedSelectionToken === undefined || expectedSelectionToken === threadSelectionToken) startupError = errorText(error);
+    }
   }
   async function setFlag(thread: Thread, kind: 'pinned' | 'archived') {
+    const projectToken = projectSelectionToken;
+    const threadToken = threadSelectionToken;
     try { Object.assign(thread, await api.setThreadFlags(thread.id, kind === 'pinned' ? !thread.pinned : undefined, kind === 'archived' ? !thread.archived : undefined)); }
-    catch (error) { startupError = errorText(error); }
+    catch (error) {
+      if (projectToken === projectSelectionToken && threadToken === threadSelectionToken) startupError = errorText(error);
+    }
   }
   async function setModel(value: string) {
-    if (!activeThread) return;
+    const targetThread = activeThread;
+    const targetSession = activeSession;
+    if (!targetThread) return;
     const slash = value.indexOf('/'); if (slash < 0) return;
-    try { const state = await api.setThreadModel(activeThread.id, value.slice(0, slash), value.slice(slash + 1)); if (activeSession && state.model) activeSession.view.model = state.model; if (activeSession) activeSession.view.effort = state.thinkingLevel; }
-    catch (error) { startupError = errorText(error); }
+    try {
+      const state = await api.setThreadModel(targetThread.id, value.slice(0, slash), value.slice(slash + 1));
+      if (state.model && targetSession) targetSession.view.model = state.model;
+      if (targetSession) targetSession.view.effort = state.thinkingLevel;
+    } catch (error) {
+      if (activeThread?.id === targetThread.id) startupError = `Could not change model: ${errorText(error)}`;
+    }
   }
   async function setEffort(level: string) {
-    if (!activeThread) return;
-    try { const state = await api.setThreadEffort(activeThread.id, level); if (activeSession) activeSession.view.effort = state.thinkingLevel; }
-    catch (error) { startupError = errorText(error); }
+    const targetThread = activeThread;
+    const targetSession = activeSession;
+    if (!targetThread) return;
+    try {
+      const state = await api.setThreadEffort(targetThread.id, level);
+      if (targetSession) targetSession.view.effort = state.thinkingLevel;
+    } catch (error) {
+      if (activeThread?.id === targetThread.id) startupError = `Could not change effort: ${errorText(error)}`;
+    }
   }
   async function install(kind: HarnessKind) {
+    if (installInProgress !== null) return;
     installInProgress = kind; installLog = [];
     try { await api.installHarness(kind); await refreshHarnesses(); }
     catch (error) { installLog = [...installLog, errorText(error)]; }
@@ -355,32 +573,51 @@
   async function openSettings() {
     settingsOpen = true;
     loginProviders = [];
-    if (activeThread?.harness === 'omp') {
-      try { loginProviders = await api.getLoginProviders(activeThread.id); }
-      catch (error) { startupError = `Could not load providers: ${errorText(error)}`; }
+    const targetThread = activeThread;
+    if (targetThread?.harness === 'omp') {
+      try {
+        const providers = await api.getLoginProviders(targetThread.id);
+        if (activeThread?.id === targetThread.id) loginProviders = providers;
+      } catch (error) {
+        if (activeThread?.id === targetThread.id) startupError = `Could not load providers: ${errorText(error)}`;
+      }
     }
   }
   async function login(providerId: string) {
-    if (!activeThread) return;
+    const targetThread = activeThread;
+    if (!targetThread) return;
     loggingIn = providerId;
     settingsOpen = false;
     try {
-      await api.loginProvider(activeThread.id, providerId);
-      loginProviders = await api.getLoginProviders(activeThread.id);
-      settingsOpen = true;
-    } catch (error) { startupError = `Sign-in failed: ${errorText(error)}`; }
-    finally { loggingIn = null; }
+      await api.loginProvider(targetThread.id, providerId);
+      const providers = await api.getLoginProviders(targetThread.id);
+      if (activeThread?.id === targetThread.id) {
+        loginProviders = providers;
+        settingsOpen = true;
+      }
+    } catch (error) {
+      if (activeThread?.id === targetThread.id) startupError = `Sign-in failed: ${errorText(error)}`;
+    } finally {
+      if (loggingIn === providerId) loggingIn = null;
+    }
   }
   async function openSwitcher() {
     switchQuery = ''; switchIndex = 0; switcherOpen = true;
     await Promise.all(projects.map(p => refreshThreads(p.id)));
     await tick();
-    document.querySelector<HTMLInputElement>('#switcher-search')?.focus();
+    if (switcherOpen) document.querySelector<HTMLInputElement>('#switcher-search')?.focus();
   }
   async function chooseSwitch(entry: (typeof switchEntries)[number]) {
     switcherOpen = false;
-    await selectProject(entry.project);
-    if (entry.kind === 'thread') await selectThread(entry.thread);
+    if (entry.kind === 'project') {
+      await selectProject(entry.project);
+    } else if (activeProject?.id === entry.project.id) {
+      await selectThread(entry.thread);
+    } else {
+      const selectionToken = beginProjectSelection(entry.project);
+      void refreshThreads(entry.project.id, selectionToken);
+      await selectThread(entry.thread);
+    }
   }
   function statusMark(status: ThreadStatus): string {
     return ({ active: '●', waiting: '◉', idle: '◌', completed: '✓', failed: '!', disconnected: '!' } satisfies Record<ThreadStatus, string>)[status];
@@ -390,7 +627,7 @@
 
 <div class="app-shell" style={`--sidebar-width:${sidebarWidth}px; --panel-width:${panelWidth}px`}>
   <header class="topbar" data-tauri-drag-region>
-    <div class="brand" data-tauri-drag-region><div class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></div><span>OMP<span class="brand-soft"> Desktop</span></span></div>
+    <div class="brand" data-tauri-drag-region><div class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></div><span>OMP <span class="brand-soft">Desktop</span></span></div>
     <span class="bar-divider"></span>
     <div class="top-project" data-tauri-drag-region>{activeProject?.displayName ?? 'Workspace'}{#if activeThread}<ChevronRight size={13} strokeWidth={1.7} /><span class="top-thread">{activeThread.title}</span>{/if}</div>
     <div class="bar-spacer" data-tauri-drag-region></div>

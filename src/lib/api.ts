@@ -33,6 +33,7 @@ export const api = {
   gitFile: (threadId: string, path: string) => invoke<GitFile>('git_file', { threadId, path }),
   gitRevertFile: (threadId: string, path: string) => invoke<void>('git_revert_file', { threadId, path }),
   gitWriteIfUnchanged: (threadId: string, path: string, expectedHash: string, content: string) => invoke<void>('git_write_if_unchanged', { threadId, path, expectedHash, content }),
+  openChangedFile: (threadId: string, path: string) => invoke<void>('open_changed_file', { threadId, path }),
 };
 
 const eventSchema = z.discriminatedUnion('type', [

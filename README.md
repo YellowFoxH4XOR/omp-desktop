@@ -22,16 +22,16 @@ OMP Desktop provides projects and thread management, streaming conversations, st
 ## Requirements
 
 - macOS with Xcode Command Line Tools
-- [Bun](https://bun.sh/)
-- Rust stable toolchain
+- [Bun](https://bun.sh/) 1.4.2 (pinned in `.bun-version`)
+- Rust 1.98.1 (pinned in `rust-toolchain.toml`)
 - OMP or Pi installed, or use the guided installer from first launch
 
 ## Development
 
-Install frontend dependencies:
+Install the exact dependency versions in `bun.lock`:
 
 ```bash
-bun install
+bun install --frozen-lockfile
 ```
 
 Start the Tauri development app:
@@ -44,25 +44,43 @@ The Vite frontend runs on `http://127.0.0.1:1420`; the Tauri window manages the 
 
 ## Validation
 
-Run frontend type and Svelte checks:
+Run frontend type and Svelte checks, followed by Rust formatting and compilation:
 
 ```bash
 bun run check
 ```
 
-Run frontend reducer tests:
+Run all Vitest tests:
 
 ```bash
 bun run test
 ```
 
-Run Rust formatting, checks, and unit tests:
+Run the Playwright desktop journeys after installing Chromium once:
+
+```bash
+bunx playwright install chromium
+bun run test:e2e
+```
+
+Run Rust library tests:
+
+```bash
+bun run test:rust
+```
+
+Run the aggregate local validation (frozen install, checks, tests, and frontend build):
+
+```bash
+bun run validate
+```
+
+Rust formatting and compilation can also be run directly:
 
 ```bash
 cd src-tauri
 cargo fmt -- --check
-cargo check
-cargo test --lib
+cargo check --locked
 ```
 
 Run optional live RPC smoke tests against installed OMP and Pi executables:
@@ -82,11 +100,13 @@ Build the frontend only:
 bun run build
 ```
 
-Build the macOS application bundle:
+Build, ad-hoc sign, and verify the macOS application bundle:
 
 ```bash
-bun run tauri build --bundles app
+bun run bundle:macos
 ```
+
+The macOS command builds the app, signs the complete bundle with the local ad-hoc identity, and runs strict `codesign --verify --deep` validation.
 
 The local application bundle is written to:
 
@@ -94,7 +114,7 @@ The local application bundle is written to:
 src-tauri/target/release/bundle/macos/OMP Desktop.app
 ```
 
-The local build is ad-hoc signed. Distributing it to other Macs requires a Developer ID signature and Apple notarization.
+`bundle:macos` produces a locally runnable ad-hoc-signed app. Ad-hoc signing does not satisfy Gatekeeper distribution requirements. Distributing the app to other Macs requires a Developer ID signature and Apple notarization.
 
 ## Project Layout
 

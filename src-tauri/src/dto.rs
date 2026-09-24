@@ -157,11 +157,14 @@ impl HarnessCapabilities {
                 agent_kill: false,
                 agent_revive: false,
                 plan_mode: false,
-                permissions: true,
-                model_switching: true,
-                effort_levels: true,
-                context_usage: true,
-                token_usage: true,
+                // Pi has no capability handshake in its RPC contract. Do not
+                // advertise permission UI until the host can verify support.
+                permissions: false,
+                // These are enabled per snapshot from successful RPC queries.
+                model_switching: false,
+                effort_levels: false,
+                context_usage: false,
+                token_usage: false,
                 worktrees: true,
             },
         }

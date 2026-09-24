@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import { TriangleAlert } from '@lucide/svelte';
 
   /** In-app confirmation for destructive git actions (file/hunk revert). */
@@ -20,13 +21,44 @@
     onCancel: () => void;
   } = $props();
 
+  let dialogEl: HTMLDivElement | undefined = $state();
+  let cancelEl: HTMLButtonElement | undefined = $state();
+
+  onMount(() => {
+    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    cancelEl?.focus();
+
+    return () => {
+      if (previousFocus?.isConnected) previousFocus.focus();
+    };
+  });
+
   function onKeydown(e: KeyboardEvent) {
     if (e.key === 'Escape') {
+      e.preventDefault();
       e.stopPropagation();
       if (!busy) onCancel();
-    } else if (e.key === 'Enter' && !busy) {
-      e.stopPropagation();
-      onConfirm();
+      return;
+    }
+    if (e.key !== 'Tab') return;
+
+    const controls = dialogEl
+      ? Array.from(dialogEl.querySelectorAll<HTMLButtonElement>('button:not(:disabled)'))
+      : [];
+    if (controls.length === 0) {
+      e.preventDefault();
+      dialogEl?.focus();
+      return;
+    }
+
+    const first = controls[0];
+    const last = controls[controls.length - 1];
+    if (e.shiftKey && (document.activeElement === first || !dialogEl?.contains(document.activeElement))) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && document.activeElement === last) {
+      e.preventDefault();
+      first.focus();
     }
   }
 </script>
@@ -34,7 +66,7 @@
 <svelte:window onkeydown={onKeydown} />
 
 <div class="confirm-backdrop" role="presentation" onmousedown={(e) => { if (e.target === e.currentTarget && !busy) onCancel(); }}>
-  <div class="confirm" role="alertdialog" aria-modal="true" aria-label={title}>
+  <div bind:this={dialogEl} class="confirm" role="alertdialog" aria-modal="true" aria-label={title} tabindex="-1">
     <div class="confirm-head">
       <TriangleAlert size={14} />
       <span class="confirm-title">{title}</span>
@@ -44,7 +76,7 @@
       <div class="confirm-detail">{detail}</div>
     {/if}
     <div class="confirm-actions">
-      <button type="button" class="btn" onclick={onCancel} disabled={busy}>Cancel</button>
+      <button bind:this={cancelEl} type="button" class="btn" onclick={onCancel} disabled={busy}>Cancel</button>
       <button type="button" class="btn danger" onclick={onConfirm} disabled={busy}>
         {busy ? 'Working…' : confirmLabel}
       </button>

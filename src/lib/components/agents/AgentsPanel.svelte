@@ -132,39 +132,10 @@
     return row.isMain ? mainStatus(view.status) : STATUS_FACE[row.agent.status];
   }
 
-  // --- Runtime ticker -------------------------------------------------------
-  // Baselines let a running agent's runtime advance between progress events:
-  // each time durationMs changes we re-anchor, then add local elapsed time.
-  let now = $state(Date.now());
-  const baselines = new Map<string, { d: number; at: number }>();
-
-  $effect(() => {
-    if (!view.agents.some(agent => agent.status === 'running' || agent.status === 'waiting' || agent.status === 'pending')) return;
-    const timer = setInterval(() => {
-      now = Date.now();
-    }, 1000);
-    return () => clearInterval(timer);
-  });
-
-  $effect(() => {
-    const seen = new Set<string>();
-    const at = Date.now();
-    for (const agent of view.agents) {
-      seen.add(agent.id);
-      const d = agent.durationMs ?? 0;
-      const prev = baselines.get(agent.id);
-      if (!prev || prev.d !== d) baselines.set(agent.id, { d, at });
-    }
-    for (const id of baselines.keys()) if (!seen.has(id)) baselines.delete(id);
-  });
-
+  // Agent progress events carry durationMs, so runtime display is event-driven
+  // and does not keep a panel timer alive for queued or long-running agents.
   function runtimeMs(agent: AgentInfo): number | undefined {
-    const base = baselines.get(agent.id);
-    if (!base) return agent.durationMs;
-    if (agent.status === 'running' || agent.status === 'waiting' || agent.status === 'pending') {
-      return base.d + (now - base.at);
-    }
-    return agent.durationMs ?? base.d;
+    return agent.durationMs;
   }
 
   // --- Formatting -----------------------------------------------------------
@@ -252,9 +223,11 @@
     return () => clearTimeout(timer);
   });
 
-  // Reset when the panel is reused for a different thread.
+  // Reset when the panel is reused for a different thread. Invalidate any
+  // in-flight request before clearing the transcript it could still update.
   $effect(() => {
     void view.threadId;
+    fetchSeq += 1;
     selectedId = null;
     detailItems = [];
     detailError = null;
@@ -263,6 +236,9 @@
   });
 
   function select(id: string) {
+    // The replacement fetch starts after debounce; invalidate the previous one
+    // now so it cannot populate this selection during that window.
+    fetchSeq += 1;
     selectedId = id;
     detailItems = [];
     detailError = null;
@@ -271,6 +247,7 @@
   }
 
   function deselect() {
+    fetchSeq += 1;
     selectedId = null;
     detailItems = [];
     detailError = null;

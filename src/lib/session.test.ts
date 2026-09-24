@@ -99,6 +99,51 @@ test('opening a busy thread preserves its prior completed assistant turn', () =>
   expect(assistantTexts(model)).toEqual(['Previous answer', 'Current answer']);
 });
 
+test('timestamp-less equal-length assistant messages do not collide', () => {
+  const model = new SessionModel(snapshot);
+  const left: RpcMessage = { role: 'assistant', content: [{ type: 'text', text: 'Left answer' }] };
+  const right: RpcMessage = { role: 'assistant', content: [{ type: 'text', text: 'Other reply' }] };
+  model.apply({ type: 'message_end', message: left });
+  model.apply({ type: 'message_end', message: right });
+  expect(assistantTexts(model)).toEqual(['Left answer', 'Other reply']);
+});
+
+test('exact timestamp-less message replays are suppressed', () => {
+  const model = new SessionModel(snapshot);
+  const message: RpcMessage = { role: 'assistant', content: [{ type: 'text', text: 'Only once' }] };
+  model.apply({ type: 'message_end', message });
+  model.apply({ type: 'message_end', message });
+  expect(assistantTexts(model)).toEqual(['Only once']);
+});
+
+test('turn_end does not duplicate a message_end that only gained usage metadata', () => {
+  const model = new SessionModel(snapshot);
+  const delivered: RpcMessage = {
+    role: 'assistant',
+    content: [{ type: 'thinking', thinking: 'Need no tools.' }, { type: 'text', text: '4' }],
+    timestamp: 42,
+    stopReason: 'stop'
+  };
+  const repeated = {
+    ...delivered,
+    usage: { input: 10, output: 1, total: 11 }
+  } as RpcMessage;
+  model.apply({ type: 'agent_start' });
+  model.apply({ type: 'message_end', message: delivered });
+  model.apply({ type: 'turn_end', message: repeated });
+  expect(model.view.items.filter(item => item.kind === 'thinking')).toHaveLength(1);
+  expect(assistantTexts(model)).toEqual(['4']);
+});
+
+test('stable message IDs distinguish identical payloads', () => {
+  const model = new SessionModel(snapshot);
+  const first = { role: 'assistant', id: 'message-1', content: [{ type: 'text', text: 'Same payload' }] } as RpcMessage;
+  const second = { role: 'assistant', id: 'message-2', content: [{ type: 'text', text: 'Same payload' }] } as RpcMessage;
+  model.apply({ type: 'message_end', message: first });
+  model.apply({ type: 'message_end', message: second });
+  expect(assistantTexts(model)).toEqual(['Same payload', 'Same payload']);
+});
+
 test('a large terminal agent-end summary does not duplicate delivered messages', () => {
   const model = new SessionModel(snapshot);
   const messages: RpcMessage[] = Array.from({ length: 2050 }, (_, index) => ({
@@ -108,6 +153,48 @@ test('a large terminal agent-end summary does not duplicate delivered messages',
   for (const message of messages) model.apply({ type: 'message_end', message });
   model.apply({ type: 'agent_end', messages, isTerminal: true });
   expect(model.view.items.filter(item => item.kind === 'user')).toHaveLength(messages.length);
+});
+
+test('long sessions preserve replayed messages, tool ordering, nested agents, and status within budget', () => {
+  const started = performance.now();
+  const messages: RpcMessage[] = Array.from({ length: 5000 }, (_, index) => ({
+    role: 'user', content: `Message ${index}`, timestamp: index + 1
+  }));
+  const model = new SessionModel({ ...snapshot, messages });
+  model.apply({ type: 'agent_start' });
+  for (const message of messages.slice(-1500)) model.apply({ type: 'turn_end', message });
+  for (let index = 0; index < 100; index++) {
+    const toolCallId = `tool-${index}`;
+    model.apply({ type: 'tool_execution_start', toolCallId, toolName: 'stress', intent: `Step ${index}` });
+    model.apply({
+      type: 'tool_execution_end', toolCallId,
+      result: { content: [{ type: 'text', text: `Result ${index}` }] }
+    });
+  }
+  const agentIds = ['Stress-0'];
+  for (let index = 1; index < 10; index++) agentIds.push(`${agentIds.at(-1)}.Level-${index}`);
+  for (const id of agentIds) {
+    model.apply({ type: 'subagent_lifecycle', payload: { id, agent: 'task', status: 'started' } });
+  }
+  for (const id of agentIds) {
+    model.apply({ type: 'subagent_lifecycle', payload: { id, agent: 'task', status: 'completed' } });
+  }
+  model.apply({ type: 'agent_settled' });
+
+  const users = model.view.items.filter(item => item.kind === 'user');
+  const tools = model.view.items.filter(item => item.kind === 'tool');
+  expect(users).toHaveLength(5000);
+  expect(users[0]).toMatchObject({ text: 'Message 0', timestamp: 1 });
+  expect(users.at(-1)).toMatchObject({ text: 'Message 4999', timestamp: 5000 });
+  expect(tools).toHaveLength(100);
+  expect(tools.map(tool => tool.kind === 'tool' ? tool.toolCallId : '')).toEqual(
+    Array.from({ length: 100 }, (_, index) => `tool-${index}`)
+  );
+  expect(tools.every(tool => tool.kind === 'tool' && tool.status === 'completed')).toBe(true);
+  expect(model.view.agents.map(agent => agent.name)).toEqual(agentIds.map(id => id.split('.').at(-1)));
+  expect(model.view.agents.every(agent => agent.status === 'completed')).toBe(true);
+  expect(model.view.status).toBe('completed');
+  expect(performance.now() - started).toBeLessThan(15_000);
 });
 
 test('late same-id prompt failure ends the run with an actionable error', () => {

@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { VList } from 'virtua/svelte';
-  import { openPath } from '@tauri-apps/plugin-opener';
+  import { api, onBackendEvent } from '$lib/api';
   import {
     ChevronDown,
     ChevronUp,
@@ -18,7 +18,6 @@
     Undo2,
     X,
   } from '@lucide/svelte';
-  import { api, onBackendEvent } from '$lib/api';
   import type { ChangedFile, ChangesSummary, GitFile, Thread } from '$lib/types';
   import ConfirmDialog from './ConfirmDialog.svelte';
   import DiffEditor from './DiffEditor.svelte';
@@ -146,7 +145,7 @@
   async function openExternally() {
     if (!selectedPath) return;
     try {
-      await openPath(joinPath(worktreeRoot, selectedPath));
+      await api.openChangedFile(thread.id, selectedPath);
     } catch (err) {
       showNotice(`Could not open file: ${errorMessage(err)}`);
     }
@@ -195,21 +194,19 @@
         selectedPath = null;
         gitFile = null;
       }
+      const requestedPath =
+        focusPath && focusPath !== lastFocus && s.files.some((f) => f.path === focusPath)
+          ? focusPath
+          : undefined;
       if (!selectedPath) {
-        const target =
-          (focusPath && focusPath !== lastFocus && s.files.some((f) => f.path === focusPath)
-            ? focusPath
-            : undefined) ??
-          s.files[0]?.path ??
-          null;
-        if (target) {
-          selectedPath = target;
-          void loadFile(target);
-        }
+        const target = requestedPath ?? s.files[0]?.path ?? null;
+        if (target) selectFile(target);
+      } else if (requestedPath) {
+        selectFile(requestedPath);
       } else {
         void loadFile(selectedPath);
       }
-      lastFocus = focusPath;
+      if (requestedPath) lastFocus = requestedPath;
     } catch (err) {
       error = errorMessage(err);
     } finally {
@@ -287,9 +284,10 @@
 
   // Re-focus when the parent points at a different file after mount.
   $effect(() => {
-    if (focusPath && focusPath !== lastFocus && summary?.files.some((f) => f.path === focusPath)) {
-      lastFocus = focusPath;
-      selectFile(focusPath);
+    const requestedPath = focusPath;
+    if (requestedPath && requestedPath !== lastFocus && summary?.files.some((f) => f.path === requestedPath)) {
+      lastFocus = requestedPath;
+      selectFile(requestedPath);
     }
   });
 
@@ -347,6 +345,8 @@
             type="button"
             class:active={mode === 'unified'}
             title="Unified diff"
+            aria-label="Unified diff"
+            aria-pressed={mode === 'unified'}
             onclick={() => setMode('unified')}
           >
             <List size={12} />
@@ -355,6 +355,8 @@
             type="button"
             class:active={mode === 'split'}
             title="Split diff"
+            aria-label="Split diff"
+            aria-pressed={mode === 'split'}
             onclick={() => setMode('split')}
           >
             <Columns2 size={12} />
@@ -417,6 +419,7 @@
                 type="button"
                 class="file-row"
                 class:selected={f.path === selectedPath}
+                aria-current={f.path === selectedPath ? 'true' : undefined}
                 onclick={() => selectFile(f.path)}
                 title={f.path}
               >

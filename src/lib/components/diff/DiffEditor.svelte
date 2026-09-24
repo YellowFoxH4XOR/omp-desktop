@@ -95,6 +95,9 @@
     btn.onmousedown = (e) => {
       e.preventDefault();
       e.stopPropagation();
+    };
+    btn.onclick = (e) => {
+      e.stopPropagation();
       if (!canRevertHunk || !view) return;
       const widget = (e.currentTarget as HTMLElement).closest('.cm-deletedChunk');
       if (!widget) return;
@@ -126,6 +129,9 @@
     btn.textContent = '⇝';
     btn.onmousedown = (e) => {
       e.preventDefault();
+      e.stopPropagation();
+    };
+    btn.onclick = (e) => {
       e.stopPropagation();
       if (!canRevertHunk || !mergeView) return;
       const idx = Number((e.currentTarget as HTMLElement).dataset.chunk);

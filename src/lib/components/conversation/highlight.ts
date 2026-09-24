@@ -6,20 +6,12 @@ const DARK_THEME = 'github-dark-default';
 const INITIAL_LANGS = [
   'typescript',
   'javascript',
-  'tsx',
-  'jsx',
   'json',
   'bash',
-  'shell',
   'markdown',
   'python',
   'go',
   'rust',
-  'css',
-  'html',
-  'yaml',
-  'toml',
-  'diff',
 ];
 
 const LANG_ALIASES: Record<string, string> = {
@@ -38,6 +30,7 @@ const LANG_ALIASES: Record<string, string> = {
   golang: 'go',
   'c++': 'cpp',
   'objective-c': 'objc',
+  'shellscript': 'bash',
   'c#': 'csharp',
   'f#': 'fsharp',
   'visual-basic': 'vb',
@@ -98,15 +91,15 @@ async function ensureLanguage(highlighter: Highlighter, lang: string): Promise<b
  * unavailable so callers can fall back to escaped plain text.
  */
 export async function highlightCode(code: string, lang?: string): Promise<string | null> {
-  const highlighter = await getHighlighter();
-  if (!highlighter) return null;
   const normalized = (lang ?? '').trim().toLowerCase();
   const resolved = LANG_ALIASES[normalized] ?? normalized;
   const target = resolved || 'text';
-  if (!(await ensureLanguage(highlighter, target))) {
-    if (target === 'text') return null;
-    return highlightCode(code, 'text');
-  }
+  // Plain text needs no grammar and must not pull the highlighter into memory.
+  if (target === 'text') return null;
+
+  const highlighter = await getHighlighter();
+  if (!highlighter) return null;
+  if (!(await ensureLanguage(highlighter, target))) return null;
   try {
     return highlighter.codeToHtml(code, {
       lang: target,

@@ -21,6 +21,8 @@
   let streamMode = $state<'steer' | 'follow_up'>('steer');
   let modeOpen = $state(false);
   let cmdIndex = $state(0);
+  const commandListId = 'composer-command-suggestions';
+  const optionId = (index: number) => `${commandListId}-option-${index}`;
   let cmdDismissed = $state(false);
 
   const streaming = $derived(status === 'active');
@@ -57,6 +59,11 @@
   $effect(() => {
     suggestions.length;
     cmdIndex = 0;
+  });
+
+  $effect(() => {
+    if (suggestions.length === 0) return;
+    document.getElementById(optionId(cmdIndex))?.scrollIntoView({ block: 'nearest' });
   });
 
   async function submit() {
@@ -116,9 +123,10 @@
 
 <div class="composer" class:disabled>
   {#if suggestions.length > 0}
-    <div class="suggest" role="listbox" aria-label="Commands">
+    <div class="suggest" id={commandListId} role="listbox" aria-label="Commands">
       {#each suggestions as command, i (command.name)}
         <button
+          id={optionId(i)}
           type="button"
           role="option"
           aria-selected={i === cmdIndex}
@@ -141,6 +149,12 @@
       bind:this={area}
       bind:value={text}
       onkeydown={onKeydown}
+      role="combobox"
+      aria-autocomplete="list"
+      aria-haspopup="listbox"
+      aria-expanded={suggestions.length > 0}
+      aria-controls={suggestions.length > 0 ? commandListId : undefined}
+      aria-activedescendant={suggestions.length > 0 ? optionId(cmdIndex) : undefined}
       oninput={() => (cmdDismissed = false)}
       rows="1"
       class="input"
