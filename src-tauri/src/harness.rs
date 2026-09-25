@@ -15,7 +15,10 @@ const SETTING_OVERRIDE_PI: &str = "executable_override.pi";
 const MAX_PROBE_OUTPUT_BYTES: u64 = 1_048_576;
 
 /// Fixed, allowlisted install commands. These are exactly what the onboarding
-/// UI displays; nothing else may be executed by install_harness.
+/// UI displays (via `install_commands`) and what `install_harness` executes
+/// (via `install_command`); nothing else may be executed by install_harness.
+/// The executed argv is intentionally unchanged (see E6 accepted risk): the
+/// UI copy is derived from the same source so it cannot drift.
 fn install_command(kind: HarnessKind) -> (&'static str, Vec<&'static str>) {
     match kind {
         HarnessKind::Omp => ("bun", vec!["install", "-g", "@oh-my-pi/pi-coding-agent"]),
@@ -39,11 +42,111 @@ fn install_command_display(kind: HarnessKind) -> String {
         .join(" ")
 }
 
+/// UI display copies of the fixed install commands, one per harness kind.
+pub fn install_commands() -> Vec<crate::dto::HarnessInstallCommand> {
+    [HarnessKind::Omp, HarnessKind::Pi]
+        .iter()
+        .map(|kind| crate::dto::HarnessInstallCommand {
+            kind: *kind,
+            command: install_command_display(*kind),
+        })
+        .collect()
+}
+
 fn override_setting_key(kind: HarnessKind) -> &'static str {
     match kind {
         HarnessKind::Omp => SETTING_OVERRIDE_OMP,
         HarnessKind::Pi => SETTING_OVERRIDE_PI,
     }
+}
+
+fn override_digest_key(kind: HarnessKind) -> &'static str {
+    match kind {
+        HarnessKind::Omp => "executable_override_digest.omp",
+        HarnessKind::Pi => "executable_override_digest.pi",
+    }
+}
+
+fn override_version_key(kind: HarnessKind) -> &'static str {
+    match kind {
+        HarnessKind::Omp => "executable_override_version.omp",
+        HarnessKind::Pi => "executable_override_version.pi",
+    }
+}
+
+/// Ownership/type gate for a user-supplied executable override. The override
+/// becomes the binary every later spawn runs, so it must be an absolute path
+/// to a regular file the current user owns, with no group/world write bits
+/// (on Unix) and no symlink anywhere in the resolution (a symlink could be
+/// repointed after validation).
+fn check_override_file(path: &Path) -> AppResult<PathBuf> {
+    if !path.is_absolute() {
+        return Err(AppError::new(
+            "The override must be an absolute path, not a relative one.",
+        ));
+    }
+    // Reject symlinks before resolving: `symlink_metadata` does not follow
+    // the final component, and `canonicalize` afterwards catches symlinked
+    // parents. Either way the stored path is the fully resolved one.
+    let meta = std::fs::symlink_metadata(path)
+        .map_err(|_| AppError::new(format!("No executable exists at {}.", path.display())))?;
+    if meta.file_type().is_symlink() {
+        return Err(AppError::new(
+            "The override must be a real file, not a symlink.",
+        ));
+    }
+    let resolved = std::fs::canonicalize(path)
+        .map_err(|_| AppError::new(format!("No executable exists at {}.", path.display())))?;
+    if std::fs::symlink_metadata(&resolved)
+        .map(|m| !m.file_type().is_file())
+        .unwrap_or(true)
+    {
+        return Err(AppError::new(format!(
+            "No executable exists at {}.",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(&resolved)
+            .map_err(|_| AppError::new(format!("No executable exists at {}.", path.display())))?;
+        if meta.uid() != unsafe { libc::geteuid() } {
+            return Err(AppError::new(
+                "The override must be owned by the current user.",
+            ));
+        }
+        if meta.mode() & 0o022 != 0 {
+            return Err(AppError::new(
+                "The override must not be writable by group or others.",
+            ));
+        }
+    }
+    Ok(resolved)
+}
+
+/// Re-verify a stored override immediately before use: the file must still
+/// pass the ownership/type gate and its digest must match the value recorded
+/// at validation time. Fails closed when the override changed or the stored
+/// digest is missing (e.g. written by an older build).
+fn verify_stored_override_file(
+    store: &Store,
+    kind: HarnessKind,
+    path: &Path,
+) -> AppResult<PathBuf> {
+    let resolved = check_override_file(path)?;
+    let expected = store
+        .get_setting_checked(override_digest_key(kind))?
+        .filter(|s| !s.is_empty());
+    let actual = util::file_digest(&resolved)?;
+    if expected.as_deref() != Some(actual.as_str()) {
+        return Err(AppError::new(format!(
+            "{} override at {} changed since it was validated. Re-select it in Settings.",
+            kind.display_name(),
+            resolved.display()
+        )));
+    }
+    Ok(resolved)
 }
 
 /// Well-known install locations checked after PATH lookups.
@@ -205,12 +308,66 @@ impl HarnessRegistry {
     }
 
     /// Executable path for spawning; errors with guidance when undetected.
+    /// A stored override is re-verified by digest immediately before use
+    /// (never executed just to detect it); non-override candidates keep the
+    /// existing `--version` identity gate.
     pub async fn executable_path(&self, kind: HarnessKind) -> AppResult<PathBuf> {
+        // A configured override always takes precedence over any cached
+        // install and fails closed, so check the store first: a missing,
+        // changed, or unreadable override must error rather than silently
+        // run a stale cached binary (or skip to a different one).
+        let configured = self.store.get_setting_checked(override_setting_key(kind))?;
+        if let Some(ov) = configured {
+            if !ov.trim().is_empty() {
+                return verify_stored_override_file(&self.store, kind, Path::new(ov.trim()))
+                    .map_err(|e| {
+                        self.resolved.lock().remove(&kind);
+                        e
+                    });
+            }
+        }
         if let Some(inst) = self.executable(kind) {
             return Ok(PathBuf::from(inst.path));
         }
         // Lazy detection so commands work even if detect_harnesses was skipped.
+        self.detect_kind(kind).await
+    }
+
+    /// Detect one kind, verifying a stored override by digest and validating
+    /// non-override candidates by execution as before. A configured override
+    /// takes precedence and fails closed: when the user's chosen executable
+    /// is missing, changed, or unreadable, spawning must error rather than
+    /// silently run a different binary.
+    async fn detect_kind(&self, kind: HarnessKind) -> AppResult<PathBuf> {
+        let configured = self.store.get_setting_checked(override_setting_key(kind))?;
+        if let Some(ov) = configured {
+            if !ov.trim().is_empty() {
+                let resolved = verify_stored_override_file(&self.store, kind, Path::new(ov.trim()))
+                    .map_err(|e| {
+                        // Fail closed: never serve a stale cached install
+                        // after the override broke.
+                        self.resolved.lock().remove(&kind);
+                        e
+                    })?;
+                let version = self
+                    .store
+                    .get_setting_checked(override_version_key(kind))?
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_default();
+                let inst = HarnessInstallation {
+                    kind,
+                    path: resolved.to_string_lossy().to_string(),
+                    version,
+                    source: "override".to_string(),
+                };
+                self.resolved.lock().insert(kind, inst.clone());
+                return Ok(PathBuf::from(inst.path));
+            }
+        }
         for (path, source) in self.candidates(kind) {
+            if source == "override" {
+                continue;
+            }
             if let Ok(version) = validate_executable(&path, kind).await {
                 let inst = HarnessInstallation {
                     kind,
@@ -229,6 +386,9 @@ impl HarnessRegistry {
     }
 
     /// Ordered candidate list: override → PATH → login-shell PATH → known locations.
+    /// `detect`/`detect_kind` check the override first via the checked API
+    /// and fail closed, so this list only supplies it as a fallback entry;
+    /// a database failure here skips the entry rather than inventing one.
     fn candidates(&self, kind: HarnessKind) -> Vec<(PathBuf, String)> {
         let mut out: Vec<(PathBuf, String)> = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -238,10 +398,12 @@ impl HarnessRegistry {
                 out.push((p, source.to_string()));
             }
         };
-        if let Some(ov) = self.store.get_setting(override_setting_key(kind)) {
-            if !ov.trim().is_empty() {
+        match self.store.get_setting_checked(override_setting_key(kind)) {
+            Ok(Some(ov)) if !ov.trim().is_empty() => {
                 push(PathBuf::from(ov), "override");
             }
+            Ok(_) => {}
+            Err(_) => {}
         }
         let name = kind.binary_name();
         if let Ok(p) = which::which(name) {
@@ -260,11 +422,52 @@ impl HarnessRegistry {
         out
     }
 
-    /// Full detection pass; returns every validated installation.
+    /// Full detection pass; returns every validated installation. A stored
+    /// override is verified by digest (never executed just to detect it);
+    /// non-override candidates keep the existing `--version` identity gate.
+    /// A configured override takes precedence and fails closed: a bad
+    /// override reports nothing for that kind instead of silently returning
+    /// a different binary as the user's choice.
     pub async fn detect(&self) -> Vec<HarnessInstallation> {
         let mut found = Vec::new();
         for kind in [HarnessKind::Omp, HarnessKind::Pi] {
+            let configured = self
+                .store
+                .get_setting_checked(override_setting_key(kind))
+                .ok()
+                .flatten()
+                .filter(|s| !s.trim().is_empty());
+            if let Some(ov) = configured {
+                match verify_stored_override_file(&self.store, kind, Path::new(ov.trim())) {
+                    Ok(resolved) => {
+                        let version = self
+                            .store
+                            .get_setting_checked(override_version_key(kind))
+                            .ok()
+                            .flatten()
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or_default();
+                        let inst = HarnessInstallation {
+                            kind,
+                            path: resolved.to_string_lossy().to_string(),
+                            version,
+                            source: "override".to_string(),
+                        };
+                        self.resolved.lock().insert(kind, inst.clone());
+                        found.push(inst);
+                    }
+                    Err(_) => {
+                        // Fail closed: drop any previously cached install for
+                        // this kind so a broken override is never served stale.
+                        self.resolved.lock().remove(&kind);
+                    }
+                }
+                continue;
+            }
             for (path, source) in self.candidates(kind) {
+                if source == "override" {
+                    continue;
+                }
                 match validate_executable(&path, kind).await {
                     Ok(version) => {
                         let inst = HarnessInstallation {
@@ -284,22 +487,27 @@ impl HarnessRegistry {
         found
     }
 
-    /// Pin a user-selected executable after validating it.
+    /// Pin a user-selected executable after validating it. The file must pass
+    /// the ownership/type gate first; validation still executes the chosen
+    /// binary once (the user explicitly picked it), and the resulting digest
+    /// plus version are stored so later detection/spawn only re-verifies the
+    /// digest without re-executing anything.
     pub async fn set_override(
         &self,
         kind: HarnessKind,
         path: &str,
     ) -> AppResult<HarnessInstallation> {
-        let p = PathBuf::from(path);
-        if !p.is_file() {
-            return Err(AppError::new(format!("No executable exists at {path}.")));
-        }
-        let version = validate_executable(&p, kind).await?;
+        let resolved = check_override_file(Path::new(path))?;
+        let version = validate_executable(&resolved, kind).await?;
+        let digest = util::file_digest(&resolved)?;
         self.store
-            .set_setting(override_setting_key(kind), &p.to_string_lossy())?;
+            .set_setting(override_setting_key(kind), &resolved.to_string_lossy())?;
+        self.store.set_setting(override_digest_key(kind), &digest)?;
+        self.store
+            .set_setting(override_version_key(kind), &version)?;
         let inst = HarnessInstallation {
             kind,
-            path: p.to_string_lossy().to_string(),
+            path: resolved.to_string_lossy().to_string(),
             version,
             source: "override".to_string(),
         };

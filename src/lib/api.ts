@@ -1,12 +1,13 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { z } from 'zod';
-import type { AgentInfo, BackendEvent, ChangesSummary, GitFile, HarnessInstallation, HarnessKind, LoginProvider, ModelInfo, Project, RpcMessage, SessionSnapshot, SessionState, Thread, UiResponse, Usage } from './types';
+import type { AgentInfo, BackendEvent, ChangesSummary, GitFile, HarnessInstallation, HarnessInstallCommand, HarnessKind, LoginProvider, ModelInfo, Project, RpcMessage, SessionSnapshot, SessionState, Thread, UiResponse, Usage } from './types';
 
 export const api = {
   detectHarnesses: () => invoke<HarnessInstallation[]>('detect_harnesses'),
   setExecutableOverride: (kind: HarnessKind, path: string) => invoke<HarnessInstallation>('set_executable_override', { kind, path }),
   installHarness: (kind: HarnessKind) => invoke<void>('install_harness', { kind }),
+  harnessInstallCommands: () => invoke<HarnessInstallCommand[]>('harness_install_commands'),
   listProjects: () => invoke<Project[]>('list_projects'),
   addProject: (path: string, harness: HarnessKind) => invoke<Project>('add_project', { path, harness }),
   removeProject: (projectId: string) => invoke<void>('remove_project', { projectId }),
@@ -31,7 +32,7 @@ export const api = {
   getSubagents: (threadId: string) => invoke<AgentInfo[]>('get_subagents', { threadId }),
   gitStatus: (threadId: string) => invoke<ChangesSummary>('git_status', { threadId }),
   gitFile: (threadId: string, path: string) => invoke<GitFile>('git_file', { threadId, path }),
-  gitRevertFile: (threadId: string, path: string) => invoke<void>('git_revert_file', { threadId, path }),
+  gitRevertFile: (threadId: string, path: string, expectedHash?: string | null) => invoke<void>('git_revert_file', { threadId, path, expectedHash: expectedHash ?? null }),
   gitWriteIfUnchanged: (threadId: string, path: string, expectedHash: string, content: string) => invoke<void>('git_write_if_unchanged', { threadId, path, expectedHash, content }),
   openChangedFile: (threadId: string, path: string) => invoke<void>('open_changed_file', { threadId, path }),
 };

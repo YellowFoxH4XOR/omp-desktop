@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { Check, Circle, LoaderCircle } from '@lucide/svelte';
+  import { Check, Circle, LoaderCircle, ListTodo } from '@lucide/svelte';
   import ToolShell from './ToolShell.svelte';
   import { resultText, type ToolItem } from './tool-utils';
 
@@ -66,11 +66,12 @@
   const entries = $derived(parseEntries());
   const doneCount = $derived(entries.filter((entry) => entry.state === 'done').length);
   const meta = $derived(entries.length > 0 ? `${doneCount}/${entries.length} done` : undefined);
+  const current = $derived(entries.find((entry) => entry.state === 'active'));
 </script>
 
-<ToolShell status={item.status} failed={item.status === 'failed'} {meta}>
+<ToolShell icon={ListTodo} status={item.status} failed={item.status === 'failed'} {meta}>
   {#snippet summary()}
-    <span class="line">Task list</span>
+    <span class="line">Plan{#if current}&nbsp;<span class="now">{current.text}</span>{/if}</span>
   {/snippet}
   {#snippet detail()}
     {#if entries.length > 0}
@@ -99,6 +100,9 @@
 <style>
   .line {
     min-width: 0;
+  }
+  .now {
+    color: var(--text);
   }
   .todos {
     list-style: none;

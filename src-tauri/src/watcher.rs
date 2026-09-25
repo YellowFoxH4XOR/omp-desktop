@@ -33,6 +33,9 @@ enum Cmd {
 }
 
 const DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(400);
+/// Continuous churn (builds, installs) would otherwise reset the debounce
+/// forever and the Changes panel would never refresh while an agent works.
+const MAX_DEBOUNCE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 const COMMAND_CAPACITY: usize = 256;
 const EVENT_CAPACITY: usize = 8;
 const MAX_WATCHED_DIRS: usize = 32;
@@ -55,14 +58,24 @@ impl WatcherManager {
         let generation = self
             .next_generation
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // Publish membership only when the request was accepted. A failed send
+        // must not leave the manager claiming a directory is watched; the next
+        // `ensure_running` retries.
+        if self
+            .cmd
+            .send(Cmd::Watch {
+                thread_id: thread_id.to_string(),
+                cwd: cwd.to_path_buf(),
+                generation,
+            })
+            .is_err()
+        {
+            eprintln!("omp-desktop: watcher command channel is closed; {thread_id} is not watched");
+            return;
+        }
         self.threads
             .lock()
             .insert(thread_id.to_string(), (cwd.to_path_buf(), generation));
-        let _ = self.cmd.send(Cmd::Watch {
-            thread_id: thread_id.to_string(),
-            cwd: cwd.to_path_buf(),
-            generation,
-        });
     }
 
     pub fn unwatch(&self, thread_id: &str) {
@@ -86,6 +99,25 @@ struct WatchedDir {
     _watcher: notify::RecommendedWatcher,
     _git_watcher: Option<notify::RecommendedWatcher>,
     threads: Vec<String>,
+}
+
+/// A registration that could not be installed must not stay in the membership
+/// map: the manager would claim a directory is watched while no change event
+/// can ever arrive. Clearing it also lets the next `watch()` (a newer
+/// generation) retry the install.
+fn forget_failed_watch(
+    threads: &Mutex<HashMap<String, (PathBuf, u64)>>,
+    thread_id: &str,
+    cwd: &Path,
+    generation: u64,
+) {
+    threads.lock().retain(|id, (current, latest)| {
+        !(id == thread_id && current == cwd && *latest == generation)
+    });
+    eprintln!(
+        "omp-desktop: could not watch {}; change notifications are unavailable for {thread_id}",
+        cwd.display()
+    );
 }
 
 fn watcher_thread(
@@ -125,6 +157,7 @@ fn watcher_thread(
                     continue;
                 }
                 if watchers.len() >= MAX_WATCHED_DIRS {
+                    forget_failed_watch(&threads, &thread_id, &cwd, generation);
                     continue;
                 }
                 let (tx, event_rx) = sync_channel::<()>(EVENT_CAPACITY);
@@ -148,9 +181,13 @@ fn watcher_thread(
                     });
                 let mut watcher = match watcher {
                     Ok(watcher) => watcher,
-                    Err(_) => continue,
+                    Err(_) => {
+                        forget_failed_watch(&threads, &thread_id, &cwd, generation);
+                        continue;
+                    }
                 };
                 if watcher.watch(&cwd, RecursiveMode::Recursive).is_err() {
+                    forget_failed_watch(&threads, &thread_id, &cwd, generation);
                     continue;
                 }
                 let git_watcher = worktree_git_watcher(&cwd, tx.clone());
@@ -167,8 +204,14 @@ fn watcher_thread(
                 let dir = cwd.clone();
                 std::thread::spawn(move || {
                     while event_rx.recv().is_ok() {
+                        let deadline = std::time::Instant::now() + MAX_DEBOUNCE_WAIT;
                         loop {
-                            match event_rx.recv_timeout(DEBOUNCE) {
+                            let wait = DEBOUNCE
+                                .min(deadline.saturating_duration_since(std::time::Instant::now()));
+                            if wait.is_zero() {
+                                break;
+                            }
+                            match event_rx.recv_timeout(wait) {
                                 Ok(()) => continue,
                                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
                                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
@@ -296,6 +339,21 @@ mod tests {
         assert!(manager.is_watching("failed"));
         manager.unwatch("failed");
         assert!(!manager.is_watching("failed"));
+    }
+
+    /// A watch request that never reached the watcher thread must not be
+    /// published as an installed watch.
+    #[test]
+    fn failed_command_send_does_not_publish_membership() {
+        let (tx, rx) = sync_channel(COMMAND_CAPACITY);
+        drop(rx);
+        let manager = WatcherManager {
+            cmd: tx,
+            threads: Arc::new(Mutex::new(HashMap::new())),
+            next_generation: std::sync::atomic::AtomicU64::new(1),
+        };
+        manager.watch("closed", Path::new("/tmp"));
+        assert!(!manager.is_watching("closed"));
     }
 
     #[test]

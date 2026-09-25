@@ -113,13 +113,16 @@ export function preview(value: string, max = 120): string {
   return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
 }
 
-/** Pretty-print args for the details disclosure (never shown by default). */
-export function prettyJson(value: unknown): string {
+/** Pretty-print args for the details disclosure (never shown by default).
+ *  Pass `maxChars` only for display-only dumps, never for approval prompts. */
+export function prettyJson(value: unknown, maxChars?: number): string {
+  let text: string;
   try {
-    return JSON.stringify(value, null, 2) ?? '';
+    text = JSON.stringify(value, null, 2) ?? '';
   } catch {
-    return String(value);
+    text = String(value);
   }
+  return maxChars !== undefined && text.length > maxChars ? `${text.slice(0, maxChars)}\n…` : text;
 }
 
 /** Extract http(s) URLs from tool args and result text. */

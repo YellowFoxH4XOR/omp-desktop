@@ -8,6 +8,11 @@ export interface HarnessInstallation {
   version: string;
   source: string;
 }
+export interface HarnessInstallCommand {
+  kind: HarnessKind;
+  command: string;
+}
+
 export interface Project {
   id: string;
   path: string;

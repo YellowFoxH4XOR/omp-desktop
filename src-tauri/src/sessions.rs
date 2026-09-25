@@ -39,11 +39,16 @@ fn bounded_session(mut session: ScannedSession) -> ScannedSession {
 enum BoundedRecord {
     Eof,
     Line,
+    /// EOF with bytes that were never newline-terminated: the normal state
+    /// of a transcript a subagent is still appending to. Callers must skip
+    /// the fragment rather than parse it.
+    Fragment,
     Oversized,
 }
 
 /// Read one newline-delimited record without allowing malformed or hostile
-/// files to grow the allocation beyond the protocol limit.
+/// files to grow the allocation beyond the protocol limit. An unterminated
+/// tail (no trailing newline at EOF) reports `Fragment`, never `Line`.
 fn read_bounded_record(
     reader: &mut impl BufRead,
     record: &mut Vec<u8>,
@@ -56,7 +61,7 @@ fn read_bounded_record(
             return Ok(if record.is_empty() {
                 BoundedRecord::Eof
             } else {
-                BoundedRecord::Line
+                BoundedRecord::Fragment
             });
         }
         let newline = available.iter().position(|byte| *byte == b'\n');
@@ -93,6 +98,11 @@ pub struct ScannedSession {
 /// that belongs to it, newest first.
 pub fn scan_sessions(kind: HarnessKind, cwd: &Path) -> Vec<ScannedSession> {
     let dir = util::session_dir_for(kind, cwd);
+    // Both harnesses share one flat directory when PI_CODING_AGENT_SESSION_DIR
+    // overrides the layout; only then is the OMP title-slot discriminator
+    // required to keep their schema-compatible headers apart.
+    let shared_layout =
+        util::session_dir_for(HarnessKind::Omp, cwd) == util::session_dir_for(HarnessKind::Pi, cwd);
     let mut out = Vec::new();
     let Ok(read_dir) = std::fs::read_dir(&dir) else {
         return out;
@@ -102,7 +112,7 @@ pub fn scan_sessions(kind: HarnessKind, cwd: &Path) -> Vec<ScannedSession> {
         if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
             continue;
         }
-        if let Some(s) = parse_session_file(kind, &path) {
+        if let Some(s) = parse_session_file(kind, &path, shared_layout) {
             // When PI_CODING_AGENT_SESSION_DIR flattens the layout, sessions
             // from many cwds share one dir; keep only this project's.
             if util::resolve_path(Path::new(&s.cwd)) != util::resolve_path(cwd) {
@@ -229,7 +239,11 @@ static SESSION_CACHE: std::sync::LazyLock<Mutex<SessionCache>> =
 /// Parse the head of a session JSONL file.
 /// OMP: first line may be a `title` slot, then a `session` header.
 /// Pi: first line is the `session` header; `session_info` may follow.
-fn parse_session_file(kind: HarnessKind, path: &Path) -> Option<ScannedSession> {
+fn parse_session_file(
+    kind: HarnessKind,
+    path: &Path,
+    require_disambiguator: bool,
+) -> Option<ScannedSession> {
     let file = std::fs::File::open(path).ok()?;
     let metadata = file.metadata().ok()?;
     let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
@@ -256,6 +270,7 @@ fn parse_session_file(kind: HarnessKind, path: &Path) -> Option<ScannedSession> 
     loop {
         match read_bounded_record(&mut reader, &mut line, MAX_JSONL_RECORD_BYTES) {
             Ok(BoundedRecord::Line) => {}
+            Ok(BoundedRecord::Fragment) => continue,
             Ok(BoundedRecord::Eof) => break,
             Ok(BoundedRecord::Oversized) => return None,
             Err(_) => return None,
@@ -331,10 +346,12 @@ fn parse_session_file(kind: HarnessKind, path: &Path) -> Option<ScannedSession> 
             break;
         }
     }
-    // OMP reserves a fixed-width title slot; Pi does not. In a shared flat
-    // directory this is the reliable discriminator between otherwise
-    // schema-compatible session headers.
-    if (kind == HarnessKind::Omp) != omp_title_slot {
+    // OMP reserves a fixed-width title slot; Pi does not. That is the reliable
+    // discriminator between otherwise schema-compatible session headers, but
+    // it is only needed when both harnesses can write into one flat directory
+    // (`PI_CODING_AGENT_SESSION_DIR`). Legacy OMP sessions without the slot
+    // must still be listed from OMP's own session directory.
+    if require_disambiguator && (kind == HarnessKind::Omp) != omp_title_slot {
         return None;
     }
     if session_id.is_empty() || cwd.is_empty() {
@@ -357,34 +374,67 @@ fn parse_session_file(kind: HarnessKind, path: &Path) -> Option<ScannedSession> 
     Some(session)
 }
 
-/// OMP stores subagent transcripts next to the main JSONL in its artifacts
-/// directory (`<session stem>/<agent-id>.jsonl`). Exclude advisor internals.
-pub fn historical_agents(session_file: &str) -> Vec<AgentInfo> {
-    let dir = Path::new(session_file).with_extension("");
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Vec::new();
-    };
-    let mut agents = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !entry.file_type().ok().is_some_and(|kind| kind.is_file())
-            || path.extension().and_then(|e| e.to_str()) != Some("jsonl")
-        {
-            continue;
-        }
-        let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+/// Bounded recursive discovery of agent transcripts: yields `(agent id, path)`.
+/// Depth-capped, entry-capped, `*.jsonl` only, skipping `__*`, invalid ids,
+/// and symlinks (never followed).
+const MAX_AGENT_DISCOVERY_DEPTH: usize = 3;
+const MAX_AGENT_DISCOVERY_ENTRIES: usize = 1024;
+
+fn discover_agent_transcripts(session_file: &str) -> Vec<(String, PathBuf)> {
+    let root = Path::new(session_file).with_extension("");
+    let mut out = Vec::new();
+    let mut stack = vec![(root, 0usize)];
+    let mut visited = 0usize;
+    while let Some((dir, depth)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
-        if id.starts_with("__") || !valid_agent_id(id) {
-            continue;
+        for entry in entries.flatten() {
+            visited += 1;
+            if visited > MAX_AGENT_DISCOVERY_ENTRIES || out.len() >= MAX_AGENT_DISCOVERY_ENTRIES {
+                return out;
+            }
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if kind.is_dir() {
+                if depth < MAX_AGENT_DISCOVERY_DEPTH {
+                    stack.push((path, depth + 1));
+                }
+                continue;
+            }
+            if !kind.is_file() {
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            if id.starts_with("__") || !valid_agent_id(id) {
+                continue;
+            }
+            out.push((id.to_string(), path));
         }
+    }
+    out
+}
+
+/// OMP stores subagent transcripts next to the main JSONL in its artifacts
+/// directory (`<session stem>/<agent-id>.jsonl`, with nested children under
+/// `<session stem>/<Parent>/<Parent>.<Child>.jsonl`). Exclude advisor internals.
+pub fn historical_agents(session_file: &str) -> Vec<AgentInfo> {
+    let mut agents = Vec::new();
+    for (id, path) in discover_agent_transcripts(session_file) {
         let parent_id = id.rsplit_once('.').map(|(parent, _)| parent.to_string());
         let status = agent_status_from_tail(&path);
         agents.push(AgentInfo {
-            id: id.to_string(),
+            id: id.clone(),
             parent_id,
             parent_tool_call_id: None,
-            name: id.rsplit('.').next().unwrap_or(id).to_string(),
+            name: id.rsplit('.').next().unwrap_or(&id).to_string(),
             role: None,
             task: None,
             status,
@@ -416,42 +466,60 @@ fn valid_agent_id(id: &str) -> bool {
 
 fn agent_status_from_tail(path: &Path) -> String {
     use std::io::{Read, Seek, SeekFrom};
+    const TAIL_WINDOW: u64 = 1024 * 1024;
+    const FALLBACK_WINDOW: u64 = 8 * 1024 * 1024;
     let Ok(mut file) = std::fs::File::open(path) else {
         return "parked".into();
     };
     let Ok(len) = file.metadata().map(|meta| meta.len()) else {
         return "parked".into();
     };
-    let offset = len.saturating_sub(128 * 1024);
-    if file.seek(SeekFrom::Start(offset)).is_err() {
-        return "parked".into();
-    }
-    let mut bytes = Vec::new();
-    if file.read_to_end(&mut bytes).is_err() {
-        return "parked".into();
-    }
-    let text = String::from_utf8_lossy(&bytes);
-    for line in text.lines().rev() {
-        if !line.contains("\"role\":\"assistant\"") {
-            continue;
+    // Larger bounded window first, then a bounded fallback for very long
+    // final records. Each pass starts on a record boundary so only complete
+    // records are parsed.
+    for window in [TAIL_WINDOW, FALLBACK_WINDOW] {
+        let offset = len.saturating_sub(window);
+        if file.seek(SeekFrom::Start(offset)).is_err() {
+            return "parked".into();
         }
-        let Ok(entry) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        if entry.get("type").and_then(Value::as_str) != Some("message") {
-            continue;
+        let mut bytes = Vec::new();
+        // Bounded: at most `window` bytes plus one partial head line.
+        if file.read_to_end(&mut bytes).is_err() {
+            return "parked".into();
         }
-        let reason = entry
-            .get("message")
-            .and_then(|message| message.get("stopReason"))
-            .and_then(Value::as_str);
-        return match reason {
-            Some("stop") => "completed",
-            Some("error") => "failed",
-            Some("aborted") => "aborted",
-            _ => "parked",
+        let mut text = String::from_utf8_lossy(&bytes).into_owned();
+        if offset > 0 {
+            if let Some(index) = text.find('\n') {
+                text.drain(..=index);
+            } else {
+                continue;
+            }
         }
-        .to_string();
+        for line in text.lines().rev() {
+            let Ok(entry) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            if entry.get("type").and_then(Value::as_str) != Some("message") {
+                continue;
+            }
+            let message = entry.get("message");
+            if message.and_then(|m| m.get("role")).and_then(Value::as_str) != Some("assistant") {
+                continue;
+            }
+            let reason = message
+                .and_then(|message| message.get("stopReason"))
+                .and_then(Value::as_str);
+            return match reason {
+                Some("stop") => "completed",
+                Some("error") => "failed",
+                Some("aborted") => "aborted",
+                _ => "parked",
+            }
+            .to_string();
+        }
+        if len <= window {
+            break;
+        }
     }
     "parked".into()
 }
@@ -464,7 +532,11 @@ pub fn read_agent_messages(session_file: &str, agent_id: &str) -> AppResult<Vec<
         return Err(AppError::new("Invalid agent id."));
     }
     let dir = Path::new(session_file).with_extension("");
-    let path = dir.join(format!("{agent_id}.jsonl"));
+    let path = discover_agent_transcripts(session_file)
+        .into_iter()
+        .find(|(id, _)| id == agent_id)
+        .map(|(_, path)| path)
+        .unwrap_or_else(|| dir.join(format!("{agent_id}.jsonl")));
     let resolved_dir = std::fs::canonicalize(&dir)
         .map_err(|_| AppError::new("Agent transcript directory is unavailable."))?;
     let resolved_path = std::fs::canonicalize(&path)
@@ -513,6 +585,9 @@ pub fn read_agent_messages(session_file: &str, agent_id: &str) -> AppResult<Vec<
         let record_offset = offset;
         match read_bounded_record(&mut reader, &mut line, MAX_JSONL_RECORD_BYTES) {
             Ok(BoundedRecord::Line) => {}
+            // A writer mid-append leaves an unterminated tail: skip it and
+            // keep the records that did land.
+            Ok(BoundedRecord::Fragment) => break,
             Ok(BoundedRecord::Eof) => break,
             Ok(BoundedRecord::Oversized) => {
                 return Err(AppError::new("Agent transcript record is too large."));
@@ -530,9 +605,11 @@ pub fn read_agent_messages(session_file: &str, agent_id: &str) -> AppResult<Vec<
                 "Agent transcript is too large to reconstruct.",
             ));
         }
-        let entry: Value = serde_json::from_slice(trimmed_record(&line)).map_err(|e| {
-            AppError::new(format!("Agent transcript contains an invalid record: {e}"))
-        })?;
+        // One malformed record must not kill the whole replay: skip it and
+        // return the records that did parse. Filesystem/IO errors stay fatal.
+        let Ok(entry) = serde_json::from_slice::<Value>(trimmed_record(&line)) else {
+            continue;
+        };
         let Some(id) = entry.get("id").and_then(Value::as_str) else {
             continue;
         };
@@ -659,7 +736,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let session = parse_session_file(HarnessKind::Omp, &path).unwrap();
+        let session = parse_session_file(HarnessKind::Omp, &path, true).unwrap();
         assert_eq!(session.title.len(), MAX_SESSION_METADATA_FIELD_BYTES);
         let cached = SESSION_CACHE.lock().get(
             &(HarnessKind::Omp, path.clone()),
@@ -720,21 +797,25 @@ mod tests {
         let omp = dir.join("omp.jsonl");
         std::fs::write(&omp, "{\"type\":\"title\",\"title\":\"Harness title\"}\n{\"type\":\"session\",\"id\":\"omp-1\",\"cwd\":\"/tmp/repo\",\"timestamp\":\"2026-09-23T00:00:00Z\"}\n{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"First prompt\"}}\n").unwrap();
         assert_eq!(
-            parse_session_file(HarnessKind::Omp, &omp).unwrap().title,
+            parse_session_file(HarnessKind::Omp, &omp, true)
+                .unwrap()
+                .title,
             "Harness title"
         );
 
         let pi = dir.join("pi.jsonl");
         std::fs::write(&pi, "{\"type\":\"session\",\"id\":\"pi-1\",\"cwd\":\"/tmp/repo\",\"timestamp\":\"2026-09-23T00:00:00Z\"}\n{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"First prompt\"}}\n{\"type\":\"session_info\",\"name\":\"First name\"}\n{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"content\":[]}}\n{\"type\":\"session_info\",\"name\":\"Latest name\"}\n").unwrap();
         assert_eq!(
-            parse_session_file(HarnessKind::Pi, &pi).unwrap().title,
+            parse_session_file(HarnessKind::Pi, &pi, true)
+                .unwrap()
+                .title,
             "Latest name"
         );
 
         let untitled = dir.join("untitled.jsonl");
         std::fs::write(&untitled, "{\"type\":\"session\",\"id\":\"pi-2\",\"cwd\":\"/tmp/repo\",\"timestamp\":\"2026-09-23T00:00:00Z\"}\n{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Investigate race condition\"}]}}\n").unwrap();
         assert_eq!(
-            parse_session_file(HarnessKind::Pi, &untitled)
+            parse_session_file(HarnessKind::Pi, &untitled, true)
                 .unwrap()
                 .title,
             "Investigate race condition"
@@ -751,17 +832,40 @@ mod tests {
         let pi = dir.join("pi.jsonl");
         std::fs::write(&pi, "{\"type\":\"session\",\"version\":3,\"id\":\"pi\",\"timestamp\":\"2026-09-23T00:00:00Z\",\"cwd\":\"/tmp/repo\"}\n").unwrap();
         assert_eq!(
-            parse_session_file(HarnessKind::Omp, &omp)
+            parse_session_file(HarnessKind::Omp, &omp, true)
                 .unwrap()
                 .session_id,
             "omp"
         );
-        assert!(parse_session_file(HarnessKind::Pi, &omp).is_none());
+        assert!(parse_session_file(HarnessKind::Pi, &omp, true).is_none());
         assert_eq!(
-            parse_session_file(HarnessKind::Pi, &pi).unwrap().session_id,
+            parse_session_file(HarnessKind::Pi, &pi, true)
+                .unwrap()
+                .session_id,
             "pi"
         );
-        assert!(parse_session_file(HarnessKind::Omp, &pi).is_none());
+        assert!(parse_session_file(HarnessKind::Omp, &pi, true).is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Legacy OMP sessions predate the fixed-width title slot. They must still
+    /// be listed from OMP's own session directory, while the shared-directory
+    /// discriminator keeps separating Pi's schema-compatible header.
+    #[test]
+    fn legacy_omp_session_without_title_slot_is_listed_outside_shared_layouts() {
+        let dir =
+            std::env::temp_dir().join(format!("omp-sessions-legacy-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy = dir.join("legacy.jsonl");
+        std::fs::write(
+            &legacy,
+            "{\"type\":\"session\",\"version\":3,\"id\":\"legacy\",\"timestamp\":\"2026-09-23T00:00:00Z\",\"cwd\":\"/tmp/repo\"}\n{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"Old prompt\"}}\n",
+        )
+        .unwrap();
+        assert!(parse_session_file(HarnessKind::Omp, &legacy, true).is_none());
+        let session = parse_session_file(HarnessKind::Omp, &legacy, false).unwrap();
+        assert_eq!(session.session_id, "legacy");
+        assert_eq!(session.title, "Old prompt");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -795,6 +899,88 @@ mod tests {
             std::os::unix::fs::symlink(&outside, artifacts.join("Outsider.jsonl")).unwrap();
             assert_eq!(historical_agents(&main.to_string_lossy()).len(), 1);
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// OMP 18.3.1 stores nested children one directory deeper as
+    /// `<artifacts>/<Parent>/<Parent>.<Child>.jsonl`; both discovery and
+    /// transcript lookup must resolve that layout after the RPC registry is
+    /// gone, or nested agents vanish from the panel on restart.
+    #[test]
+    fn nested_child_transcript_is_discovered_and_readable() {
+        let dir = std::env::temp_dir().join(format!("omp-agent-nested-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let main = dir.join("session.jsonl");
+        std::fs::write(
+            &main,
+            "{\"type\":\"session\",\"id\":\"root\",\"cwd\":\"/tmp/repo\"}\n",
+        )
+        .unwrap();
+        let artifacts = main.with_extension("");
+        let nested_dir = artifacts.join("Backend");
+        std::fs::create_dir_all(&nested_dir).unwrap();
+        std::fs::write(
+            nested_dir.join("Backend.DatabaseExpert.jsonl"),
+            "{\"type\":\"session\",\"id\":\"child\",\"cwd\":\"/tmp/repo\"}\n{\"type\":\"message\",\"id\":\"a\",\"parentId\":null,\"message\":{\"role\":\"user\",\"content\":\"Inspect database\"}}\n{\"type\":\"message\",\"id\":\"b\",\"parentId\":\"a\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Done\"}],\"stopReason\":\"stop\"}}\n",
+        )
+        .unwrap();
+        let agents = historical_agents(&main.to_string_lossy());
+        let nested = agents
+            .iter()
+            .find(|agent| agent.id == "Backend.DatabaseExpert")
+            .expect("nested child transcript must be discovered");
+        assert_eq!(nested.parent_id.as_deref(), Some("Backend"));
+        assert_eq!(nested.status, "completed");
+        let messages =
+            read_agent_messages(&main.to_string_lossy(), "Backend.DatabaseExpert").unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1]["content"][0]["text"], "Done");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A subagent is often read while it is still appending: a torn final
+    /// record or one corrupt line must not make the whole transcript
+    /// unavailable, matching the harness's own tolerant loaders.
+    #[test]
+    fn malformed_transcript_records_are_skipped() {
+        let dir = std::env::temp_dir().join(format!("omp-agent-torn-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let main = dir.join("session.jsonl");
+        std::fs::write(
+            &main,
+            "{\"type\":\"session\",\"id\":\"root\",\"cwd\":\"/tmp/repo\"}\n",
+        )
+        .unwrap();
+        let artifacts = main.with_extension("");
+        std::fs::create_dir_all(&artifacts).unwrap();
+        std::fs::write(
+            artifacts.join("Torn.jsonl"),
+            "{\"type\":\"session\",\"id\":\"torn\"}\nnot json at all\n{\"type\":\"message\",\"id\":\"a\",\"parentId\":null,\"message\":{\"role\":\"user\",\"content\":\"One\"}}\n{\"type\":\"message\",\"id\":\"b\",\"parentId\":\"a\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Two\"}],\"stopReason\":\"stop\"}}\n{\"type\":\"message\",\"id\":\"c\",\"pare",
+        )
+        .unwrap();
+        let messages = read_agent_messages(&main.to_string_lossy(), "Torn").unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["content"], "One");
+        assert_eq!(messages[1]["content"][0]["text"], "Two");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Status recovery must not classify a finished agent as `parked` just
+    /// because its final assistant record starts before a fixed tail window.
+    #[test]
+    fn long_final_assistant_record_still_reports_completed() {
+        let dir = std::env::temp_dir().join(format!("omp-agent-status-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Long.jsonl");
+        let filler = "x".repeat(200 * 1024);
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"type\":\"session\",\"id\":\"long\"}}\n{{\"type\":\"message\",\"id\":\"a\",\"parentId\":null,\"message\":{{\"role\":\"user\",\"content\":\"{filler}\"}}}}\n{{\"type\":\"message\",\"id\":\"b\",\"parentId\":\"a\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"Done\"}}],\"stopReason\":\"stop\"}}}}\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(agent_status_from_tail(&path), "completed");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

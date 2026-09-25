@@ -106,7 +106,7 @@ Build, ad-hoc sign, and verify the macOS application bundle:
 bun run bundle:macos
 ```
 
-The macOS command builds the app, signs the complete bundle with the local ad-hoc identity, and runs strict `codesign --verify --deep` validation.
+The macOS command builds the app, re-signs the bundle with the local ad-hoc identity while preserving the bundler's signature flags and entitlements, and verifies it with `codesign --verify --strict`. The script also fails if re-signing would weaken any flag and reports when the bundle carries no hardened runtime (local ad-hoc builds do not).
 
 The local application bundle is written to:
 

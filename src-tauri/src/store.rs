@@ -105,14 +105,21 @@ impl Store {
 
     // ---- settings ----
 
-    pub fn get_setting(&self, key: &str) -> Option<String> {
+    /// Checked read: only "no such row" maps to `Ok(None)`; lock/IO and
+    /// corruption errors propagate to the caller. Callers where a missing
+    /// value changes what runs or what the user sees as configured MUST use
+    /// this rather than swallowing errors.
+    pub fn get_setting_checked(&self, key: &str) -> AppResult<Option<String>> {
         let conn = self.conn.lock();
-        conn.query_row(
+        match conn.query_row(
             "SELECT value FROM settings WHERE key = ?1",
             params![key],
-            |r| r.get(0),
-        )
-        .ok()
+            |row| row.get::<_, String>(0),
+        ) {
+            Ok(value) => Ok(Some(value)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(other) => Err(other.into()),
+        }
     }
 
     pub fn set_setting(&self, key: &str, value: &str) -> AppResult<()> {

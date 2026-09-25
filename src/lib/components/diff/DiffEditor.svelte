@@ -49,7 +49,7 @@
 
   const langCompartment = new Compartment();
 
-  function baseExtensions(eol: string | null): Extension[] {
+  function baseExtensions(eol: string | null, seed: LanguageSupport | null = null): Extension[] {
     return [
       ...(eol ? [EditorState.lineSeparator.of(eol)] : []),
       lineNumbers(),
@@ -58,7 +58,7 @@
       EditorState.readOnly.of(true),
       EditorView.editable.of(false),
       keymap.of([...defaultKeymap]),
-      langCompartment.of([]),
+      langCompartment.of(seed ? [seed] : []),
       syntaxHighlighting(diffHighlight),
       diffTheme,
     ];
@@ -67,9 +67,15 @@
   function chunkScope(chunk: Chunk, aDoc: string, bDoc: string): string {
     const aLines = aDoc === '' ? 0 : aDoc.split('\n').length;
     const bLines = bDoc === '' ? 0 : bDoc.split('\n').length;
+    // Zero-width current side: HEAD content deleted in the worktree. The
+    // boundary is zero-based (offset 0 → line 0), unlike 1-based line ranges.
     if (chunk.fromB === chunk.toB) {
-      const line = Math.min(bLines, bDoc.slice(0, chunk.fromB).split('\n').length);
-      return `inserted lines after line ${line} of current`;
+      if (chunk.fromA === chunk.toA) return `empty change at line 0 of current`;
+      const boundary = Math.max(0, bDoc.slice(0, chunk.fromB).split('\n').length - 1);
+      const startA = aDoc.slice(0, chunk.fromA).split('\n').length;
+      const endA = Math.min(aLines, aDoc.slice(0, chunk.endA).split('\n').length);
+      const single = endA === startA;
+      return `deleted line${single ? '' : 's'} ${startA}${single ? '' : `–${endA}`} from HEAD (after line ${boundary} of current)`;
     }
     const startB = bDoc.slice(0, chunk.fromB).split('\n').length;
     const endB = Math.min(bLines, bDoc.slice(0, chunk.endB).split('\n').length);
@@ -165,7 +171,10 @@
     destroyViews();
     if (!hostEl) return;
     const eol = current.includes('\r\n') && !current.replace(/\r\n/g, '').includes('\n') ? '\r\n' : null;
-    const ext = baseExtensions(eol);
+    // Seed the resolved grammar so recreated deletion widgets capture it at
+    // build time; empty until the async load finishes.
+    const seed = langPath === path ? loadedSupport : null;
+    const ext = baseExtensions(eol, seed);
     if (mode === 'split') {
       mergeView = new MergeView({
         a: { doc: original, extensions: ext },
@@ -214,15 +223,34 @@
     const support = await languageFor(requestedPath);
     if (!support || seq !== buildSeq || !hostEl?.isConnected) return;
     loadedSupport = support;
-    // Language is isolated in a compartment. Reconfigure the existing editor
-    // instead of rebuilding the entire diff view when a grammar finishes
-    // loading, preserving undo/scroll/merge widget state.
-    const language = [support];
-    if (mergeView) {
-      mergeView.a.dispatch({ effects: langCompartment.reconfigure(language) });
-      mergeView.b.dispatch({ effects: langCompartment.reconfigure(language) });
-    } else {
-      view?.dispatch({ effects: langCompartment.reconfigure(language) });
+    // Unified deletion widgets capture the language facet when they are
+    // built, so reconfiguring the compartment alone leaves already-created
+    // widgets unhighlighted. Recreate the view once (the only rebuild tied
+    // to language load — never on keystrokes) with the grammar seeded, and
+    // preserve scroll/selection so the swap doesn't jump.
+    const prevSelection = activeView()?.state.selection.main;
+    const scrollerTops = hostEl
+      ? Array.from(hostEl.querySelectorAll('.cm-scroller, .cm-mergeView')).map(
+          (el) => (el as HTMLElement).scrollTop,
+        )
+      : [];
+    build();
+    const next = activeView();
+    if (next && prevSelection) {
+      next.dispatch({
+        selection: {
+          anchor: Math.min(prevSelection.anchor, next.state.doc.length),
+          head: Math.min(prevSelection.head, next.state.doc.length),
+        },
+        scrollIntoView: false,
+      });
+    }
+    if (hostEl) {
+      hostEl
+        .querySelectorAll('.cm-scroller, .cm-mergeView')
+        .forEach((el, i) => {
+          if (i < scrollerTops.length) (el as HTMLElement).scrollTop = scrollerTops[i];
+        });
     }
   }
 

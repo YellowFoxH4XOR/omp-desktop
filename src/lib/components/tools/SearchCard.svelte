@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { Search } from '@lucide/svelte';
   import ToolShell from './ToolShell.svelte';
   import {
     argPath,
@@ -46,7 +47,7 @@
   const shownOutput = $derived(truncated ? `${output.slice(0, 3000)}\n…` : output);
 </script>
 
-<ToolShell status={item.status} failed={item.status === 'failed' || item.result?.isError === true} meta={meta || undefined}>
+<ToolShell icon={Search} status={item.status} failed={item.status === 'failed' || item.result?.isError === true} meta={meta || undefined}>
   {#snippet summary()}
     <span class="line">Searched <code class="c">{preview(query || item.toolName, 70)}</code></span>
   {/snippet}

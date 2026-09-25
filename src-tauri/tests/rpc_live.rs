@@ -90,7 +90,7 @@ async fn omp_handshake_and_state() {
 async fn pi_no_ready_state() {
     let dir = std::env::temp_dir().join("pi-rpc-live");
     std::fs::create_dir_all(&dir).unwrap();
-    let (client, _rx) = spawn("pi", &["--mode", "rpc"], &dir);
+    let (client, rx) = spawn("pi", &["--mode", "rpc"], &dir);
     let state = tokio::time::timeout(
         std::time::Duration::from_secs(45),
         client.call("get_state", Map::new()),
@@ -105,6 +105,19 @@ async fn pi_no_ready_state() {
         .expect("get_messages");
     assert!(msgs.get("messages").is_some());
     client.shutdown().await;
+    // Pi has no `ready` frame: `get_state` is the readiness probe. Drain the
+    // event channel briefly and fail if a `ready` frame ever arrived.
+    let mut saw_ready = false;
+    while let Ok(frame) = rx.recv_timeout(std::time::Duration::from_millis(200)) {
+        if frame.get("type").and_then(Value::as_str) == Some("ready") {
+            saw_ready = true;
+            break;
+        }
+    }
+    assert!(
+        !saw_ready,
+        "Pi must not emit a `ready` frame; `get_state` is the readiness probe"
+    );
 }
 
 async fn smoke_prompt(bin: &str, args: &[&str], terminal_event: &str) {

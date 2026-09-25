@@ -1,4 +1,5 @@
 import type { BundledLanguage, Highlighter } from 'shiki';
+import { sanitizeHighlightHtml } from './markdown';
 
 const LIGHT_THEME = 'github-light-default';
 const DARK_THEME = 'github-dark-default';
@@ -44,6 +45,33 @@ let highlighterPromise: Promise<Highlighter | null> | null = null;
 const loadedLangs = new Set<string>();
 const pendingLangs = new Map<string, Promise<boolean>>();
 
+/** Tokenizing very large blocks blocks the main thread; show them plain. */
+const MAX_HIGHLIGHT_CHARS = 200_000;
+/** Virtualized rows remount on scroll, so cache sanitized output (LRU by size). */
+const CACHE_BUDGET_CHARS = 4_000_000;
+const htmlCache = new Map<string, string>();
+let cachedChars = 0;
+
+function cacheGet(key: string): string | undefined {
+  const html = htmlCache.get(key);
+  if (html === undefined) return undefined;
+  htmlCache.delete(key);
+  htmlCache.set(key, html);
+  return html;
+}
+
+function cacheSet(key: string, html: string): void {
+  const size = key.length + html.length;
+  if (size > CACHE_BUDGET_CHARS / 8) return;
+  htmlCache.set(key, html);
+  cachedChars += size;
+  for (const [oldKey, oldHtml] of htmlCache) {
+    if (cachedChars <= CACHE_BUDGET_CHARS) break;
+    htmlCache.delete(oldKey);
+    cachedChars -= oldKey.length + oldHtml.length;
+  }
+}
+
 async function getHighlighter(): Promise<Highlighter | null> {
   if (!highlighterPromise) {
     highlighterPromise = (async () => {
@@ -87,25 +115,32 @@ async function ensureLanguage(highlighter: Highlighter, lang: string): Promise<b
 }
 
 /**
- * Highlight a completed code block. Returns null when highlighting is
- * unavailable so callers can fall back to escaped plain text.
+ * Highlight a completed code block into sanitized HTML. Returns null when
+ * highlighting is unavailable so callers can fall back to escaped plain text.
  */
 export async function highlightCode(code: string, lang?: string): Promise<string | null> {
   const normalized = (lang ?? '').trim().toLowerCase();
   const resolved = LANG_ALIASES[normalized] ?? normalized;
   const target = resolved || 'text';
   // Plain text needs no grammar and must not pull the highlighter into memory.
-  if (target === 'text') return null;
+  if (target === 'text' || code.length > MAX_HIGHLIGHT_CHARS) return null;
+  const key = `${target}\0${code}`;
+  const cached = cacheGet(key);
+  if (cached !== undefined) return cached;
 
   const highlighter = await getHighlighter();
   if (!highlighter) return null;
   if (!(await ensureLanguage(highlighter, target))) return null;
   try {
-    return highlighter.codeToHtml(code, {
-      lang: target,
-      themes: { light: LIGHT_THEME, dark: DARK_THEME },
-      defaultColor: false,
-    });
+    const html = sanitizeHighlightHtml(
+      highlighter.codeToHtml(code, {
+        lang: target,
+        themes: { light: LIGHT_THEME, dark: DARK_THEME },
+        defaultColor: false,
+      }),
+    );
+    cacheSet(key, html);
+    return html;
   } catch {
     return null;
   }

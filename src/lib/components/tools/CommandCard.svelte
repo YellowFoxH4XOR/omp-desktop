@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { SquareTerminal } from '@lucide/svelte';
   import ToolShell from './ToolShell.svelte';
   import {
     argCommand,
@@ -33,7 +34,7 @@
   const shownOutput = $derived(truncated ? output.slice(-4000) : output);
 </script>
 
-<ToolShell status={item.status} {failed} meta={meta || undefined}>
+<ToolShell icon={SquareTerminal} status={item.status} {failed} meta={meta || undefined}>
   {#snippet summary()}
     <span class="line">Ran <code class="c">{preview(command, 90)}</code></span>
   {/snippet}

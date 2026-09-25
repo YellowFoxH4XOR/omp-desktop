@@ -1,6 +1,6 @@
 <script lang="ts">
-  import { ArrowUp, ChevronDown, Square } from '@lucide/svelte';
-  import type { ThreadStatus } from '../../types';
+  import { ArrowUp, Brain, ChevronDown, CornerDownLeft, Cpu, Square } from '@lucide/svelte';
+  import type { ContextUsage, ModelInfo, ThreadStatus } from '../../types';
 
   type SendMode = 'prompt' | 'steer' | 'follow_up';
 
@@ -8,11 +8,40 @@
     threadId: string;
     status: ThreadStatus;
     commands?: Array<{ name: string; description?: string }>;
+    model?: ModelInfo;
+    models?: ModelInfo[];
+    effort?: string;
+    levels?: string[];
+    contextUsage?: ContextUsage;
     onSend: (message: string, mode: SendMode) => void | Promise<void>;
     onAbort: () => void | Promise<void>;
+    onSetModel?: (value: string) => void | Promise<void>;
+    onSetEffort?: (level: string) => void | Promise<void>;
   }
 
-  let { threadId, status, commands = [], onSend, onAbort }: Props = $props();
+  let {
+    threadId,
+    status,
+    commands = [],
+    model,
+    models = [],
+    effort,
+    levels = [],
+    contextUsage,
+    onSend,
+    onAbort,
+    onSetModel,
+    onSetEffort,
+  }: Props = $props();
+
+  const modelValue = $derived(model ? `${model.provider}/${model.id}` : '');
+  const contextPercent = $derived(
+    contextUsage?.percent != null ? Math.max(0, Math.min(100, Math.round(contextUsage.percent))) : null,
+  );
+  const RING = 2 * Math.PI * 6;
+  function capitalize(value: string): string {
+    return value ? value[0].toUpperCase() + value.slice(1) : value;
+  }
 
   let text = $state('');
   let submitting = $state(false);
@@ -92,6 +121,9 @@
   }
 
   function onKeydown(event: KeyboardEvent) {
+    // IME commits send keydown with isComposing/keyCode 229: never submit or
+    // pick a suggestion mid-composition; the post-commit Enter works normally.
+    if (event.isComposing || event.keyCode === 229) return;
     if (suggestions.length > 0) {
       if (event.key === 'ArrowDown') {
         event.preventDefault();
@@ -125,10 +157,11 @@
   }
 </script>
 
-<div class="composer" class:disabled>
+
+<div class="composer" class:disabled class:streaming>
   {#if suggestions.length > 0}
     <div class="suggest" id={commandListId} role="listbox" aria-label="Commands">
-      {#each suggestions as command, i (command.name)}
+      {#each suggestions as command, i (i + ':' + command.name)}
         <button
           id={optionId(i)}
           type="button"
@@ -162,249 +195,423 @@
       oninput={() => (cmdDismissed = false)}
       rows="1"
       class="input"
-      placeholder={streaming
-        ? streamMode === 'steer'
-          ? 'Steer the agent…'
-          : 'Queue a follow-up…'
-        : 'Message the agent…'}
+      placeholder={disabled
+        ? 'Session disconnected — restart to continue'
+        : streaming
+          ? streamMode === 'steer'
+            ? 'Steer the agent…'
+            : 'Queue a follow-up…'
+          : 'Ask the agent to build, fix, or explain…'}
       aria-label="Message"
       {disabled}
     ></textarea>
 
-    <div class="controls">
-      {#if streaming}
-        <div class="mode">
-          <button
-            type="button"
-            class="mode-btn"
-            aria-haspopup="menu"
-            aria-expanded={modeOpen}
-            aria-label="Send mode while running"
-            onclick={() => (modeOpen = !modeOpen)}
+    <div class="toolbar">
+      <div class="left">
+        {#if models.length > 0 && onSetModel}
+          <label class="pill model" title="Model">
+            <Cpu size={12} strokeWidth={2} />
+            <select value={modelValue} onchange={(e) => void onSetModel(e.currentTarget.value)} aria-label="Select model">
+              {#if !model}<option value="">Default model</option>{/if}
+              {#each models as option (option.provider + '/' + option.id)}
+                <option value={`${option.provider}/${option.id}`}>{option.name}</option>
+              {/each}
+            </select>
+            <ChevronDown size={11} strokeWidth={2} />
+          </label>
+        {:else if model}
+          <span class="pill model static" title={`${model.name} · ${model.provider}`}><Cpu size={12} strokeWidth={2} />{model.name}</span>
+        {/if}
+        {#if levels.length > 0 && onSetEffort}
+          <label class="pill" title="Reasoning effort">
+            <Brain size={12} strokeWidth={2} />
+            <select value={effort ?? ''} onchange={(e) => void onSetEffort(e.currentTarget.value)} aria-label="Select effort">
+              {#if !effort}<option value="">Default effort</option>{/if}
+              {#each levels as level (level)}<option value={level}>{capitalize(level)}</option>{/each}
+            </select>
+            <ChevronDown size={11} strokeWidth={2} />
+          </label>
+        {/if}
+        {#if streaming}
+          <div class="mode">
+            <button
+              type="button"
+              class="pill mode-btn"
+              aria-haspopup="menu"
+              aria-expanded={modeOpen}
+              aria-label="Send mode while running"
+              onclick={() => (modeOpen = !modeOpen)}
+            >
+              {streamMode === 'steer' ? 'Steer' : 'Queue'}
+              <ChevronDown size={11} strokeWidth={2} />
+            </button>
+            {#if modeOpen}
+              <div class="menu" role="menu">
+                <button
+                  type="button"
+                  role="menuitemradio"
+                  aria-checked={streamMode === 'steer'}
+                  class="mi"
+                  onclick={() => {
+                    streamMode = 'steer';
+                    modeOpen = false;
+                  }}><strong>Steer</strong><span>Interrupt with guidance</span></button
+                >
+                <button
+                  type="button"
+                  role="menuitemradio"
+                  aria-checked={streamMode === 'follow_up'}
+                  class="mi"
+                  onclick={() => {
+                    streamMode = 'follow_up';
+                    modeOpen = false;
+                  }}><strong>Queue</strong><span>Send when it finishes</span></button
+                >
+              </div>
+            {/if}
+          </div>
+        {/if}
+      </div>
+
+      <div class="right">
+        {#if contextPercent !== null}
+          <span
+            class="context"
+            class:high={contextPercent >= 80}
+            title={`Context ${contextUsage?.tokens?.toLocaleString() ?? '?'} / ${contextUsage?.contextWindow.toLocaleString()} tokens`}
           >
-            {streamMode === 'steer' ? 'Steer' : 'Queue'}
-            <ChevronDown size={11} />
-          </button>
-          {#if modeOpen}
-            <div class="menu" role="menu">
-              <button
-                type="button"
-                role="menuitemradio"
-                aria-checked={streamMode === 'steer'}
-                class="mi"
-                onclick={() => {
-                  streamMode = 'steer';
-                  modeOpen = false;
-                }}>Steer — interrupt with guidance</button
-              >
-              <button
-                type="button"
-                role="menuitemradio"
-                aria-checked={streamMode === 'follow_up'}
-                class="mi"
-                onclick={() => {
-                  streamMode = 'follow_up';
-                  modeOpen = false;
-                }}>Queue — send when it finishes</button
-              >
-            </div>
-          {/if}
-        </div>
-      {/if}
-
-      <button
-        type="button"
-        class="toggle"
-        class:on={enterSend}
-        aria-pressed={enterSend}
-        aria-label="Send with Enter"
-        title="Send with Enter"
-        onclick={() => (enterSend = !enterSend)}
-      >
-        ⏎
-      </button>
-
-      {#if streaming}
-        <button type="button" class="send stop" onclick={() => void onAbort()} aria-label="Stop generation">
-          <Square size={12} />
+            <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+              <circle cx="8" cy="8" r="6" class="ring-track" />
+              <circle cx="8" cy="8" r="6" class="ring-fill" stroke-dasharray={`${(RING * contextPercent) / 100} ${RING}`} />
+            </svg>
+            <span class="context-pct">{contextPercent}%</span>
+          </span>
+        {/if}
+        <button
+          type="button"
+          class="icon toggle"
+          class:on={enterSend}
+          aria-pressed={enterSend}
+          aria-label="Send with Enter"
+          title={enterSend ? 'Enter sends · Shift+Enter adds a newline' : '⌘Enter sends · click to send with Enter'}
+          onclick={() => (enterSend = !enterSend)}
+        >
+          <CornerDownLeft size={13} strokeWidth={2} />
         </button>
-      {/if}
-      <button
-        type="button"
-        class="send"
-        onclick={submit}
-        disabled={!canSend}
-        aria-label={streaming ? (streamMode === 'steer' ? 'Send steer message' : 'Queue follow-up') : 'Send message'}
-      >
-        <ArrowUp size={14} />
-      </button>
+        {#if streaming}
+          <button type="button" class="icon stop" onclick={() => void onAbort()} aria-label="Stop generation" title="Stop (Esc)">
+            <Square size={11} strokeWidth={0} fill="currentColor" />
+          </button>
+        {/if}
+        <button
+          type="button"
+          class="send"
+          onclick={submit}
+          disabled={!canSend}
+          title={enterSend ? 'Send (Enter)' : 'Send (⌘Enter)'}
+          aria-label={streaming ? (streamMode === 'steer' ? 'Send steer message' : 'Queue follow-up') : 'Send message'}
+        >
+          <ArrowUp size={15} strokeWidth={2.2} />
+        </button>
+      </div>
     </div>
-  </div>
-
-  <div class="hint">
-    {enterSend ? 'Enter to send · Shift+Enter for newline' : '⌘+Enter to send · Shift+Enter for newline'}
   </div>
 </div>
 
 <style>
   .composer {
-    padding: 8px 12px 10px;
-    border-top: 1px solid var(--line);
-    background: var(--bg);
+    position: relative;
+    container: composer / inline-size;
   }
-  .composer.disabled {
+  .composer.disabled .box {
     opacity: 0.7;
   }
   .suggest {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: calc(100% + 6px);
     display: flex;
     flex-direction: column;
-    margin-bottom: 6px;
-    border: 1px solid var(--line);
-    border-radius: var(--radius);
-    background: var(--surface);
-    overflow: hidden;
-    max-height: 200px;
+    padding: 4px;
+    border-radius: var(--radius-lg);
+    background: var(--elevated);
+    box-shadow: var(--shadow);
+    max-height: 240px;
     overflow-y: auto;
+    z-index: 10;
+    animation: ui-pop 0.12s var(--ease);
   }
   .sug {
     display: flex;
-    gap: 8px;
+    gap: 10px;
     align-items: baseline;
-    padding: 5px 9px;
+    padding: 6px 10px;
     border: 0;
+    border-radius: var(--radius-sm);
     background: transparent;
     color: var(--text);
-    font-size: 12px;
+    font-size: 12.5px;
     text-align: left;
   }
   .sug.active,
   .sug:hover {
-    background: var(--surface-2);
+    background: var(--accent-bg);
   }
   .sug-name {
     font-family: var(--mono);
-    font-size: 11.5px;
+    font-size: 12px;
     color: var(--accent);
     flex: none;
   }
   .sug-desc {
     color: var(--muted);
-    font-size: 11.5px;
+    font-size: 12px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
   .box {
     display: flex;
-    align-items: flex-end;
-    gap: 8px;
-    border: 1px solid var(--line);
-    border-radius: var(--radius);
-    background: var(--surface);
-    padding: 7px 8px 7px 10px;
+    flex-direction: column;
+    gap: 6px;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--radius-xl);
+    background: var(--elevated);
+    padding: 12px 10px 8px 14px;
+    box-shadow: 0 6px 24px rgb(0 0 0 / 0.12), var(--shadow-sm);
+    transition: border-color 0.15s, box-shadow 0.15s;
   }
   .box:focus-within {
-    border-color: var(--accent);
+    border-color: color-mix(in srgb, var(--accent) 40%, var(--line-strong));
   }
   .input {
-    flex: 1;
-    min-width: 0;
+    width: 100%;
+    min-height: 22px;
     border: 0;
     background: transparent;
     color: var(--text);
-    font-size: 13px;
-    line-height: 1.45;
+    font-size: 14px;
+    line-height: 1.5;
     resize: none;
     outline: none;
     max-height: 180px;
     font-family: inherit;
+    padding: 0 4px 0 0;
+  }
+  .input:focus-visible {
+    box-shadow: none;
   }
   .input::placeholder {
     color: var(--subtle);
   }
-  .controls {
+  .toolbar {
     display: flex;
     align-items: center;
-    gap: 6px;
+    justify-content: space-between;
+    gap: 8px;
+    margin-left: -6px;
+  }
+  .left,
+  .right {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    min-width: 0;
+  }
+  .left {
+    flex: 1;
+    overflow: hidden;
+  }
+  .right {
     flex: none;
+  }
+  .pill {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    height: 26px;
+    padding: 0 8px;
+    border: 0;
+    border-radius: 999px;
+    background: transparent;
+    color: var(--muted);
+    font-size: 12px;
+    font-weight: 500;
+    flex-shrink: 0;
+    white-space: nowrap;
+  }
+  .pill.model {
+    flex-shrink: 1;
+    min-width: 0;
+    overflow: hidden;
+  }
+  .pill.model select {
+    min-width: 0;
+  }
+  .pill:hover:not(.static),
+  .pill:focus-within {
+    background: var(--surface-2);
+    color: var(--text);
+  }
+  .pill select {
+    appearance: none;
+    border: 0;
+    background: transparent;
+    color: inherit;
+    font-size: inherit;
+    font-weight: inherit;
+    padding: 0;
+    max-width: 160px;
+    text-overflow: ellipsis;
+    cursor: pointer;
+    field-sizing: content;
+  }
+  .pill select:focus-visible {
+    box-shadow: none;
+  }
+  .pill :global(svg) {
+    flex: none;
+    pointer-events: none;
+  }
+  .pill.static {
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   .mode {
     position: relative;
   }
   .mode-btn {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    padding: 4px 8px;
-    border: 1px solid var(--line);
-    border-radius: 6px;
-    background: var(--surface-2);
-    color: var(--muted);
-    font-size: 11px;
-  }
-  .mode-btn:hover {
-    color: var(--text);
+    color: var(--accent);
+    background: var(--accent-bg);
   }
   .menu {
     position: absolute;
-    bottom: calc(100% + 4px);
-    right: 0;
+    bottom: calc(100% + 6px);
+    left: 0;
     display: flex;
     flex-direction: column;
     min-width: 220px;
-    border: 1px solid var(--line);
-    border-radius: var(--radius);
-    background: var(--surface);
+    padding: 4px;
+    border-radius: var(--radius-lg);
+    background: var(--elevated);
     box-shadow: var(--shadow);
-    overflow: hidden;
     z-index: 10;
+    animation: ui-pop 0.12s var(--ease);
   }
   .mi {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
     padding: 6px 10px;
     border: 0;
+    border-radius: var(--radius-sm);
     background: transparent;
     color: var(--text);
-    font-size: 12px;
+    font-size: 12.5px;
     text-align: left;
   }
-  .mi:hover {
-    background: var(--surface-2);
+  .mi strong {
+    font-weight: 600;
   }
-  .toggle {
-    padding: 4px 7px;
-    border: 1px solid var(--line);
-    border-radius: 6px;
-    background: transparent;
+  .mi span {
     color: var(--muted);
-    font-size: 11px;
-    line-height: 1;
+    font-size: 11.5px;
+  }
+  .mi:hover,
+  .mi[aria-checked='true'] {
+    background: var(--accent-bg);
+  }
+  .context {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 0 6px;
+    color: var(--subtle);
+    font-size: 11.5px;
+    font-variant-numeric: tabular-nums;
+  }
+  .context svg {
+    transform: rotate(-90deg);
+  }
+  .ring-track {
+    fill: none;
+    stroke: var(--surface-3);
+    stroke-width: 2.2;
+  }
+  .ring-fill {
+    fill: none;
+    stroke: var(--accent);
+    stroke-width: 2.2;
+    stroke-linecap: round;
+  }
+  .context.high .ring-fill {
+    stroke: var(--warn);
+  }
+  .icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    border: 0;
+    border-radius: 999px;
+    background: transparent;
+    color: var(--subtle);
+  }
+  .icon:hover {
+    background: var(--surface-2);
+    color: var(--text);
   }
   .toggle.on {
     color: var(--accent);
-    border-color: var(--accent);
+  }
+  .stop {
+    color: var(--text);
+    background: var(--surface-2);
+  }
+  .stop:hover {
+    color: var(--bad);
+    background: var(--bad-bg);
   }
   .send {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 26px;
-    height: 26px;
+    width: 30px;
+    height: 30px;
+    margin-left: 2px;
     border: 0;
-    border-radius: 6px;
-    background: var(--accent-bg);
-    color: var(--text);
+    border-radius: 999px;
+    background: var(--accent-strong);
+    color: var(--on-accent);
+    transition: filter 0.12s, background 0.12s;
   }
   .send:hover:not(:disabled) {
-    filter: brightness(1.15);
+    filter: brightness(1.1);
   }
-  .send.stop {
-    background: var(--surface-2);
-    color: var(--bad);
-    border: 1px solid var(--line);
+  @container composer (max-width: 560px) {
+    .pill > :global(svg:first-child),
+    .context-pct {
+      display: none;
+    }
+    .pill select {
+      max-width: 96px;
+    }
   }
-  .hint {
-    margin-top: 5px;
+  @container composer (max-width: 420px) {
+    .toggle,
+    .pill.model {
+      display: none;
+    }
+    .pill select {
+      max-width: 72px;
+    }
+  }
+  .send:disabled {
+    background: var(--surface-3);
     color: var(--subtle);
-    font-size: 10.5px;
+    opacity: 1;
   }
 </style>

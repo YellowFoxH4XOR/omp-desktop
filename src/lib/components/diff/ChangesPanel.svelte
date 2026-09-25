@@ -10,6 +10,7 @@
     ExternalLink,
     FileDiff,
     FolderGit2,
+    GitBranch,
     List,
     LoaderCircle,
     Maximize2,
@@ -83,6 +84,7 @@
     diffable &&
       !confirmBusy &&
       fileEol.cur !== 'mixed' &&
+      fileEol.cur !== 'crlf' &&
       fileEol.orig !== 'mixed' &&
       fileEol.orig !== 'crlf',
   );
@@ -172,7 +174,6 @@
   }
 
   function selectFile(path: string) {
-    if (narrow) expanded = true;
     if (selectedPath === path) return;
     selectedPath = path;
     gitFile = null;
@@ -220,25 +221,73 @@
     }
   }
 
+  // Watcher-driven refreshes run one at a time: on a large repo `git status`
+  // can outlast the watcher interval, and overlapping runs pile up processes.
+  let watchRefreshInFlight = false;
+  let watchRefreshQueued = false;
+  let destroyed = false;
+
   function scheduleRefresh() {
     clearTimeout(refreshTimer);
-    refreshTimer = setTimeout(() => void refresh(), 250);
+    refreshTimer = setTimeout(runWatchRefresh, 250);
   }
 
-  function requestFileRevert() {
+  function runWatchRefresh() {
+    if (destroyed) return;
+    if (watchRefreshInFlight) {
+      watchRefreshQueued = true;
+      return;
+    }
+    watchRefreshInFlight = true;
+    void refresh().finally(() => {
+      watchRefreshInFlight = false;
+      if (watchRefreshQueued && !destroyed) {
+        watchRefreshQueued = false;
+        scheduleRefresh();
+      }
+    });
+  }
+
+  async function requestFileRevert() {
     if (!selectedPath || !selectedFile) return;
     const path = selectedPath;
+    const threadId = thread.id;
     const meta = statusMeta(selectedFile.status);
     const untracked = meta.cls === 'added';
+    const baseDetail = untracked
+      ? 'This file is not tracked by git. Reverting deletes it from the working tree.'
+      : `All uncommitted changes in this file are discarded (${meta.label}). This cannot be undone.`;
+    const loaded = gitFile && gitFile.path === path ? gitFile : null;
+    const loadedHash = loaded?.currentHash || null;
+    // Hash guard: re-read the worktree bytes before confirming so the revert
+    // is verified against the current on-disk state, not the stale open diff.
+    let freshHash: string | null = null;
+    let guardUnavailable = false;
+    try {
+      const fresh = await api.gitFile(threadId, path);
+      if (selectedPath !== path || thread.id !== threadId) return;
+      freshHash = fresh.currentHash || null;
+      if (!freshHash) guardUnavailable = true;
+    } catch {
+      if (selectedPath !== path || thread.id !== threadId) return;
+      guardUnavailable = true;
+    }
+    if (!guardUnavailable && loadedHash && freshHash && freshHash !== loadedHash) {
+      // The worktree moved under the open diff: resync and make the user
+      // confirm again on the fresh state instead of reverting what was shown.
+      showNotice(`${path} changed on disk. Review the updated diff and confirm again.`);
+      await refresh();
+      return;
+    }
     confirm = {
       title: 'Revert file to HEAD?',
       path,
-      detail: untracked
-        ? 'This file is not tracked by git. Reverting deletes it from the working tree.'
-        : `All uncommitted changes in this file are discarded (${meta.label}). This cannot be undone.`,
+      detail: guardUnavailable
+        ? `${baseDetail} The current on-disk state could not be verified (no hash available), so the revert proceeds without a hash guard.`
+        : baseDetail,
       confirmLabel: 'Revert file',
       run: async () => {
-        await api.gitRevertFile(thread.id, path);
+        await api.gitRevertFile(threadId, path, freshHash);
         showNotice(`Reverted ${path}`);
         await refresh();
       },
@@ -323,6 +372,7 @@
 
     return () => {
       disposed = true;
+      destroyed = true;
       refreshSeq += 1;
       fileSeq += 1;
       unlisten?.();
@@ -339,10 +389,9 @@
 <aside class="changes-panel" bind:this={panelEl} aria-label="Changes">
   <header class="panel-head">
     <div class="panel-title">
-      <FileDiff size={13} />
-      <span>Changes</span>
+      <span class="title-text">Changes</span>
       {#if summary?.branch}
-        <span class="branch" title="Current branch">{summary.branch}</span>
+        <span class="branch" title="Current branch"><GitBranch size={11} strokeWidth={2} />{summary.branch}</span>
       {/if}
     </div>
     <div class="panel-actions">
@@ -356,7 +405,7 @@
             aria-pressed={mode === 'unified'}
             onclick={() => setMode('unified')}
           >
-            <List size={12} />
+            <List size={13} />
           </button>
           <button
             type="button"
@@ -366,7 +415,7 @@
             aria-pressed={mode === 'split'}
             onclick={() => setMode('split')}
           >
-            <Columns2 size={12} />
+            <Columns2 size={13} />
           </button>
         </div>
       {/if}
@@ -374,13 +423,14 @@
         type="button"
         class="icon-btn"
         title="Refresh changes"
+        aria-label="Refresh changes"
         onclick={() => void refresh()}
         disabled={refreshing}
       >
-        <RefreshCcw size={12} class={refreshing ? 'spin' : ''} />
+        <RefreshCcw size={14} class={refreshing ? 'spin' : ''} />
       </button>
-      <button type="button" class="icon-btn" title="Close changes" onclick={onClose}>
-        <X size={12} />
+      <button type="button" class="icon-btn" title="Close changes" aria-label="Close changes" onclick={onClose}>
+        <X size={15} />
       </button>
     </div>
   </header>
@@ -419,9 +469,10 @@
           </span>
         </div>
         <div class="file-list">
-          <VList data={summary.files} getKey={(f: ChangedFile) => f.path} itemSize={28}>
+          <VList data={summary.files} getKey={(f: ChangedFile) => f.path} itemSize={30}>
             {#snippet children(f: ChangedFile)}
               {@const meta = statusMeta(f.status)}
+              {@const slash = f.path.lastIndexOf('/')}
               <button
                 type="button"
                 class="file-row"
@@ -431,7 +482,7 @@
                 title={f.path}
               >
                 <span class="status status-{meta.cls}" title={meta.label}>{meta.code}</span>
-                <span class="file-path">{f.path}</span>
+                <span class="file-path"><span class="file-name">{f.path.slice(slash + 1)}</span>{#if slash > 0}<span class="file-dir"><bdi>{f.path.slice(0, slash)}</bdi></span>{/if}</span>
                 {#if f.binary}
                   <span class="binary-tag">bin</span>
                 {:else}
@@ -446,32 +497,31 @@
         </div>
       </div>
 
-      <div class="diff-pane" class:overlay={narrow && expanded}>
+      <div class="diff-pane" class:overlay={expanded}>
         {#if selectedPath && selectedFile}
           <div class="diff-head">
             <div class="diff-path" title={selectedPath}>
               <span class="status status-{statusMeta(selectedFile.status).cls}">
                 {statusMeta(selectedFile.status).code}
               </span>
-              <span class="diff-path-text">{selectedPath}</span>
+              <span class="diff-path-text"><bdi>{selectedPath}</bdi></span>
             </div>
             <div class="diff-actions">
-              {#if narrow}
-                <button
-                  type="button"
-                  class="icon-btn"
-                  title={expanded ? 'Collapse review' : 'Expand review'}
-                  onclick={() => (expanded = !expanded)}
-                >
-                  {#if expanded}<Minimize2 size={12} />{:else}<Maximize2 size={12} />{/if}
-                </button>
-              {/if}
+              <button
+                type="button"
+                class="icon-btn"
+                title={expanded ? 'Collapse review' : 'Expand review'}
+                aria-label={expanded ? 'Collapse review' : 'Expand review'}
+                onclick={() => (expanded = !expanded)}
+              >
+                {#if expanded}<Minimize2 size={14} />{:else}<Maximize2 size={14} />{/if}
+              </button>
               {#if diffable}
                 <button type="button" class="icon-btn" title="Previous change" onclick={() => diffEditor?.prevChange()}>
-                  <ChevronUp size={12} />
+                  <ChevronUp size={14} />
                 </button>
                 <button type="button" class="icon-btn" title="Next change" onclick={() => diffEditor?.nextChange()}>
-                  <ChevronDown size={12} />
+                  <ChevronDown size={14} />
                 </button>
               {/if}
               <button
@@ -481,7 +531,7 @@
                 onclick={() => void copySelection()}
                 disabled={!diffable}
               >
-                <Copy size={12} />
+                <Copy size={14} />
               </button>
               <button
                 type="button"
@@ -490,19 +540,19 @@
                 onclick={() => void copyPath()}
               >
                 <span class="copy-path-label">{copied === 'path' ? '✓' : ''}</span>
-                <FileDiff size={12} />
+                <FileDiff size={14} />
               </button>
               <button type="button" class="icon-btn" title="Open file externally" onclick={() => void openExternally()}>
-                <ExternalLink size={12} />
+                <ExternalLink size={14} />
               </button>
               <button
                 type="button"
                 class="icon-btn danger"
                 title="Revert file to HEAD"
-                onclick={requestFileRevert}
+                onclick={() => void requestFileRevert()}
                 disabled={confirmBusy}
               >
-                <Undo2 size={12} />
+                <Undo2 size={14} />
               </button>
             </div>
           </div>
@@ -537,7 +587,7 @@
               canRevertHunk={hunkRevertable}
               onRequestRevertHunk={requestHunkRevert}
             />
-            {#if !hunkRevertable && diffable && (fileEol.cur === 'mixed' || fileEol.orig === 'mixed' || fileEol.orig === 'crlf')}
+            {#if !hunkRevertable && diffable && (fileEol.cur === 'mixed' || fileEol.cur === 'crlf' || fileEol.orig === 'mixed' || fileEol.orig === 'crlf')}
               <div class="diff-note">Hunk revert disabled: mixed or CRLF line endings.</div>
             {/if}
           {/if}
@@ -572,9 +622,9 @@
     flex-direction: column;
     height: 100%;
     min-height: 0;
-    background: var(--bg);
+    background: var(--panel);
     color: var(--text);
-    font-size: 12px;
+    font-size: 12.5px;
     overflow: hidden;
   }
   .panel-head {
@@ -582,29 +632,39 @@
     align-items: center;
     justify-content: space-between;
     gap: 8px;
-    padding: 8px 10px;
+    height: var(--header-height);
+    min-height: var(--header-height);
+    padding: 0 10px 0 16px;
     border-bottom: 1px solid var(--line);
     flex: none;
   }
   .panel-title {
     display: flex;
     align-items: center;
-    gap: 6px;
-    font-size: 11px;
-    font-weight: 600;
-    letter-spacing: 0.04em;
-    text-transform: uppercase;
-    color: var(--muted);
+    gap: 8px;
     min-width: 0;
   }
+  .title-text {
+    font-size: 13px;
+    font-weight: 600;
+  }
   .branch {
-    font-weight: 400;
-    text-transform: none;
-    letter-spacing: 0;
-    color: var(--accent);
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    height: 20px;
+    padding: 0 7px;
+    border-radius: 5px;
+    background: var(--surface-2);
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 11px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  .branch :global(svg) {
+    flex: none;
   }
   .panel-actions {
     display: flex;
@@ -614,32 +674,43 @@
   }
   .mode-toggle {
     display: flex;
+    gap: 2px;
+    padding: 2px;
+    border-radius: 7px;
+    background: var(--surface);
     border: 1px solid var(--line);
-    border-radius: 5px;
-    overflow: hidden;
-    margin-right: 4px;
+    margin-right: 6px;
   }
   .mode-toggle button {
     display: flex;
     align-items: center;
-    padding: 3px 7px;
+    justify-content: center;
+    width: 26px;
+    height: 22px;
     border: none;
+    border-radius: 5px;
     background: transparent;
-    color: var(--muted);
+    color: var(--subtle);
     cursor: pointer;
   }
-  .mode-toggle button.active {
-    background: var(--surface-2);
+  .mode-toggle button:hover {
     color: var(--text);
+  }
+  .mode-toggle button.active {
+    background: var(--elevated);
+    color: var(--text);
+    box-shadow: var(--shadow-sm), 0 0 0 1px var(--line);
   }
   .icon-btn {
     display: flex;
     align-items: center;
     justify-content: center;
     gap: 2px;
-    padding: 4px;
+    min-width: 28px;
+    height: 28px;
+    padding: 0 4px;
     border: none;
-    border-radius: 5px;
+    border-radius: var(--radius-sm);
     background: transparent;
     color: var(--muted);
     cursor: pointer;
@@ -650,6 +721,7 @@
   }
   .icon-btn.danger:hover:not(:disabled) {
     color: var(--bad);
+    background: var(--bad-bg);
   }
   .icon-btn:disabled {
     opacity: 0.4;
@@ -665,22 +737,22 @@
     flex: 1;
     min-height: 0;
   }
-  /* Narrow panel: file list and diff share the space; the diff opens as an
-     expanded review overlay instead. */
+  /* Narrow panel: file list stacked above the diff. */
+  .panel-body.narrow {
+    flex-direction: column;
+  }
   .panel-body.narrow .file-pane {
     width: auto;
-    flex: 1;
-    min-width: 0;
+    max-height: 38%;
+    min-height: 96px;
     border-right: none;
-  }
-  .panel-body.narrow:not(.expanded) .diff-pane {
-    display: none;
+    border-bottom: 1px solid var(--line);
   }
   .file-pane {
     display: flex;
     flex-direction: column;
-    width: 220px;
-    min-width: 160px;
+    width: 240px;
+    min-width: 170px;
     flex: none;
     border-right: 1px solid var(--line);
     min-height: 0;
@@ -689,10 +761,10 @@
     display: none;
   }
   .files-summary {
-    padding: 6px 10px;
-    font-size: 11px;
+    padding: 10px 14px 6px;
+    font-size: 11.5px;
+    font-weight: 500;
     color: var(--muted);
-    border-bottom: 1px solid var(--line);
     display: flex;
     justify-content: space-between;
     gap: 6px;
@@ -702,6 +774,8 @@
     display: flex;
     gap: 6px;
     white-space: nowrap;
+    font-family: var(--mono);
+    font-size: 11px;
   }
   .add { color: var(--good); }
   .del { color: var(--bad); }
@@ -709,19 +783,21 @@
     flex: 1;
     min-height: 0;
     overflow: hidden;
+    padding: 0 6px 6px;
   }
   .file-row {
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: 8px;
     width: 100%;
-    height: 28px;
+    height: 30px;
     padding: 0 8px;
     border: none;
+    border-radius: var(--radius-sm);
     background: transparent;
     color: var(--text);
     font: inherit;
-    font-size: 11px;
+    font-size: 12.5px;
     cursor: pointer;
     text-align: left;
   }
@@ -729,47 +805,64 @@
     background: var(--surface);
   }
   .file-row.selected {
-    background: var(--surface-2);
+    background: var(--accent-bg);
   }
   .status {
     flex: none;
-    width: 14px;
-    text-align: center;
-    font-size: 10px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    font-size: 9.5px;
     font-weight: 700;
-    border-radius: 3px;
+    border-radius: 4px;
   }
-  .status-added { color: var(--good); }
-  .status-modified { color: var(--warn); }
-  .status-deleted { color: var(--bad); }
-  .status-renamed { color: var(--accent); }
-  .status-conflict { color: var(--bad); }
-  .status-other { color: var(--muted); }
+  .status-added { color: var(--good); background: var(--good-bg); }
+  .status-modified { color: var(--warn); background: var(--warn-bg); }
+  .status-deleted { color: var(--bad); background: var(--bad-bg); }
+  .status-renamed { color: var(--accent); background: var(--accent-bg); }
+  .status-conflict { color: var(--bad); background: var(--bad-bg); }
+  .status-other { color: var(--muted); background: var(--surface-2); }
   .file-path {
     flex: 1;
     min-width: 0;
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    overflow: hidden;
+    white-space: nowrap;
+  }
+  .file-name {
+    flex: none;
+    max-width: 100%;
     overflow: hidden;
     text-overflow: ellipsis;
-    white-space: nowrap;
+  }
+  .file-dir {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    color: var(--subtle);
+    font-size: 11.5px;
     direction: rtl;
     text-align: left;
-    font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
   }
   .file-stats {
     flex: none;
     display: flex;
-    gap: 4px;
-    font-size: 10px;
-    font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+    gap: 5px;
+    font-size: 11px;
+    font-family: var(--mono);
   }
   .binary-tag {
     flex: none;
-    font-size: 9px;
+    font-size: 9.5px;
     text-transform: uppercase;
     color: var(--muted);
-    border: 1px solid var(--line);
-    border-radius: 3px;
-    padding: 0 3px;
+    border: 1px solid var(--line-strong);
+    border-radius: 4px;
+    padding: 0 4px;
   }
 
   .diff-pane {
@@ -778,35 +871,38 @@
     flex: 1;
     min-width: 0;
     min-height: 0;
+    background: var(--bg);
   }
   .diff-pane.overlay {
     position: fixed;
-    top: 12px;
-    right: 12px;
-    bottom: 12px;
-    left: 12px;
+    top: 16px;
+    right: 16px;
+    bottom: 16px;
+    left: 16px;
     z-index: 50;
-    background: var(--bg);
-    border: 1px solid var(--line);
-    border-radius: 8px;
-    box-shadow: 0 16px 60px color-mix(in srgb, var(--bg) 75%, transparent);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow);
+    overflow: hidden;
+    animation: ui-pop 0.16s var(--ease);
   }
   .diff-head {
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 8px;
-    padding: 5px 8px;
+    height: 40px;
+    padding: 0 6px 0 12px;
     border-bottom: 1px solid var(--line);
+    background: var(--panel);
     flex: none;
   }
   .diff-path {
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: 8px;
     min-width: 0;
-    font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
-    font-size: 11px;
+    font-family: var(--mono);
+    font-size: 11.5px;
   }
   .diff-path-text {
     overflow: hidden;
@@ -818,13 +914,17 @@
   .diff-actions {
     display: flex;
     align-items: center;
-    gap: 1px;
+    gap: 0;
     flex: none;
+  }
+  .diff-actions .icon-btn {
+    min-width: 26px;
+    height: 26px;
   }
   .diff-note {
     flex: none;
-    padding: 4px 10px;
-    font-size: 10px;
+    padding: 6px 12px;
+    font-size: 11px;
     color: var(--muted);
     border-top: 1px solid var(--line);
   }
@@ -837,55 +937,53 @@
     justify-content: center;
     gap: 8px;
     color: var(--muted);
-    padding: 24px;
+    padding: 28px;
     text-align: center;
   }
   .state-msg.small {
-    padding: 16px;
+    padding: 18px;
   }
   .state-title {
-    font-size: 12px;
+    font-size: 13px;
     font-weight: 600;
     color: var(--text);
   }
   .state-detail {
-    font-size: 11px;
+    font-size: 12px;
     max-width: 320px;
-    line-height: 1.5;
+    line-height: 1.55;
   }
   .btn {
     font: inherit;
-    font-size: 11px;
-    padding: 4px 12px;
-    border-radius: 5px;
-    border: 1px solid var(--line);
-    background: var(--surface-2);
+    font-size: 12px;
+    font-weight: 500;
+    height: 28px;
+    padding: 0 12px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--line-strong);
+    background: var(--elevated);
     color: var(--text);
     cursor: pointer;
   }
   .btn:hover {
-    border-color: var(--muted);
+    background: var(--surface-2);
   }
   .notice {
     position: absolute;
-    left: 10px;
-    right: 10px;
-    bottom: 10px;
-    padding: 7px 10px;
-    font-size: 11px;
+    left: 50%;
+    transform: translateX(-50%);
+    bottom: 14px;
+    max-width: calc(100% - 28px);
+    padding: 8px 14px;
+    font-size: 12px;
     color: var(--text);
-    background: var(--surface);
-    border: 1px solid var(--line);
-    border-radius: 6px;
-    box-shadow: 0 6px 24px color-mix(in srgb, var(--bg) 60%, transparent);
+    background: var(--elevated);
+    border-radius: 999px;
+    box-shadow: var(--shadow);
     z-index: 40;
-  }
-  :global(.spin) {
-    animation: cmp-spin 0.9s linear infinite;
-  }
-  @keyframes cmp-spin {
-    to {
-      transform: rotate(360deg);
-    }
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    animation: ui-rise 0.16s var(--ease);
   }
 </style>

@@ -88,22 +88,22 @@ export function errorMessage(err: unknown): string {
 
 /** Syntax colors tuned for the app's dark surface tokens. */
 export const diffHighlight = HighlightStyle.define([
-  { tag: [t.keyword, t.modifier, t.controlKeyword, t.operatorKeyword], color: '#c792ea' },
-  { tag: [t.string, t.special(t.string), t.regexp], color: '#c3e88d' },
-  { tag: [t.number, t.bool, t.null, t.atom], color: '#f78c6c' },
-  { tag: [t.comment, t.blockComment, t.lineComment, t.docComment], color: '#697098', fontStyle: 'italic' },
-  { tag: [t.function(t.variableName), t.function(t.propertyName)], color: '#82aaff' },
-  { tag: [t.typeName, t.className, t.tagName, t.standard(t.typeName)], color: '#ffcb6b' },
-  { tag: [t.propertyName, t.attributeName], color: '#addb67' },
-  { tag: [t.variableName, t.definition(t.variableName)], color: '#d6deeb' },
-  { tag: [t.operator, t.punctuation, t.separator, t.derefOperator], color: '#89ddff' },
-  { tag: [t.meta, t.annotation, t.processingInstruction], color: '#7fdbca' },
-  { tag: t.heading, color: '#82b1ff', fontWeight: 'bold' },
-  { tag: t.link, color: '#82aaff', textDecoration: 'underline' },
+  { tag: [t.keyword, t.modifier, t.controlKeyword, t.operatorKeyword], color: 'var(--syn-keyword)' },
+  { tag: [t.string, t.special(t.string), t.regexp], color: 'var(--syn-string)' },
+  { tag: [t.number, t.bool, t.null, t.atom], color: 'var(--syn-number)' },
+  { tag: [t.comment, t.blockComment, t.lineComment, t.docComment], color: 'var(--syn-comment)', fontStyle: 'italic' },
+  { tag: [t.function(t.variableName), t.function(t.propertyName)], color: 'var(--syn-function)' },
+  { tag: [t.typeName, t.className, t.tagName, t.standard(t.typeName)], color: 'var(--syn-type)' },
+  { tag: [t.propertyName, t.attributeName], color: 'var(--syn-property)' },
+  { tag: [t.variableName, t.definition(t.variableName)], color: 'var(--syn-variable)' },
+  { tag: [t.operator, t.punctuation, t.separator, t.derefOperator], color: 'var(--syn-operator)' },
+  { tag: [t.meta, t.annotation, t.processingInstruction], color: 'var(--syn-meta)' },
+  { tag: t.heading, color: 'var(--syn-function)', fontWeight: 'bold' },
+  { tag: t.link, color: 'var(--syn-function)', textDecoration: 'underline' },
   { tag: t.emphasis, fontStyle: 'italic' },
   { tag: t.strong, fontWeight: 'bold' },
   { tag: t.strikethrough, textDecoration: 'line-through' },
-  { tag: t.invalid, color: '#ff5370' },
+  { tag: t.invalid, color: 'var(--syn-invalid)' },
 ]);
 
 /**
@@ -120,7 +120,7 @@ export const diffTheme = EditorView.theme(
       height: '100%',
     },
     '.cm-scroller': {
-      fontFamily: "ui-monospace, 'SF Mono', Menlo, Consolas, monospace",
+      fontFamily: 'var(--mono)',
       lineHeight: '1.55',
       overflow: 'auto',
     },

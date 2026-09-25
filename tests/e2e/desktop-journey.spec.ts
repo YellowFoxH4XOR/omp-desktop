@@ -32,11 +32,13 @@ interface Scenario {
   openDelay?: Record<string, number>;
   sendDelay?: number;
   rememberedThreadId?: string;
+  /** Raw assistant text, used to exercise the markdown sanitizer. */
+  assistantText?: string;
 }
 
 async function installDesktopMock(page: Page, scenario: Scenario = {}) {
   const [firstTitle, secondTitle] = scenario.titles ?? ['Alpha', 'Beta'];
-  await page.addInitScript(({ project, threads, openDelay, sendDelay, rememberedThreadId }) => {
+  await page.addInitScript(({ project, threads, openDelay, sendDelay, rememberedThreadId, assistantText }) => {
     localStorage.setItem('lastProject', project.id);
     if (rememberedThreadId) localStorage.setItem('lastThread', rememberedThreadId);
     const callbacks = new Map<number, (event: unknown) => void>();
@@ -51,7 +53,7 @@ async function installDesktopMock(page: Page, scenario: Scenario = {}) {
       if (!row) throw new Error(`Unknown thread ${id}`);
       return {
         thread: clone(row),
-        messages: [{ role: 'assistant', content: [{ type: 'text', text: `History ${id}` }], timestamp: 1 }],
+        messages: [{ role: 'assistant', content: [{ type: 'text', text: assistantText ?? `History ${id}` }], timestamp: 1 }],
         state: { sessionId: row.sessionId, sessionFile: row.sessionFile, isStreaming: false },
         models: [], levels: [], agents: [],
         capabilities: {
@@ -135,8 +137,43 @@ async function installDesktopMock(page: Page, scenario: Scenario = {}) {
     openDelay: scenario.openDelay ?? {},
     sendDelay: scenario.sendDelay ?? 0,
     rememberedThreadId: scenario.rememberedThreadId,
+    assistantText: scenario.assistantText,
   });
 }
+
+test('assistant HTML cannot carry layout CSS, scripts, or remote images', async ({ page }) => {
+  await installDesktopMock(page, {
+    assistantText:
+      '<div style="position:fixed;inset:0;z-index:99999;background:#000">overlay</div><script>document.title = "XSS1"<\/script><img src="x" onerror="document.title = \'XSS2\'"><a href="javascript:document.title = \'XSS3\'">click</a>plain text',
+  });
+  await page.goto('/');
+  await page.locator('.thread-link[title="Alpha"]').click();
+  await expect(page.getByText('plain text')).toBeVisible();
+  await expect(page.getByText('overlay')).toBeVisible();
+
+  const probe = await page.evaluate(() => {
+    const assistant = document.querySelector('.assistant');
+    const anchors = Array.from(assistant?.querySelectorAll('a') ?? []);
+    return {
+      styleAttributes: assistant?.querySelectorAll('[style]').length ?? -1,
+      positioned: assistant?.querySelector('[style*="position"]') !== null,
+      scripts: assistant?.querySelectorAll('script').length ?? -1,
+      images: assistant?.querySelectorAll('img').length ?? -1,
+      javascriptHrefs: anchors.filter((anchor) =>
+        (anchor.getAttribute('href') ?? '').startsWith('javascript:'),
+      ).length,
+      title: document.title,
+    };
+  });
+  expect(probe).toEqual({
+    styleAttributes: 0,
+    positioned: false,
+    scripts: 0,
+    images: 0,
+    javascriptHrefs: 0,
+    title: 'OMP Desktop',
+  });
+});
 
 test('startup does not spawn a harness and newer thread selection wins', async ({ page }) => {
   await installDesktopMock(page, { openDelay: { a: 200, b: 15 } });
@@ -207,4 +244,18 @@ test('Enter on Cancel never confirms file revert', async ({ page }) => {
   await expect(dialog).toBeHidden();
   await expect(page.locator('.diff-path-text')).toHaveText('sample.txt');
   expect(await page.evaluate(() => (window as any).__mockDesktop.calls.some((call: { command: string }) => call.command === 'git_revert_file'))).toBe(false);
+});
+
+test('benign ResizeObserver warnings stay silent and project removal lives in the project menu', async ({ page }) => {
+  await installDesktopMock(page);
+  await page.goto('/');
+  await expect(page.getByRole('heading', { name: 'What shall we work on?' })).toBeVisible();
+  await page.evaluate(() => window.dispatchEvent(new ErrorEvent('error', { message: 'ResizeObserver loop completed with undelivered notifications.' })));
+  await expect(page.getByRole('alert')).toHaveCount(0);
+
+  await expect(page.getByRole('menuitem', { name: 'Remove from app' })).toHaveCount(0);
+  await page.getByRole('button', { name: 'Actions for desktop-e2e' }).click();
+  await expect(page.getByRole('menuitem', { name: 'Remove from app' })).toBeVisible();
+  await page.keyboard.press('Escape');
+  await expect(page.getByRole('menuitem', { name: 'Remove from app' })).toHaveCount(0);
 });

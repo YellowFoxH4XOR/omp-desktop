@@ -164,35 +164,117 @@ fn read_login_shell_env() -> Option<std::collections::HashMap<String, String>> {
     shell_env(&shell, &["-i", "-l", "-c"]).or_else(|| shell_env(&shell, &["-l", "-c"]))
 }
 
+/// Cap for one login-shell capture. Output beyond this is truncated for
+/// parsing, but the shell is still drained so it can never block on a full
+/// pipe buffer.
+const SHELL_ENV_CAP_BYTES: usize = 1_048_576;
+/// Whole-operation deadline: shell exit *and* stdout EOF share it, so a
+/// backgrounded descendant holding stdout open cannot hang startup.
+const SHELL_ENV_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+
+#[cfg(unix)]
+fn kill_shell_group(pgid: i32) {
+    // The child is spawned as a process-group leader, so a negative pid
+    // targets the whole group. SIGKILL cannot be caught or ignored. A
+    // non-positive pgid must never reach kill: 0 would signal our own group.
+    if pgid <= 0 {
+        return;
+    }
+    unsafe {
+        libc::kill(-pgid, libc::SIGKILL);
+    }
+}
+
 fn shell_env(shell: &str, flags: &[&str]) -> Option<std::collections::HashMap<String, String>> {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
-    let mut child = Command::new(shell)
-        .args(flags)
-        .arg(
-            "printf '\\0__OMP_DESKTOP_ENV_START__\\0'; env -0; printf '__OMP_DESKTOP_ENV_END__\\0'",
-        )
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let deadline = Instant::now() + Duration::from_secs(4);
+    let deadline = Instant::now() + SHELL_ENV_TIMEOUT;
+    let mut child = {
+        let mut cmd = Command::new(shell);
+        cmd.args(flags)
+            .arg(
+                "printf '\\0__OMP_DESKTOP_ENV_START__\\0'; env -0; printf '__OMP_DESKTOP_ENV_END__\\0'",
+            )
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        cmd.spawn().ok()?
+    };
+    // `process_group(0)` makes the child its own group leader, so its pid is
+    // the pgid. Captured on all platforms to keep the timeout paths uniform;
+    // only the Unix kill path uses it.
+    #[allow(unused_variables)]
+    let pgid: i32 = child.id() as i32;
+    let stdout = child.stdout.take()?;
+    // Drain stdout on a helper thread so a large `env -0` can never fill the
+    // pipe buffer and deadlock the shell. Only the first CAP bytes are kept
+    // for parsing; the rest is still drained so the writer never blocks.
+    let drain = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut kept = Vec::new();
+        let mut truncated = false;
+        let mut buf = [0u8; 8192];
+        let mut reader = stdout;
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if !truncated {
+                        let room = SHELL_ENV_CAP_BYTES.saturating_sub(kept.len());
+                        if n <= room {
+                            kept.extend_from_slice(&buf[..n]);
+                        } else {
+                            kept.extend_from_slice(&buf[..room]);
+                            truncated = true;
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        kept
+    });
+    // Wait for the shell itself within the deadline.
     let status = loop {
         if let Ok(Some(status)) = child.try_wait() {
             break status;
         }
         if Instant::now() >= deadline {
+            #[cfg(unix)]
+            kill_shell_group(pgid);
+            #[cfg(not(unix))]
             let _ = child.kill();
+            // Reaps the direct child only; never waits for pipe EOF.
             let _ = child.wait();
             return None;
         }
         std::thread::sleep(Duration::from_millis(20));
     };
     if !status.success() {
+        // The shell is gone but a backgrounded descendant may still hold
+        // stdout open, which would leave the drain thread blocked on read
+        // forever. Kill the group so the pipe reaches EOF, then return
+        // without trusting anything for parsing.
+        #[cfg(unix)]
+        kill_shell_group(pgid);
         return None;
     }
-    parse_shell_env(&child.wait_with_output().ok()?.stdout)
+    // The shell exited, but a backgrounded descendant may still hold stdout
+    // open. EOF shares the same deadline: never wait for it unboundedly.
+    while !drain.is_finished() {
+        if Instant::now() >= deadline {
+            #[cfg(unix)]
+            kill_shell_group(pgid);
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    parse_shell_env(&drain.join().ok()?)
 }
 
 fn parse_shell_env(output: &[u8]) -> Option<std::collections::HashMap<String, String>> {
@@ -334,7 +416,37 @@ pub fn redact_secrets(text: &str) -> String {
     result
 }
 
-/// True when bytes look like binary content (NUL in the first chunk).
+/// Streaming file digest (FNV-1a 64-bit, hex) used to detect replacement of
+/// a validated executable between validation and spawn. Not cryptographic;
+/// only needs to reliably notice a changed file.
+pub fn file_digest(path: &std::path::Path) -> crate::error::AppResult<String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).map_err(|e| {
+        crate::error::AppError::new(format!("Could not read {}: {e}", path.display()))
+    })?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut hash: u64 = 0xcbf29ce484222325;
+    let mut buf = [0u8; 8192];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                for byte in &buf[..n] {
+                    hash ^= u64::from(*byte);
+                    hash = hash.wrapping_mul(0x100000001b3);
+                }
+            }
+            Err(e) => {
+                return Err(crate::error::AppError::new(format!(
+                    "Could not read {}: {e}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    Ok(format!("{hash:016x}"))
+}
+
 pub fn looks_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(8192).any(|b| *b == 0)
 }
