@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { ExternalLink } from '@lucide/svelte';
+  import { ExternalLink, Globe } from '@lucide/svelte';
   import ToolShell from './ToolShell.svelte';
   import { openExternal } from '../conversation/links';
   import {
@@ -35,7 +35,7 @@
   const shownOutput = $derived(truncated ? `${output.slice(0, 3000)}\n…` : output);
 </script>
 
-<ToolShell status={item.status} failed={item.status === 'failed' || item.result?.isError === true} meta={meta || undefined}>
+<ToolShell icon={Globe} status={item.status} failed={item.status === 'failed' || item.result?.isError === true} meta={meta || undefined}>
   {#snippet summary()}
     <span class="line">Web <code class="c">{preview(query || item.toolName, 70)}</code></span>
   {/snippet}
@@ -45,7 +45,7 @@
     {/if}
     {#if urls.length > 0}
       <div class="sources">
-        {#each urls as url (url)}
+        {#each urls as url, urlIndex (urlIndex + ':' + url)}
           <button type="button" class="source" onclick={() => void openExternal(url)}>
             <ExternalLink size={11} />
             <span class="u">{url}</span>

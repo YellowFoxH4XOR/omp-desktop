@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onDestroy } from 'svelte';
+  import { ChevronLeft, ChevronRight, X } from '@lucide/svelte';
   import { api } from '$lib/api';
   import { messagesToItems } from '$lib/session.svelte';
   import Transcript from '$lib/components/conversation/Transcript.svelte';
@@ -69,7 +70,16 @@
     prefix: string;
   }
 
-  const subagents = $derived(view.agents.filter((a) => a.id !== MAIN_ID && !isAdvisor(a)));
+  // Harness agent ids feed keyed each blocks: dedupe first-wins so a duplicate
+  // id can never throw each_key_duplicate.
+  const subagents = $derived.by(() => {
+    const seen = new Set<string>([MAIN_ID]);
+    return view.agents.filter((a) => {
+      if (a.id === MAIN_ID || isAdvisor(a) || seen.has(a.id)) return false;
+      seen.add(a.id);
+      return true;
+    });
+  });
 
   const mainAgent = $derived<AgentInfo>({
     id: MAIN_ID,
@@ -118,8 +128,12 @@
 
   const rows = $derived.by(() => {
     const out: Row[] = [{ agent: mainAgent, isMain: true, prefix: '' }];
+    const seen = new Set<string>([MAIN_ID]);
     const walk = (nodes: AgentNode[], guides: string) => {
       nodes.forEach((node, i) => {
+        // Duplicate harness agent ids would throw each_key_duplicate; first wins.
+        if (seen.has(node.agent.id)) return;
+        seen.add(node.agent.id);
         const last = i === nodes.length - 1;
         out.push({ agent: node.agent, isMain: false, prefix: `${guides}${last ? '└─' : '├─'}` });
         walk(node.children, `${guides}${last ? '  ' : '│ '}`);
@@ -177,8 +191,10 @@
 
   // --- Selection + transcript ----------------------------------------------
   const MAX_DETAIL_ITEMS = 5_000;
+  const REFRESH_INTERVAL_MS = 1_000;
   let selectedId = $state<string | null>(null);
-  let detailItems = $state<ConversationItem[]>([]);
+  // Replaced wholesale on every fetch and never mutated: skip deep proxying.
+  let detailItems = $state.raw<ConversationItem[]>([]);
   let detailLoading = $state(false);
   let detailError = $state<string | null>(null);
   let fetchSeq = 0;
@@ -212,7 +228,9 @@
   }
 
   // Event-driven refresh: re-fetch the open transcript when the agent's
-  // progress fields change; coalesce bursts into one request per window.
+  // progress fields change. Throttled, not debounced: a running agent emits
+  // progress continuously, and a resetting debounce would never fire.
+  let firstLoadPending = true;
   $effect(() => {
     const sel = selected;
     if (!sel || sel.id === MAIN_ID) {
@@ -224,11 +242,14 @@
     const fingerprint = fingerprintOf(sel);
     if (fingerprint === lastFingerprint) return;
     lastFingerprint = fingerprint;
-    clearTimeout(progressTimer);
+    if (progressTimer !== undefined) return;
+    const delay = firstLoadPending ? 0 : REFRESH_INTERVAL_MS;
+    firstLoadPending = false;
     progressTimer = setTimeout(() => {
       progressTimer = undefined;
-      if (view.threadId === threadId && selected?.id === sel.id) void loadTranscript(sel.id);
-    }, 250);
+      const current = selected;
+      if (view.threadId === threadId && current && current.id !== MAIN_ID) void loadTranscript(current.id);
+    }, delay);
   });
 
   // Reset when the panel is reused for a different thread. Invalidate any
@@ -236,6 +257,7 @@
   $effect(() => {
     void view.threadId;
     fetchSeq += 1;
+    resetRefresh();
     selectedId = null;
     detailItems = [];
     detailError = null;
@@ -243,10 +265,17 @@
     lastFingerprint = '';
   });
 
+  function resetRefresh() {
+    clearTimeout(progressTimer);
+    progressTimer = undefined;
+    firstLoadPending = true;
+  }
+
   function select(id: string) {
-    // The replacement fetch starts after debounce; invalidate the previous one
-    // now so it cannot populate this selection during that window.
+    // Invalidate the previous fetch now so it cannot populate this selection
+    // before the replacement fetch starts.
     fetchSeq += 1;
+    resetRefresh();
     selectedId = id;
     detailItems = [];
     detailError = null;
@@ -256,6 +285,7 @@
 
   function deselect() {
     fetchSeq += 1;
+    resetRefresh();
     selectedId = null;
     detailItems = [];
     detailError = null;
@@ -281,7 +311,8 @@
     {#if subagents.length > 0}
       <span class="count">{subagents.length}</span>
     {/if}
-    <button type="button" class="icon-btn" onclick={onClose} aria-label="Close agents panel">×</button>
+    <span class="grow"></span>
+    <button type="button" class="icon-btn" onclick={onClose} aria-label="Close agents panel" title="Close agents panel"><X size={15} /></button>
   </header>
 
   {#if selected}
@@ -289,27 +320,25 @@
     {@const parts = metaParts({ agent: selected, isMain: selected.id === MAIN_ID, prefix: '' })}
     <div class="detail">
       <div class="detail-head">
-        <button type="button" class="back" onclick={deselect}>← Agents</button>
+        <button type="button" class="back" onclick={deselect}><ChevronLeft size={13} strokeWidth={2} /> All agents</button>
         <div class="detail-title">
-          <span class="glyph {st.cls}" aria-hidden="true">{st.glyph}</span>
-          <div class="detail-name">
-            <span class="name">{selected.id === MAIN_ID ? 'Main agent' : selected.name}</span>
-            <span class="status-label">{st.label}</span>
-          </div>
+          <span class="dot {st.cls}" aria-hidden="true"></span>
+          <span class="name">{selected.id === MAIN_ID ? 'Main agent' : selected.name}</span>
+          <span class="status-chip {st.cls}">{st.label}</span>
         </div>
         {#if selected.task}
           <p class="task">{selected.task}</p>
         {/if}
         {#if parts.length}
           <div class="chips">
-            {#each parts as part (part)}
+            {#each parts as part, chipIndex (chipIndex + ':' + part)}
               <span class="chip">{part}</span>
             {/each}
           </div>
         {/if}
         {#if selected.worktreePath}
           <div class="chips">
-            <span class="chip path" title={selected.worktreePath}>⎇ {selected.worktreePath}</span>
+            <span class="chip path" title={selected.worktreePath}>{selected.worktreePath}</span>
           </div>
         {/if}
       </div>
@@ -339,36 +368,38 @@
     </div>
   {:else}
     <div class="tree" role="tree">
-      {#each rows as row (row.isMain ? MAIN_ID : row.agent.id)}
+      {#each rows as row, rowIndex (rowIndex + ':' + (row.isMain ? MAIN_ID : row.agent.id))}
         {@const st = statusOf(row)}
         {@const parts = metaParts(row)}
+        {@const depth = row.prefix.length / 2}
         <button
           type="button"
           class="row"
           class:main={row.isMain}
+          class:nested={depth > 0}
           role="treeitem"
           aria-selected="false"
+          aria-level={depth + 1}
+          style={`--depth:${depth}`}
           onclick={() => select(row.agent.id)}
         >
-          {#if row.prefix}
-            <span class="guide" aria-hidden="true">{row.prefix}</span>
-          {/if}
-          <span class="glyph {st.cls}" aria-hidden="true">{st.glyph}</span>
+          <span class="dot {st.cls}" aria-hidden="true"></span>
           <span class="row-body">
             <span class="row-top">
               <span class="name">{row.isMain ? 'Main agent' : row.agent.name}</span>
-              <span class="status-label">{st.label}</span>
+              <span class="status-chip {st.cls}">{st.label}</span>
             </span>
             {#if row.agent.task}
               <span class="task">{row.agent.task}</span>
             {/if}
+            {#if row.agent.activity && st.cls === 'accent'}
+              <span class="activity">{row.agent.activity}</span>
+            {/if}
             {#if parts.length}
               <span class="meta">{parts.join(' · ')}</span>
             {/if}
-            {#if row.agent.activity}
-              <span class="activity">{row.agent.activity}</span>
-            {/if}
           </span>
+          <ChevronRight size={13} strokeWidth={2} class="row-chev" />
         </button>
       {/each}
       {#if subagents.length === 0}
@@ -384,267 +415,295 @@
     flex-direction: column;
     height: 100%;
     min-height: 0;
-    background: var(--surface);
-    border-left: 1px solid var(--line);
+    background: var(--panel);
     color: var(--text);
-    font-size: 12px;
+    font-size: 12.5px;
   }
-
   .head {
     display: flex;
     align-items: center;
-    gap: 6px;
-    padding: 8px 10px;
+    gap: 8px;
+    height: var(--header-height);
+    min-height: var(--header-height);
+    padding: 0 10px 0 16px;
     border-bottom: 1px solid var(--line);
     flex: none;
   }
-
   .head h2 {
-    flex: 1;
     margin: 0;
-    font-size: 11px;
+    font-size: 13px;
     font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    color: var(--muted);
   }
-
+  .grow {
+    flex: 1;
+  }
   .count {
+    min-width: 18px;
+    height: 18px;
+    padding: 0 5px;
+    border-radius: 9px;
     background: var(--surface-2);
     color: var(--muted);
-    border-radius: 8px;
-    padding: 0 6px;
-    font-size: 10px;
-    line-height: 16px;
+    font-size: 11px;
+    font-weight: 600;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
   }
-
   .icon-btn {
-    background: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
     border: none;
+    border-radius: var(--radius-sm);
+    background: none;
     color: var(--muted);
     cursor: pointer;
-    font-size: 14px;
-    line-height: 1;
-    padding: 3px 6px;
-    border-radius: 4px;
   }
-
   .icon-btn:hover {
     background: var(--surface-2);
     color: var(--text);
   }
 
   /* --- Tree --- */
-
   .tree {
     flex: 1;
     min-height: 0;
     overflow-y: auto;
-    padding: 6px;
+    padding: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
   }
-
   .row {
+    position: relative;
     display: flex;
     align-items: flex-start;
-    gap: 4px;
+    gap: 10px;
     width: 100%;
-    padding: 6px 8px;
+    padding: 9px 10px 9px calc(12px + var(--depth) * 16px);
     border: none;
-    border-radius: 6px;
+    border-radius: var(--radius);
     background: none;
     color: var(--text);
     font: inherit;
     text-align: left;
     cursor: pointer;
+    transition: background 0.12s;
   }
-
+  .row.nested::before {
+    content: '';
+    position: absolute;
+    left: calc(15px + (var(--depth) - 1) * 16px);
+    top: 0;
+    bottom: 0;
+    width: 1px;
+    background: var(--line-strong);
+  }
   .row:hover {
+    background: var(--surface);
+  }
+  .row.main {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    margin-bottom: 4px;
+  }
+  .row.main:hover {
     background: var(--surface-2);
   }
-
-  .guide {
+  .row :global(.row-chev) {
     flex: none;
-    color: var(--muted);
-    font-family: ui-monospace, monospace;
-    white-space: pre;
-    opacity: 0.7;
+    margin-top: 2px;
+    color: var(--subtle);
+    opacity: 0;
+    transition: opacity 0.12s;
   }
-
-  .glyph {
+  .row:hover :global(.row-chev) {
+    opacity: 1;
+  }
+  .dot {
     flex: none;
-    width: 14px;
-    text-align: center;
+    width: 8px;
+    height: 8px;
+    margin-top: 5px;
+    border-radius: 50%;
+    background: var(--subtle);
   }
-
-  .glyph.accent {
-    color: var(--accent);
+  .dot.accent {
+    background: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-bg);
+    animation: ui-pulse 1.8s ease-in-out infinite;
   }
-
-  .glyph.good {
-    color: var(--good);
+  .dot.good {
+    background: var(--good);
   }
-
-  .glyph.warn {
-    color: var(--warn);
+  .dot.warn {
+    background: var(--warn);
+    box-shadow: 0 0 0 3px var(--warn-bg);
   }
-
-  .glyph.bad {
-    color: var(--bad);
+  .dot.bad {
+    background: var(--bad);
   }
-
-  .glyph.muted {
-    color: var(--muted);
+  .dot.muted {
+    background: transparent;
+    box-shadow: inset 0 0 0 1.5px var(--subtle);
   }
-
   .row-body {
     flex: 1;
     min-width: 0;
     display: flex;
     flex-direction: column;
-    gap: 1px;
+    gap: 2px;
   }
-
   .row-top {
     display: flex;
-    align-items: baseline;
+    align-items: center;
     justify-content: space-between;
     gap: 8px;
   }
-
   .name {
     font-weight: 600;
+    font-size: 13px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-
-  .row.main .name {
-    color: var(--accent);
-  }
-
-  .status-label {
+  .status-chip {
     flex: none;
-    font-size: 10px;
+    padding: 1px 7px;
+    border-radius: 999px;
+    font-size: 10.5px;
+    font-weight: 500;
     color: var(--muted);
+    background: var(--surface-2);
   }
-
+  .status-chip.accent {
+    color: var(--accent);
+    background: var(--accent-bg);
+  }
+  .status-chip.good {
+    color: var(--good);
+    background: var(--good-bg);
+  }
+  .status-chip.warn {
+    color: var(--warn);
+    background: var(--warn-bg);
+  }
+  .status-chip.bad {
+    color: var(--bad);
+    background: var(--bad-bg);
+  }
   .task {
-    color: var(--text);
+    color: var(--muted);
+    line-height: 1.45;
     overflow: hidden;
     display: -webkit-box;
     -webkit-line-clamp: 2;
     line-clamp: 2;
     -webkit-box-orient: vertical;
   }
-
   .meta {
-    color: var(--muted);
-    font-size: 10px;
+    color: var(--subtle);
+    font-size: 11px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-
   .activity {
     color: var(--accent);
-    font-size: 10px;
+    font-size: 11.5px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-
   .empty {
-    margin: 4px 8px;
-    color: var(--muted);
-    font-size: 11px;
+    margin: 12px 10px;
+    color: var(--subtle);
+    font-size: 12px;
+    text-align: center;
   }
 
   /* --- Detail --- */
-
   .detail {
     flex: 1;
     min-height: 0;
     display: flex;
     flex-direction: column;
   }
-
   .detail-head {
     flex: none;
-    padding: 8px 10px;
+    padding: 10px 16px 14px;
     border-bottom: 1px solid var(--line);
     display: flex;
     flex-direction: column;
-    gap: 6px;
+    gap: 8px;
   }
-
   .back {
     align-self: flex-start;
-    background: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    height: 24px;
+    margin-left: -6px;
+    padding: 0 8px 0 4px;
     border: none;
+    border-radius: var(--radius-sm);
+    background: none;
     color: var(--muted);
     font: inherit;
-    font-size: 11px;
+    font-size: 12px;
     cursor: pointer;
-    padding: 0;
   }
-
   .back:hover {
     color: var(--text);
+    background: var(--surface-2);
   }
-
   .detail-title {
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: 9px;
   }
-
-  .detail-name {
-    display: flex;
-    align-items: baseline;
-    gap: 8px;
-    min-width: 0;
+  .detail-title .dot {
+    margin-top: 0;
   }
-
-  .detail-name .name {
-    font-size: 13px;
+  .detail-title .name {
+    font-size: 15px;
   }
-
   .detail-head .task {
     margin: 0;
+    color: var(--text);
     -webkit-line-clamp: 4;
     line-clamp: 4;
   }
-
   .chips {
     display: flex;
     flex-wrap: wrap;
     gap: 4px;
   }
-
   .chip {
     background: var(--surface-2);
     color: var(--muted);
-    border-radius: 4px;
-    padding: 1px 6px;
-    font-size: 10px;
+    border-radius: 5px;
+    padding: 2px 7px;
+    font-size: 11px;
     max-width: 100%;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-
   .chip.path {
-    font-family: ui-monospace, monospace;
+    font-family: var(--mono);
   }
-
   .transcript-wrap {
     flex: 1;
     min-height: 0;
     display: flex;
     flex-direction: column;
     overflow: hidden;
+    --content-width: 100%;
   }
-
   .state {
     flex: 1;
     display: flex;
@@ -652,35 +711,33 @@
     align-items: center;
     justify-content: center;
     gap: 6px;
-    padding: 16px;
+    padding: 20px;
     text-align: center;
   }
-
   .state-title {
     margin: 0;
     color: var(--text);
+    font-weight: 500;
   }
-
   .state-msg {
     margin: 0;
     color: var(--muted);
-    font-size: 11px;
+    font-size: 12px;
     word-break: break-word;
   }
-
   .retry {
-    margin-top: 4px;
-    background: var(--surface-2);
-    border: 1px solid var(--line);
+    margin-top: 6px;
+    height: 28px;
+    padding: 0 12px;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--radius-sm);
+    background: var(--elevated);
     color: var(--text);
-    border-radius: 6px;
-    padding: 4px 12px;
     font: inherit;
-    font-size: 11px;
+    font-size: 12px;
     cursor: pointer;
   }
-
   .retry:hover {
-    border-color: var(--accent);
+    background: var(--surface-2);
   }
 </style>

@@ -48,6 +48,13 @@ pub struct HarnessInstallation {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct HarnessInstallCommand {
+    pub kind: HarnessKind,
+    pub command: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Project {
     pub id: String,
     pub path: String,

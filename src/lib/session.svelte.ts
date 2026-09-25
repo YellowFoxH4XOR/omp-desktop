@@ -31,7 +31,6 @@ interface LiveBlock {
 	id: string;
 	kind: 'text' | 'thinking' | 'tool';
 	item: ConversationItem;
-	rawArgs: string;
 	/** Snapshot text still expected from deltas that raced get_messages. */
 	seeded?: string;
 }
@@ -44,8 +43,15 @@ interface LiveState {
 
 interface BashLive {
 	item: ConversationItem;
+	/** Bounded display tail of the streamed output. */
 	output: string;
+	/** Leading output kept to match the final bashExecution message. */
+	head: string;
 }
+
+/** Live `!command` output is unbounded; the command card shows only a tail. */
+const MAX_LIVE_BASH_CHARS = 64 * 1024;
+const BASH_MATCH_HEAD_CHARS = 4096;
 
 let itemSeq = 0;
 function nid(): string {
@@ -551,6 +557,7 @@ export class SessionModel {
 		this.#failed = true;
 		this.#runActive = false;
 		this.#finalizeLive();
+		this.#bashLive.clear();
 		for (const it of this.#toolIndex.values()) {
 			if (it.status === 'running' || it.status === 'queued') it.status = 'cancelled';
 		}
@@ -739,7 +746,7 @@ export class SessionModel {
 				this.view.commands = cmds
 					.filter(isRec)
 					.map((c) => ({ name: str(c.name) ?? '', description: str(c.description) }))
-					.filter((c) => c.name.length > 0);
+					.filter((c, index, all) => c.name.length > 0 && all.findIndex((o) => o.name === c.name) === index);
 				return;
 			}
 			case 'command_output':
@@ -868,6 +875,7 @@ export class SessionModel {
 					this.#runActive = false;
 					this.#failed = true;
 					this.#finalizeLive();
+					this.#bashLive.clear();
 					this.view.pendingRequests = [];
 					this.view.status = 'disconnected';
 				} else {
@@ -948,7 +956,7 @@ export class SessionModel {
 			if (!item) return;
 			const kind = b.type === 'toolCall' ? 'tool' : b.type === 'thinking' ? 'thinking' : 'text';
 			const seeded = kind !== 'tool' && 'text' in item ? item.text : undefined;
-			live.blocks.set(i, { id: item.id, kind, item, rawArgs: '', seeded });
+			live.blocks.set(i, { id: item.id, kind, item, seeded });
 			live.order.push(i);
 		});
 	}
@@ -984,7 +992,7 @@ export class SessionModel {
 			this.view.items.push({ id: nid(), kind, text: '', streaming: true, timestamp: live.timestamp });
 			item = this.view.items[this.view.items.length - 1];
 		}
-		const b: LiveBlock = { id: item.id, kind, item, rawArgs: '' };
+		const b: LiveBlock = { id: item.id, kind, item };
 		live.blocks.set(idx, b);
 		live.order.push(idx);
 		return b;
@@ -1053,13 +1061,10 @@ export class SessionModel {
 				return;
 			}
 			case 'toolcall_start':
+			case 'toolcall_delta':
+				// Argument deltas are not rendered; toolcall_end carries the parsed args.
 				this.#blockFor(live, ev, 'tool');
 				return;
-			case 'toolcall_delta': {
-				const b = this.#blockFor(live, ev, 'tool');
-				b.rawArgs += str(ev.delta) ?? '';
-				return;
-			}
 			case 'toolcall_end': {
 				const b = this.#blockFor(live, ev, 'tool');
 				const item = b.item as ToolItem;
@@ -1461,17 +1466,19 @@ export class SessionModel {
 		if (!delta) return;
 		const e = this.#bashLive.get(id);
 		if (!e) {
+			const output = delta.slice(-MAX_LIVE_BASH_CHARS);
 			const item = this.#sink.push({
 				id: nid(),
 				kind: 'custom',
 				customType: 'bashExecution',
-				text: delta,
-				details: { output: delta },
+				text: output,
+				details: { output },
 			});
-			this.#bashLive.set(id, { item, output: delta });
+			this.#bashLive.set(id, { item, output, head: delta.slice(0, BASH_MATCH_HEAD_CHARS) });
 			return;
 		}
-		e.output += delta;
+		if (e.head.length < BASH_MATCH_HEAD_CHARS) e.head = (e.head + delta).slice(0, BASH_MATCH_HEAD_CHARS);
+		e.output = (e.output + delta).slice(-MAX_LIVE_BASH_CHARS);
 		(e.item as TextItem).text = e.output;
 		const det = (e.item as { details?: unknown }).details;
 		if (isRec(det)) det.output = e.output;
@@ -1481,7 +1488,7 @@ export class SessionModel {
 		const output = str(msg.output);
 		let match: string | undefined;
 		for (const [id, e] of this.#bashLive) {
-			if (output === undefined || output.startsWith(e.output)) {
+			if (output === undefined || output.startsWith(e.head)) {
 				match = id;
 				break;
 			}

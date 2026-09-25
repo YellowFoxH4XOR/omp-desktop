@@ -3,11 +3,11 @@
   import { onMount, tick } from 'svelte';
   import { open } from '@tauri-apps/plugin-dialog';
   import { VList } from 'virtua/svelte';
-  import { Plus, Settings2, PanelRightClose, GitCompareArrows, Network, Search, ChevronDown, ChevronRight, X, Pin, Archive, MoreHorizontal, RefreshCw, Terminal, FolderOpen, AlertTriangle, SunMoon, LoaderCircle, Check, SquarePen } from '@lucide/svelte';
+  import { Plus, Settings2, GitCompareArrows, Network, Search, ChevronDown, ChevronRight, X, Pin, Archive, MoreHorizontal, RefreshCw, Terminal, FolderOpen, FolderPlus, Folder, AlertTriangle, LoaderCircle, Check, SquarePen, GitFork, Trash2, Sparkles, MessageSquare, Monitor, Sun, Moon } from '@lucide/svelte';
   import { api, onBackendEvent } from '$lib/api';
   import { SessionModel } from '$lib/session.svelte';
   import Conversation from '$lib/components/conversation/Conversation.svelte';
-  import type { BackendEvent, HarnessInstallation, HarnessKind, LoginProvider, Project, Thread, ThreadStatus, UiResponse } from '$lib/types';
+  import type { BackendEvent, HarnessInstallation, HarnessInstallCommand, HarnessKind, LoginProvider, Project, Thread, ThreadStatus, UiResponse } from '$lib/types';
   type AgentsPanelComponent = (typeof import('$lib/components/agents/AgentsPanel.svelte'))['default'];
   type ChangesPanelComponent = (typeof import('$lib/components/diff/ChangesPanel.svelte'))['default'];
   type RpcFrame = Record<string, unknown>;
@@ -62,10 +62,13 @@
   let theme = $state<'system' | 'dark' | 'light'>('system');
   let installInProgress = $state<HarnessKind | null>(null);
   let installLog = $state<string[]>([]);
+  let installCommands = $state<HarnessInstallCommand[] | null>(null);
+  let installCommandsRequested = false;
   let loginProviders = $state<LoginProvider[]>([]);
   let loggingIn = $state<string | null>(null);
   let newHarness = $state<HarnessKind>('omp');
   let renaming = $state<string | null>(null);
+  let projectMenu = $state<string | null>(null);
   let renameText = $state('');
   let sidebarResizing = false;
   let panelResizing = false;
@@ -86,6 +89,9 @@
     { kind: 'project' as const, label: project.displayName, subtitle: project.path, project },
     ...(threadsByProject[project.id] ?? []).filter(t => !t.archived).map(thread => ({ kind: 'thread' as const, label: thread.title || 'New thread', subtitle: project.displayName, project, thread }))
   ]).filter(entry => `${entry.label} ${entry.subtitle}`.toLowerCase().includes(switchQuery.toLowerCase())).slice(0, 40));
+  const visibleThread = $derived(activeThread && activeProject && activeThread.projectId === activeProject.id ? activeThread : null);
+  const ompInstallCommand = $derived(installCommands?.find(command => command.kind === 'omp')?.command ?? 'bun install -g @oh-my-pi/pi-coding-agent');
+  const piInstallCommand = $derived(installCommands?.find(command => command.kind === 'pi')?.command ?? 'npm install -g --ignore-scripts @earendil-works/pi-coding-agent');
 
   function utf8Bytes(value: string): number {
     return utf8Encoder.encode(value).byteLength;
@@ -207,11 +213,16 @@
     enforceSessionLimit();
   }
   function stopInactiveSession(threadId: string, expected: SessionModel): boolean {
-    if (activeThread?.id === threadId || openingSessions.has(threadId) || !isSessionInactive(expected)) return false;
+    if (activeThread?.id === threadId || openingSessions.has(threadId) || stopping.has(threadId) || !isSessionInactive(expected)) return false;
     cancelIdleStop(threadId);
-    removeCachedSession(threadId, expected);
+    // Keep the cached session until the stop succeeds so live output still routes.
     let job: Promise<void>;
-    job = api.stopThread(threadId).catch(() => undefined).finally(() => {
+    job = api.stopThread(threadId).then(() => {
+      removeCachedSession(threadId, expected);
+    }).catch((error: unknown) => {
+      startupError = `Could not stop idle session: ${errorText(error)}`;
+      if (liveSessions.get(threadId) === expected) scheduleIdleStop(threadId);
+    }).finally(() => {
       if (stopping.get(threadId) === job) stopping.delete(threadId);
     });
     stopping.set(threadId, job);
@@ -374,6 +385,7 @@
       else if (event.metaKey && key === ',') { event.preventDefault(); void openSettings(); }
       else if (event.key === 'Escape') {
         if (errorDetailsOpen) errorDetailsOpen = false;
+        else if (projectMenu) projectMenu = null;
         else if (switcherOpen) switcherOpen = false;
         else if (settingsOpen) settingsOpen = false;
         else if (rightPanel) rightPanel = null;
@@ -392,10 +404,33 @@
     };
     window.addEventListener('mousemove', move);
     window.addEventListener('mouseup', up);
-    return () => { disposed = true; unlisten?.(); window.removeEventListener('keydown', onKey); window.removeEventListener('mousemove', move); window.removeEventListener('mouseup', up); for (const timer of idleStopTimers.values()) clearTimeout(timer); idleStopTimers.clear(); };
+    const onWindowError = (event: ErrorEvent) => {
+      // Benign layout-timing warning from ResizeObserver, not an app failure.
+      if (event.message?.startsWith('ResizeObserver loop')) return;
+      startupError = event.message || 'An unexpected error occurred.';
+    };
+    const onWindowRejection = (event: PromiseRejectionEvent) => {
+      const reason: unknown = event.reason;
+      startupError = reason instanceof Error ? reason.message : String(reason);
+    };
+    window.addEventListener('error', onWindowError);
+    window.addEventListener('unhandledrejection', onWindowRejection);
+    return () => { disposed = true; unlisten?.(); window.removeEventListener('keydown', onKey); window.removeEventListener('mousemove', move); window.removeEventListener('mouseup', up); window.removeEventListener('error', onWindowError); window.removeEventListener('unhandledrejection', onWindowRejection); for (const timer of idleStopTimers.values()) clearTimeout(timer); idleStopTimers.clear(); };
   });
   function applyTheme() { document.documentElement.dataset.theme = theme === 'system' ? '' : theme; localStorage.setItem('theme', theme); }
-  async function refreshHarnesses() { try { harnesses = await api.detectHarnesses(); if (harnesses.length === 1) newHarness = harnesses[0].kind; } catch (error) { startupError = `Could not detect harnesses: ${errorText(error)}`; } }
+  async function refreshInstallCommands() {
+    if (installCommandsRequested) return;
+    installCommandsRequested = true;
+    try { installCommands = await api.harnessInstallCommands(); }
+    catch { installCommands = null; }
+  }
+  async function refreshHarnesses() {
+    try {
+      harnesses = await api.detectHarnesses();
+      if (harnesses.length === 1) newHarness = harnesses[0].kind;
+    } catch (error) { startupError = `Could not detect harnesses: ${errorText(error)}`; }
+    if (harnesses.length === 0) void refreshInstallCommands();
+  }
   async function refreshProjects() {
     try {
       projects = await api.listProjects();
@@ -420,6 +455,11 @@
     const selectionToken = ++projectSelectionToken;
     ++threadSelectionToken;
     activeProject = project;
+    activeThread = null;
+    errorDetailsOpen = false;
+    loginProviders = [];
+    renaming = null;
+    renameText = '';
     newHarness = project.preferredHarness;
     selectedThreadId = null;
     activeSession = null;
@@ -519,7 +559,6 @@
     const selectionToken = ++threadSelectionToken;
     const inflightStop = stopping.get(thread.id);
     if (inflightStop) {
-      removeCachedSession(thread.id);
       await inflightStop.catch(() => undefined);
       if (selectionToken !== threadSelectionToken || invalidatedProjects.has(thread.projectId) || invalidatedThreads.has(thread.id)) return;
     }
@@ -534,10 +573,10 @@
       const cached = liveSessions.get(thread.id);
       if (cached) {
         cacheSession(thread.id, thread.projectId, cached);
-        if (selectionToken === threadSelectionToken) activeSession = cached;
+        if (selectionToken === threadSelectionToken && activeThread?.id === thread.id) activeSession = cached;
       } else {
         const opened = await openSessionModel(thread);
-        if (selectionToken !== threadSelectionToken || activeProject?.id !== thread.projectId || invalidatedProjects.has(thread.projectId) || invalidatedThreads.has(thread.id)) return;
+        if (selectionToken !== threadSelectionToken || activeProject?.id !== thread.projectId || activeThread?.id !== thread.id || invalidatedProjects.has(thread.projectId) || invalidatedThreads.has(thread.id)) return;
         activeThread = opened.thread;
         activeSession = opened.model;
       }
@@ -782,140 +821,171 @@
       await selectThread(entry.thread);
     }
   }
-  function statusMark(status: ThreadStatus): string {
-    return ({ active: '●', waiting: '◉', idle: '◌', completed: '✓', failed: '!', disconnected: '!' } satisfies Record<ThreadStatus, string>)[status];
+  const STATUS_LABEL: Record<ThreadStatus, string> = {
+    active: 'Working', waiting: 'Needs input', idle: 'Idle', completed: 'Done', failed: 'Failed', disconnected: 'Disconnected',
+  };
+  function setTheme(next: typeof theme) { theme = next; applyTheme(); }
+  function onWindowClick(event: MouseEvent) {
+    if (projectMenu && !(event.target as Element | null)?.closest('.project-menu, .row-more')) projectMenu = null;
   }
   function focusInput(node: HTMLInputElement) { node.focus(); node.select(); }
 </script>
 
-<div class="app-shell" style={`--sidebar-width:${sidebarWidth}px; --panel-width:${panelWidth}px`}>
-  <header class="topbar" data-tauri-drag-region>
-    <div class="brand" data-tauri-drag-region><div class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></div><span>OMP <span class="brand-soft">Desktop</span></span></div>
-    <span class="bar-divider"></span>
-    <div class="top-project" data-tauri-drag-region>{activeProject?.displayName ?? 'Workspace'}{#if activeThread}<ChevronRight size={13} strokeWidth={1.7} /><span class="top-thread">{activeThread.title}</span>{/if}</div>
-    <div class="bar-spacer" data-tauri-drag-region></div>
-    {#if activeThread && currentView}
-      <span class="toolbar-harness">{activeThread.harness.toUpperCase()}</span>
-      {#if activeThread.worktreePath}<span class="worktree-badge" title={`Isolated worktree: ${activeThread.worktreePath}`}>Isolated</span>{/if}
-      {#if currentView.capabilities.modelSwitching}
-        <label class="toolbar-select" aria-label="Model">
-          <select value={currentView.model ? `${currentView.model.provider}/${currentView.model.id}` : ''} onchange={e => void setModel(e.currentTarget.value)} aria-label="Select model">
-            {#if !currentView.model}<option value="">Default model</option>{/if}
-            {#each currentView.models as model}<option value={`${model.provider}/${model.id}`}>{model.name} · {model.provider}</option>{/each}
-          </select><ChevronDown size={12} strokeWidth={1.7} />
-        </label>
-      {/if}
-      {#if currentView.capabilities.effortLevels && currentView.levels.length}
-        <label class="toolbar-select effort" aria-label="Effort">
-          <select value={currentView.effort ?? ''} onchange={e => void setEffort(e.currentTarget.value)} aria-label="Select effort">
-            {#if !currentView.effort}<option value="">Default effort</option>{/if}
-            {#each currentView.levels as level}<option value={level}>{level[0]?.toUpperCase() + level.slice(1)}</option>{/each}
-          </select><ChevronDown size={12} strokeWidth={1.7} />
-        </label>
-      {/if}
-      {#if currentView.contextUsage?.percent != null}<span class="context" title={`Context ${currentView.contextUsage.tokens ?? 0} / ${currentView.contextUsage.contextWindow} tokens`}>{Math.round(currentView.contextUsage.percent)}% context</span>{/if}
-      <span class="bar-divider"></span>
-      <button class:pressed={rightPanel === 'changes'} class="icon-button" title="Changes (⌘⇧D)" aria-label="Toggle changes" onclick={() => togglePanel('changes')}><GitCompareArrows size={17} strokeWidth={1.65} /></button>
-      {#if currentView.capabilities.agents}<button class:pressed={rightPanel === 'agents'} class="icon-button" title="Agents (⌘⇧A)" aria-label="Toggle agents" onclick={() => togglePanel('agents')}><Network size={17} strokeWidth={1.65} /></button>{/if}
-      {#if rightPanel}<button class="icon-button" title="Close panel" aria-label="Close side panel" onclick={() => rightPanel = null}><PanelRightClose size={16} strokeWidth={1.65} /></button>{/if}
-    {/if}
-    <button class="icon-button" title="Switch project or thread (⌘K)" aria-label="Switch project or thread" onclick={() => void openSwitcher()}><Search size={16} strokeWidth={1.7} /></button>
-    <button class="icon-button" title="Settings (⌘,)" aria-label="Settings" onclick={() => void openSettings()}><Settings2 size={17} strokeWidth={1.65} /></button>
-  </header>
+<svelte:window onclick={onWindowClick} />
 
-  <div class="workspace">
-    <aside class="sidebar" aria-label="Projects and threads">
-      <div class="sidebar-heading"><span>PROJECTS</span><button class="mini-button" title="Add project" aria-label="Add project" onclick={() => void addProject()}><Plus size={16} strokeWidth={1.8} /></button></div>
-      <div class="project-list">
-        {#each projects as project (project.id)}
-          <section class="project-section">
-            <button class:active={activeProject?.id === project.id} class="project-row" onclick={() => void selectProject(project)} aria-label={`Open ${project.displayName}`}>
-              <ChevronDown size={13} strokeWidth={1.8} class={activeProject?.id !== project.id ? 'rotated' : ''} /><span class="project-avatar">{project.displayName[0]?.toUpperCase()}</span><span class="project-name">{project.displayName}</span>
-              {#if project.isGit}<span class="git-tick" title="Git repository">⌁</span>{/if}
+<svelte:boundary>
+<div class="app-shell" style={`--sidebar-width:${sidebarWidth}px; --panel-width:${panelWidth}px`}>
+  <aside class="sidebar" aria-label="Projects and threads">
+    <div class="sidebar-top" data-tauri-drag-region>
+      <div class="sidebar-tools">
+        <button class="icon-button" title="Search projects and threads (⌘K)" aria-label="Switch project or thread" onclick={() => void openSwitcher()}><Search size={16} strokeWidth={1.8} /></button>
+        <button class="icon-button" title="New thread (⌘N)" aria-label="New thread" disabled={!activeProject || pendingAction || !harnesses.length} onclick={() => { if (activeProject) void createThread(activeProject); }}><SquarePen size={16} strokeWidth={1.8} /></button>
+      </div>
+    </div>
+
+    <div class="project-list">
+      <div class="section-label"><span>Projects</span><button class="mini-button" title="Add project" aria-label="Add project" onclick={() => void addProject()}><Plus size={14} strokeWidth={2} /></button></div>
+      {#each projects as project (project.id)}
+        {@const open = activeProject?.id === project.id}
+        <section class="project-section">
+          <div class="project-row" class:active={open}>
+            <button class="project-toggle" onclick={() => void selectProject(project)} aria-label={`Open ${project.displayName}`} aria-expanded={open}>
+              <ChevronRight size={12} strokeWidth={2.2} class={open ? 'chev open' : 'chev'} />
+              <span class="project-glyph" aria-hidden="true">{project.displayName[0]?.toUpperCase()}</span>
+              <span class="project-name">{project.displayName}</span>
             </button>
-            {#if activeProject?.id === project.id}
-              {@const visible = visibleThreads(project.id)}
-              <div class="thread-list">
-                <button class="new-thread" disabled={pendingAction || !harnesses.length} onclick={() => void createThread(project)}><Plus size={13} strokeWidth={2} /> New thread <kbd>⌘N</kbd></button>
-                {#if harnesses.length > 1}
-                  <label class="thread-harness-picker"><span>Harness</span><select aria-label="Harness for new threads" bind:value={newHarness}><option value="omp">OMP</option><option value="pi">Pi</option></select></label>
-                {/if}
-                {#if visible.length}
-                  <VList data={visible} getKey={thread => thread.id} style={`height: min(55vh, ${visible.length * 31 + (renaming ? 90 : 0)}px);`}>
-                    {#snippet children(thread)}
-                      <div class:active={selectedThreadId === thread.id} class="thread-row">
-                        <button class="thread-link" onclick={() => void selectThread(thread)} title={thread.title}>
-                          <span class={`status-icon ${thread.status}`} aria-label={thread.status}>{statusMark(thread.status)}</span><span class="thread-title">{thread.title || 'New thread'}</span>
-                        </button>
-                        <button class="thread-more" title={`Actions for ${thread.title}`} aria-label={`Actions for ${thread.title}`} onclick={() => { renaming = renaming === thread.id ? null : thread.id; renameText = thread.title; }}><MoreHorizontal size={15} /></button>
-                      </div>
-                      {#if renaming === thread.id}
-                        <div class="thread-actions">
-                          <form onsubmit={event => { event.preventDefault(); void renameThread(thread, renameText); }}><input use:focusInput aria-label="Thread title" bind:value={renameText} maxlength="120" /><button title="Save title" aria-label="Save title"><Check size={14}/></button></form>
-                          <button onclick={() => void setFlag(thread, 'pinned')}><Pin size={12}/>{thread.pinned ? 'Unpin' : 'Pin'}</button>
-                          <button onclick={() => void setFlag(thread, 'archived')}><Archive size={12}/>{thread.archived ? 'Unarchive' : 'Archive'}</button>
-                        </div>
-                      {/if}
-                    {/snippet}
-                  </VList>
-                {/if}
+            <button class="row-more" title="Project actions" aria-label={`Actions for ${project.displayName}`} aria-haspopup="menu" aria-expanded={projectMenu === project.id} onclick={() => projectMenu = projectMenu === project.id ? null : project.id}><MoreHorizontal size={14} /></button>
+            {#if projectMenu === project.id}
+              <div class="project-menu" role="menu">
+                <div class="menu-caption" title={project.path}>{project.path}</div>
+                <button role="menuitem" class="danger" onclick={() => { projectMenu = null; void removeProject(project); }}><Trash2 size={13} /> Remove from app</button>
               </div>
             {/if}
-          </section>
-        {/each}
-        {#if !projects.length && !detecting}<div class="empty-projects">Projects keep sessions connected to the code they change.</div>{/if}
-      </div>
-      <div class="sidebar-bottom">
-        {#if projects.length}<button class="footer-link" onclick={() => showArchived = !showArchived}><Archive size={14} strokeWidth={1.8}/>{showArchived ? 'Hide archived' : 'Show archived'}</button>{/if}
-        <button class="add-project" disabled={pendingAction} onclick={() => void addProject()}><Plus size={16} strokeWidth={1.8} /> Add project</button>
-        {#if activeProject}<button class="footer-link remove-project" onclick={() => void removeProject(activeProject!)}>Remove from app</button>{/if}
-      </div>
-    </aside>
-    <div class="resize-handle" role="slider" tabindex="0" aria-orientation="vertical" aria-valuemin="205" aria-valuemax="390" aria-valuenow={sidebarWidth} aria-label="Resize project sidebar" onmousedown={() => sidebarResizing = true} onkeydown={event => { if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); sidebarWidth = Math.max(205, Math.min(390, sidebarWidth + (event.key === 'ArrowRight' ? 12 : -12))); localStorage.setItem('sidebarWidth', String(sidebarWidth)); } }}></div>
-
-    <main class="main-pane">
-      {#if startupError}<div class="error-banner" role="alert"><AlertTriangle size={15}/><span>{startupError}</span><button aria-label="Dismiss error" onclick={() => startupError = ''}><X size={14}/></button></div>{/if}
-      {#if detecting}<div class="main-empty"><LoaderCircle class="spin" size={28} strokeWidth={1.4}/><h2>Finding your coding harnesses</h2><p>Checking OMP, Pi, and your shell environment.</p></div>
-      {:else if onboarding}
-        <div class="onboarding"><div class="onboarding-eyebrow">GET STARTED</div><h1>Your agents, in focus.</h1><p class="onboarding-intro">A quiet home for OMP and Pi sessions, tool activity, subagents, and code review. Your code and sessions stay on this Mac.</p>
-          <div class="harness-choices">
-            <div class="harness-card"><div class="harness-icon">O</div><div><h3>Oh My Pi</h3><p>Rich agent orchestration and tooling.</p></div><button disabled={installInProgress !== null} onclick={() => void install('omp')}>{installInProgress === 'omp' ? 'Installing…' : 'Install OMP'}</button></div>
-            <div class="harness-card"><div class="harness-icon">π</div><div><h3>Pi</h3><p>The lightweight coding-agent foundation.</p></div><button disabled={installInProgress !== null} onclick={() => void install('pi')}>{installInProgress === 'pi' ? 'Installing…' : 'Install Pi'}</button></div>
           </div>
-          <div class="install-notice">Installation runs only after you choose it. OMP: <code>bun install -g @oh-my-pi/pi-coding-agent</code><br />Pi: <code>npm install -g --ignore-scripts @earendil-works/pi-coding-agent</code></div>
-          {#if installLog.length}<pre class="install-log" aria-live="polite">{installLog.join('\n')}</pre>{/if}
-          <div class="onboarding-actions"><button onclick={() => void locate('omp')}>Locate OMP executable</button><button onclick={() => void locate('pi')}>Locate Pi executable</button><button onclick={() => void refreshHarnesses()}><RefreshCw size={14}/> Retry detection</button></div>
-        </div>
-      {:else if !activeProject}
-        <div class="main-empty"><div class="empty-graphic"><FolderOpen size={32} strokeWidth={1.2}/></div><h2>Start with a project</h2><p>Choose a local directory. Nothing is uploaded or copied.</p><button class="primary-button" onclick={() => void addProject()}><Plus size={16}/> Add project</button></div>
-      {:else if loadingThread}
-        <div class="main-empty"><LoaderCircle class="spin" size={28} strokeWidth={1.4}/><h2>Opening thread</h2><p>Restoring the conversation from {activeThread?.harness.toUpperCase()}.</p></div>
-      {:else if !activeThread || !currentView}
-        <div class="main-empty"><div class="empty-graphic"><SquarePen size={30} strokeWidth={1.2}/></div><h2>What shall we work on?</h2><p>Start a thread in <strong>{activeProject.displayName}</strong> to talk to your agent.</p><button class="primary-button" disabled={pendingAction || !harnesses.length} onclick={() => void createThread(activeProject!)}><Plus size={16}/> New thread</button><div class="empty-hint">Your existing sessions are in the sidebar.</div></div>
-      {:else}
-        {#if currentView.error}<div class="error-banner"><AlertTriangle size={15}/><span>{currentView.error}</span>{#if crashDetails[activeThread.id]}<button onclick={() => errorDetailsOpen = true}>View details</button>{/if}<button onclick={() => void restart()}><RefreshCw size={13}/> Restart session</button></div>{/if}
-        <Conversation view={currentView} onSend={send} onAbort={stop} onShowChanges={showChanges} onShowAgents={() => void openPanel('agents')} onRespond={respond} />
-      {/if}
-    </main>
+          {#if open}
+            {@const visible = visibleThreads(project.id)}
+            <div class="thread-list">
+              <div class="new-thread-row">
+                <button class="new-thread" disabled={pendingAction || !harnesses.length} onclick={() => void createThread(project)}><Plus size={13} strokeWidth={2.2} /> New thread</button>
+                {#if harnesses.length > 1}
+                  <label class="harness-picker" title="Harness for new threads"><select aria-label="Harness for new threads" bind:value={newHarness}><option value="omp">OMP</option><option value="pi">Pi</option></select><ChevronDown size={11} strokeWidth={2} /></label>
+                {/if}
+              </div>
+              {#if visible.length}
+                <VList data={visible} getKey={thread => thread.id} style={`height: min(58vh, ${visible.length * 30 + (renaming ? 96 : 0)}px);`}>
+                  {#snippet children(thread)}
+                    <div class:active={selectedThreadId === thread.id} class="thread-row">
+                      <button class="thread-link" onclick={() => void selectThread(thread)} title={thread.title}>
+                        <span class={`status-dot ${thread.status}`} role="img" aria-label={thread.status}></span>
+                        <span class="thread-title">{thread.title || 'New thread'}</span>
+                        {#if thread.pinned}<Pin size={10} strokeWidth={2.2} class="pin-mark" aria-label="Pinned" />{/if}
+                      </button>
+                      <button class="thread-more" title={`Actions for ${thread.title}`} aria-label={`Actions for ${thread.title}`} onclick={() => { renaming = renaming === thread.id ? null : thread.id; renameText = thread.title; }}><MoreHorizontal size={14} /></button>
+                    </div>
+                    {#if renaming === thread.id}
+                      <div class="thread-actions">
+                        <form onsubmit={event => { event.preventDefault(); void renameThread(thread, renameText); }}><input use:focusInput aria-label="Thread title" bind:value={renameText} maxlength="120" /><button title="Save title" aria-label="Save title"><Check size={13}/></button></form>
+                        <button onclick={() => void setFlag(thread, 'pinned')}><Pin size={12}/>{thread.pinned ? 'Unpin' : 'Pin'}</button>
+                        <button onclick={() => void setFlag(thread, 'archived')}><Archive size={12}/>{thread.archived ? 'Unarchive' : 'Archive'}</button>
+                      </div>
+                    {/if}
+                  {/snippet}
+                </VList>
+              {:else}
+                <div class="threads-empty">No threads yet</div>
+              {/if}
+            </div>
+          {/if}
+        </section>
+      {/each}
+      {#if !projects.length && !detecting}<div class="empty-projects">Add a folder to keep agent sessions next to the code they change.</div>{/if}
+    </div>
 
-    {#if rightPanel && activeThread && currentView}
-      <div class="resize-handle panel-handle" role="slider" tabindex="0" aria-orientation="vertical" aria-valuemin="320" aria-valuemax="850" aria-valuenow={panelWidth} aria-label="Resize detail panel" onmousedown={() => panelResizing = true} onkeydown={event => { if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); panelWidth = Math.max(320, Math.min(850, panelWidth + (event.key === 'ArrowLeft' ? 12 : -12))); localStorage.setItem('panelWidth', String(panelWidth)); } }}></div>
-      <aside class="details-pane" aria-label={rightPanel === 'agents' ? 'Agents' : 'Changes'}>
-        {#if rightPanel === 'agents'}
-          {#if AgentsPanel}<AgentsPanel view={currentView} onClose={() => rightPanel = null} />
-          {:else}<div class="panel-loading"><LoaderCircle class="spin" size={18}/><span>Loading agents…</span></div>{/if}
-        {:else if ChangesPanel}<ChangesPanel thread={activeThread} onClose={() => rightPanel = null} focusPath={diffPath} />
-        {:else}<div class="panel-loading"><LoaderCircle class="spin" size={18}/><span>Loading changes…</span></div>{/if}
-      </aside>
+    <div class="sidebar-bottom">
+      <button class="footer-button" disabled={pendingAction} onclick={() => void addProject()}><FolderPlus size={15} strokeWidth={1.8} /> Add project</button>
+      <span class="grow"></span>
+      {#if projects.length}<button class="icon-button" class:pressed={showArchived} title={showArchived ? 'Hide archived threads' : 'Show archived threads'} aria-label={showArchived ? 'Hide archived' : 'Show archived'} aria-pressed={showArchived} onclick={() => showArchived = !showArchived}><Archive size={15} strokeWidth={1.8}/></button>{/if}
+      <button class="icon-button" title="Settings (⌘,)" aria-label="Settings" onclick={() => void openSettings()}><Settings2 size={15} strokeWidth={1.8} /></button>
+    </div>
+  </aside>
+  <div class="resize-handle" role="slider" tabindex="0" aria-orientation="vertical" aria-valuemin="205" aria-valuemax="390" aria-valuenow={sidebarWidth} aria-label="Resize project sidebar" onmousedown={() => sidebarResizing = true} onkeydown={event => { if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); sidebarWidth = Math.max(205, Math.min(390, sidebarWidth + (event.key === 'ArrowRight' ? 12 : -12))); localStorage.setItem('sidebarWidth', String(sidebarWidth)); } }}></div>
+
+  <main class="main-pane">
+    <header class="main-header" data-tauri-drag-region>
+      <div class="crumbs" data-tauri-drag-region>
+        {#if activeProject}<span class="crumb-project">{activeProject.displayName}</span>{:else}<span class="crumb-project">OMP Desktop</span>{/if}
+        {#if visibleThread}<ChevronRight size={13} strokeWidth={2} class="crumb-sep" /><span class="top-thread">{visibleThread.title || 'New thread'}</span>{/if}
+        {#if visibleThread && currentView && currentView.status !== 'idle'}<span class={`status-pill ${currentView.status}`} title={STATUS_LABEL[currentView.status]}><span class={`status-dot ${currentView.status}`}></span><span class="pill-label">{STATUS_LABEL[currentView.status]}</span></span>{/if}
+      </div>
+      {#if visibleThread && currentView}
+        <div class="header-actions">
+          {#if visibleThread.worktreePath}<span class="badge" title={`Isolated worktree: ${visibleThread.worktreePath}`}><GitFork size={11} strokeWidth={2} /> Isolated</span>{/if}
+          <span class="badge harness" title="Harness">{visibleThread.harness.toUpperCase()}</span>
+          <div class="panel-toggles">
+            <button class:pressed={rightPanel === 'changes'} class="toggle-button" title="Changes (⌘⇧D)" aria-label="Toggle changes" aria-pressed={rightPanel === 'changes'} onclick={() => togglePanel('changes')}><GitCompareArrows size={14} strokeWidth={1.9} /><span>Changes</span></button>
+            {#if currentView.capabilities.agents}
+              {@const running = currentView.agents.filter(agent => agent.status === 'running').length}
+              <button class:pressed={rightPanel === 'agents'} class="toggle-button" title="Agents (⌘⇧A)" aria-label="Toggle agents" aria-pressed={rightPanel === 'agents'} onclick={() => togglePanel('agents')}><Network size={14} strokeWidth={1.9} /><span>Agents</span>{#if running}<span class="count">{running}</span>{/if}</button>
+            {/if}
+          </div>
+        </div>
+      {/if}
+    </header>
+
+    {#if startupError}<div class="error-banner" role="alert"><AlertTriangle size={14}/><span>{startupError}</span><button aria-label="Dismiss error" onclick={() => startupError = ''}><X size={14}/></button></div>{/if}
+    {#if detecting}<div class="main-empty"><LoaderCircle class="spin" size={24} strokeWidth={1.6}/><h2>Finding your coding harnesses</h2><p>Checking OMP, Pi, and your shell environment.</p></div>
+    {:else if onboarding}
+      <div class="onboarding">
+        <div class="onboarding-mark" aria-hidden="true"><Sparkles size={22} strokeWidth={1.6} /></div>
+        <h1>Your agents, in focus.</h1>
+        <p class="onboarding-intro">A calm home for OMP and Pi sessions, tool activity, subagents, and code review. Your code and sessions stay on this Mac.</p>
+        <div class="harness-choices">
+          <div class="harness-card"><div class="harness-icon">O</div><div class="harness-copy"><h3>Oh My Pi</h3><p>Rich agent orchestration and tooling.</p><code>{ompInstallCommand}</code></div><button class="primary-button" disabled={installInProgress !== null} onclick={() => void install('omp')}>{installInProgress === 'omp' ? 'Installing…' : 'Install'}</button></div>
+          <div class="harness-card"><div class="harness-icon">π</div><div class="harness-copy"><h3>Pi</h3><p>The lightweight coding-agent foundation.</p><code>{piInstallCommand}</code></div><button class="secondary-button" disabled={installInProgress !== null} onclick={() => void install('pi')}>{installInProgress === 'pi' ? 'Installing…' : 'Install'}</button></div>
+        </div>
+        <p class="install-notice">Installation runs only after you choose it.</p>
+        {#if installLog.length}<pre class="install-log" aria-live="polite">{installLog.join('\n')}</pre>{/if}
+        <div class="onboarding-actions"><button onclick={() => void locate('omp')}>Locate OMP executable</button><button onclick={() => void locate('pi')}>Locate Pi executable</button><button onclick={() => void refreshHarnesses()}><RefreshCw size={13}/> Retry detection</button></div>
+      </div>
+    {:else if !activeProject}
+      <div class="main-empty"><div class="empty-graphic"><FolderOpen size={26} strokeWidth={1.5}/></div><h2>Start with a project</h2><p>Choose a local folder. Nothing is uploaded or copied.</p><button class="primary-button" onclick={() => void addProject()}><Plus size={15} strokeWidth={2.2}/> Add project</button></div>
+    {:else if loadingThread}
+      <div class="main-empty"><LoaderCircle class="spin" size={24} strokeWidth={1.6}/><h2>Opening thread</h2><p>Restoring the conversation from {visibleThread?.harness.toUpperCase() ?? activeProject.preferredHarness.toUpperCase()}.</p></div>
+    {:else if !visibleThread || !currentView}
+      <div class="main-empty"><div class="empty-graphic"><SquarePen size={24} strokeWidth={1.5}/></div><h2>What shall we work on?</h2><p>Start a thread in <strong>{activeProject.displayName}</strong> to talk to your agent.</p><button class="primary-button" disabled={pendingAction || !harnesses.length} onclick={() => void createThread(activeProject!)}><Plus size={15} strokeWidth={2.2}/> New thread</button><div class="empty-hint"><kbd>⌘</kbd><kbd>N</kbd> new thread <span class="dot-sep"></span> <kbd>⌘</kbd><kbd>K</kbd> jump anywhere</div></div>
+    {:else}
+      {#if currentView.error}<div class="error-banner"><AlertTriangle size={14}/><span>{currentView.error}</span>{#if visibleThread && crashDetails[visibleThread.id]}<button onclick={() => errorDetailsOpen = true}>View details</button>{/if}<button class="banner-action" onclick={() => void restart()}><RefreshCw size={13}/> Restart session</button></div>{/if}
+      <Conversation view={currentView} onSend={send} onAbort={stop} onShowChanges={showChanges} onShowAgents={() => void openPanel('agents')} onRespond={respond} onSetModel={setModel} onSetEffort={setEffort} />
     {/if}
-  </div>
+  </main>
+
+  {#if rightPanel && visibleThread && currentView}
+    <div class="resize-handle panel-handle" role="slider" tabindex="0" aria-orientation="vertical" aria-valuemin="320" aria-valuemax="850" aria-valuenow={panelWidth} aria-label="Resize detail panel" onmousedown={() => panelResizing = true} onkeydown={event => { if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); panelWidth = Math.max(320, Math.min(850, panelWidth + (event.key === 'ArrowLeft' ? 12 : -12))); localStorage.setItem('panelWidth', String(panelWidth)); } }}></div>
+    <aside class="details-pane" aria-label={rightPanel === 'agents' ? 'Agents' : 'Changes'}>
+      {#if rightPanel === 'agents'}
+        {#if AgentsPanel}<AgentsPanel view={currentView} onClose={() => rightPanel = null} />
+        {:else}<div class="panel-loading"><LoaderCircle class="spin" size={16}/><span>Loading agents…</span></div>{/if}
+      {:else if ChangesPanel}<ChangesPanel thread={visibleThread} onClose={() => rightPanel = null} focusPath={diffPath} />
+      {:else}<div class="panel-loading"><LoaderCircle class="spin" size={16}/><span>Loading changes…</span></div>{/if}
+    </aside>
+  {/if}
 </div>
 
-{#if errorDetailsOpen && activeThread}
+  {#snippet failed(error, reset)}
+    <div class="main-empty" role="alert" style="height: 100vh;">
+      <div class="empty-graphic danger"><AlertTriangle size={26} strokeWidth={1.5} /></div>
+      <h2>Something went wrong</h2>
+      <p>{error instanceof Error ? error.message : String(error ?? 'An unexpected error occurred.')}</p>
+      <button class="primary-button" onclick={() => { startupError = ''; reset(); }}><RefreshCw size={15} /> Try again</button>
+      <div class="empty-hint">If this keeps happening, reload the window.</div>
+    </div>
+  {/snippet}
+
+{#if errorDetailsOpen && visibleThread}
   <div class="overlay" role="presentation" onclick={event => { if (event.target === event.currentTarget) errorDetailsOpen = false; }}>
     <div class="settings dialog" role="dialog" aria-modal="true" aria-label="Harness error details">
-      <header><div><div class="dialog-eyebrow">HARNESS ERROR</div><h2>Details</h2></div><button class="icon-button" aria-label="Close details" onclick={() => errorDetailsOpen = false}><X size={18}/></button></header>
-      <pre class="error-details">{crashDetails[activeThread.id]}</pre>
+      <header><h2>Harness error</h2><button class="icon-button" aria-label="Close details" onclick={() => errorDetailsOpen = false}><X size={16}/></button></header>
+      <pre class="error-details">{crashDetails[visibleThread.id]}</pre>
     </div>
   </div>
 {/if}
@@ -924,26 +994,27 @@
   <div class="overlay" role="presentation" onclick={event => { if (event.target === event.currentTarget) switcherOpen = false; }}>
     <div class="switcher dialog" role="dialog" aria-modal="true" aria-label="Switch project or thread">
       <div class="switch-search">
-        <Search size={18}/>
-        <input id="switcher-search" placeholder="Go to a project or thread…" bind:value={switchQuery}
+        <Search size={17} strokeWidth={1.8}/>
+        <input id="switcher-search" placeholder="Jump to a project or thread…" bind:value={switchQuery}
           oninput={() => switchIndex = 0}
           onkeydown={event => {
             if (event.key === 'ArrowDown') { event.preventDefault(); switchIndex = Math.min(switchEntries.length - 1, switchIndex + 1); }
             if (event.key === 'ArrowUp') { event.preventDefault(); switchIndex = Math.max(0, switchIndex - 1); }
             if (event.key === 'Enter' && switchEntries[switchIndex]) { event.preventDefault(); void chooseSwitch(switchEntries[switchIndex]); }
           }} />
-        <kbd>ESC</kbd>
+        <kbd>esc</kbd>
       </div>
       <div class="switch-results">
         {#each switchEntries as entry, index}
-          <button class:selected={switchIndex === index} onclick={() => void chooseSwitch(entry)}>
-            <span class="switch-icon">{entry.kind === 'project' ? '◫' : '◌'}</span>
-            <span><strong>{entry.label}</strong><small>{entry.subtitle}</small></span>
+          <button class:selected={switchIndex === index} onmouseenter={() => switchIndex = index} onclick={() => void chooseSwitch(entry)}>
+            <span class="switch-icon" class:thread={entry.kind === 'thread'}>{#if entry.kind === 'project'}<Folder size={14} strokeWidth={1.8}/>{:else}<MessageSquare size={14} strokeWidth={1.8}/>{/if}</span>
+            <span class="switch-text"><strong>{entry.label}</strong><small>{entry.subtitle}</small></span>
+            {#if entry.kind === 'thread'}<span class={`status-dot ${entry.thread.status}`}></span>{/if}
           </button>
         {/each}
         {#if !switchEntries.length}<p>No matching projects or threads.</p>{/if}
       </div>
-      <div class="dialog-footer"><span><kbd>↑</kbd> <kbd>↓</kbd> navigate&nbsp;&nbsp; <kbd>↵</kbd> open</span><span>⌘K</span></div>
+      <div class="dialog-footer"><span><kbd>↑</kbd><kbd>↓</kbd> navigate</span><span><kbd>↵</kbd> open</span></div>
     </div>
   </div>
 {/if}
@@ -951,115 +1022,239 @@
 {#if settingsOpen}
   <div class="overlay" role="presentation" onclick={event => { if (event.target === event.currentTarget) settingsOpen = false; }}>
     <div class="settings dialog" role="dialog" aria-modal="true" aria-label="Settings">
-      <header><div><div class="dialog-eyebrow">PREFERENCES</div><h2>Settings</h2></div><button class="icon-button" aria-label="Close settings" onclick={() => settingsOpen = false}><X size={18}/></button></header>
-      <section><h3>Appearance</h3><p>Choose a theme for this Mac.</p><label class="setting-row"><span><SunMoon size={17}/> Theme</span><select bind:value={theme} onchange={applyTheme}><option value="system">Follow system</option><option value="dark">Dark</option><option value="light">Light</option></select></label></section>
+      <header><h2>Settings</h2><button class="icon-button" aria-label="Close settings" onclick={() => settingsOpen = false}><X size={16}/></button></header>
+      <section>
+        <h3>Appearance</h3>
+        <div class="setting-row"><span>Theme</span>
+          <div class="segmented" role="radiogroup" aria-label="Theme">
+            <button role="radio" aria-checked={theme === 'system'} class:on={theme === 'system'} onclick={() => setTheme('system')}><Monitor size={13}/> System</button>
+            <button role="radio" aria-checked={theme === 'light'} class:on={theme === 'light'} onclick={() => setTheme('light')}><Sun size={13}/> Light</button>
+            <button role="radio" aria-checked={theme === 'dark'} class:on={theme === 'dark'} onclick={() => setTheme('dark')}><Moon size={13}/> Dark</button>
+          </div>
+        </div>
+      </section>
       <section>
         <h3>Coding harnesses</h3><p>System installations are used directly, including their existing sessions and credentials.</p>
-        {#each ['omp', 'pi'] as kind}
-          {@const installation = harnesses.find(h => h.kind === kind)}
-          <div class="setting-row"><span><Terminal size={17}/> {kind.toUpperCase()}</span>
-            {#if installation}<span class="install-path" title={installation.path}>{installation.version}<small>{installation.path}</small></span>
-            {:else}<span class="missing">Not found</span>{/if}
-            <button onclick={() => void locate(kind as HarnessKind)}>Choose…</button>
-          </div>
-        {/each}
-        <button class="text-button" onclick={() => void refreshHarnesses()}><RefreshCw size={14}/> Scan again</button>
-      </section>
-      {#if activeThread?.harness === 'omp'}
-        <section>
-          <h3>Provider sign-in</h3><p>OMP manages credentials. This app never stores provider tokens.</p>
-          {#each loginProviders.filter(provider => provider.available) as provider}
-            <div class="setting-row">
-              <span>{provider.name}</span>
-              <span class:authenticated={provider.authenticated} class="provider-state">{provider.authenticated ? 'Connected' : 'Not connected'}</span>
-              {#if !provider.authenticated}<button disabled={loggingIn !== null} onclick={() => void login(provider.id)}>{loggingIn === provider.id ? 'Signing in…' : 'Sign in'}</button>{/if}
+        <div class="setting-group">
+          {#each ['omp', 'pi'] as kind}
+            {@const installation = harnesses.find(h => h.kind === kind)}
+            <div class="setting-row"><span class="setting-name"><Terminal size={15} strokeWidth={1.8}/> {kind.toUpperCase()}</span>
+              {#if installation}<span class="install-path" title={installation.path}><span class="version">{installation.version}</span><small><bdi>{installation.path}</bdi></small></span>
+              {:else}<span class="missing">Not found</span>{/if}
+              <button class="secondary-button small" onclick={() => void locate(kind as HarnessKind)}>Choose…</button>
             </div>
           {/each}
-          {#if loginProviders.length === 0}<p>Open an OMP thread to view sign-in providers.</p>{/if}
+        </div>
+        <button class="text-button" onclick={() => void refreshHarnesses()}><RefreshCw size={13}/> Scan again</button>
+      </section>
+      {#if visibleThread?.harness === 'omp'}
+        <section>
+          <h3>Provider sign-in</h3><p>OMP manages credentials. This app never stores provider tokens.</p>
+          <div class="setting-group">
+            {#each loginProviders.filter(provider => provider.available) as provider}
+              <div class="setting-row">
+                <span class="setting-name">{provider.name}</span>
+                <span class:authenticated={provider.authenticated} class="provider-state">{#if provider.authenticated}<Check size={12} strokeWidth={2.4}/> Connected{:else}Not connected{/if}</span>
+                {#if !provider.authenticated}<button class="secondary-button small" disabled={loggingIn !== null} onclick={() => void login(provider.id)}>{loggingIn === provider.id ? 'Signing in…' : 'Sign in'}</button>{/if}
+              </div>
+            {/each}
+            {#if loginProviders.length === 0}<p class="setting-empty">Open an OMP thread to view sign-in providers.</p>{/if}
+          </div>
         </section>
       {/if}
-      <section><h3>Privacy</h3><p>Project metadata is stored locally. OMP and Pi retain control of sessions, credentials, extensions, and provider connections. This app sends no product telemetry.</p></section>
+      <section><h3>Privacy</h3><p class="last">Project metadata is stored locally. OMP and Pi retain control of sessions, credentials, extensions, and provider connections. This app sends no product telemetry.</p></section>
     </div>
   </div>
 {/if}
+</svelte:boundary>
 
 <style>
-  .app-shell { display:flex; flex-direction:column; width:100vw; height:100vh; min-width:780px; background:var(--bg); overflow:hidden; }
-  .topbar { height:54px; min-height:54px; display:flex; align-items:center; gap:10px; border-bottom:1px solid var(--line); padding:0 18px 0 78px; background:var(--bg); user-select:none; }
-  .brand { display:flex; align-items:center; gap:9px; font-size:13px; font-weight:700; letter-spacing:-.035em; white-space:nowrap; }
-  .brand-soft { font-weight:500; color:var(--muted); }
-  .brand-mark { width:18px; height:18px; display:flex; gap:2px; align-items:flex-end; transform:skew(-12deg); }
-  .brand-mark i { display:block; width:4px; height:11px; background:var(--accent); border-radius:2px 2px 0 0; }
-  .brand-mark i:nth-child(2) { height:16px; opacity:.8; }
-  .brand-mark i:nth-child(3) { height:8px; opacity:.55; }
-  .bar-divider { height:17px; width:1px; background:var(--line); margin:0 6px; flex-shrink:0; }
-  .top-project { display:flex; align-items:center; gap:8px; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:25vw; }
-  .top-project :global(svg) { color:var(--subtle); flex-shrink:0; }
-  .top-thread { color:var(--muted); font-weight:400; overflow:hidden; text-overflow:ellipsis; }
-  .bar-spacer { flex:1; }
-  .toolbar-harness { font-size:10px; letter-spacing:.08em; font-weight:700; color:var(--accent); background:var(--accent-bg); padding:3px 6px; border-radius:4px; }
-  .worktree-badge { color:var(--subtle); font-size:10px; border:1px solid var(--line); border-radius:4px; padding:2px 5px; }
-  .toolbar-select { display:flex; align-items:center; gap:3px; position:relative; max-width:195px; color:var(--muted); }
-  .toolbar-select select { appearance:none; border:0; background:transparent; color:inherit; padding:4px 3px; max-width:170px; text-overflow:ellipsis; font-size:12px; cursor:pointer; }
-  .toolbar-select.effort { max-width:110px; }.toolbar-select.effort select { max-width:85px; }
-  .toolbar-select :global(svg) { flex-shrink:0; pointer-events:none; }.toolbar-select:hover { color:var(--text); }
-  .context { color:var(--subtle); font-size:11px; white-space:nowrap; }
-  .icon-button, .mini-button { border:0; background:transparent; color:var(--muted); display:inline-flex; align-items:center; justify-content:center; border-radius:5px; width:29px; height:29px; flex-shrink:0; }
-  .icon-button:hover,.mini-button:hover,.icon-button.pressed { background:var(--surface-2); color:var(--text); }
-  .workspace { flex:1; min-height:0; display:flex; }
-  .sidebar { background:var(--sidebar); width:var(--sidebar-width); min-width:205px; max-width:390px; display:flex; flex-direction:column; flex-shrink:0; overflow:hidden; }
-  .sidebar-heading { display:flex; align-items:center; justify-content:space-between; height:55px; padding:0 16px 0 19px; color:var(--subtle); font-size:10px; font-weight:700; letter-spacing:.14em; }
-  .project-list { flex:1; overflow:auto; padding:0 9px; }
-  .project-section { margin-bottom:11px; }
-  .project-row { width:100%; display:flex; align-items:center; gap:8px; border:0; background:transparent; color:var(--text); text-align:left; border-radius:6px; padding:7px 7px; font-weight:650; }
-  .project-row:hover,.project-row.active { background:var(--surface); }
-  .project-row :global(svg) { color:var(--subtle); transition:transform .15s; flex-shrink:0; }
-  .project-row :global(svg.rotated) { transform:rotate(-90deg); }
-  .project-avatar { width:20px; height:20px; display:inline-flex; align-items:center; justify-content:center; border-radius:5px; color:var(--accent); background:var(--accent-bg); font-size:11px; flex-shrink:0; }
-  .project-name { flex:1; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }.git-tick { color:var(--subtle); font-size:19px; }
-  .thread-list { margin:3px 0 0 21px; }.new-thread { width:100%; display:flex; align-items:center; gap:9px; border:0; background:transparent; padding:6px 8px; border-radius:5px; color:var(--muted); font-size:12px; text-align:left; }.new-thread:hover { color:var(--text); background:var(--surface); }.new-thread :global(svg) { color:var(--accent); }
-  .new-thread kbd { margin-left:auto; color:var(--subtle); font-family:inherit; font-size:11px; }
-  .thread-harness-picker { display:flex; align-items:center; justify-content:space-between; padding:2px 8px 5px 29px; color:var(--subtle); font-size:10px; }
-  .thread-harness-picker select { color:var(--muted); border:0; background:transparent; font-size:10px; cursor:pointer; }
-  .thread-row { display:flex; align-items:center; border-radius:5px; margin:1px 0; height:29px; }.thread-row:hover,.thread-row.active { background:var(--surface); }.thread-row.active .thread-title { color:var(--text); }
-  .thread-link { flex:1; min-width:0; display:flex; align-items:center; gap:8px; height:100%; border:0; background:none; color:var(--muted); text-align:left; padding:0 8px; font-size:12px; }.thread-title { overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
-  .thread-more { display:none; width:23px; height:23px; border:0; border-radius:4px; background:transparent; color:var(--muted); align-items:center; justify-content:center; margin-right:3px; }.thread-row:hover .thread-more,.thread-row.active .thread-more { display:flex; }.thread-more:hover { color:var(--text); background:var(--surface-2); }
-  .status-icon { font-size:12px; width:13px; flex-shrink:0; color:var(--subtle); text-align:center; }.status-icon.active { color:var(--good); }.status-icon.waiting { color:var(--warn); }.status-icon.completed { color:var(--good); }.status-icon.failed,.status-icon.disconnected { color:var(--bad); font-weight:800; }
-  .status-icon.active { animation: working-pulse 2.4s ease-in-out infinite; }
-  @keyframes working-pulse { 50% { opacity: .55; } }
-  .thread-actions { margin:3px 0 7px 18px; background:var(--surface); border:1px solid var(--line); border-radius:7px; padding:7px; display:grid; grid-template-columns:1fr 1fr; gap:4px; }.thread-actions form { grid-column:span 2; display:flex; }.thread-actions input { background:var(--bg); border:1px solid var(--line); padding:4px 6px; min-width:0; flex:1; border-radius:4px; }.thread-actions button { display:flex; align-items:center; justify-content:center; gap:5px; border:0; border-radius:4px; background:var(--surface-2); color:var(--muted); padding:4px; font-size:11px; }.thread-actions button:hover { color:var(--text); }
-  .sidebar-bottom { padding:10px; border-top:1px solid var(--line); }.footer-link { width:100%; display:flex; align-items:center; gap:9px; padding:7px 8px; border:0; color:var(--muted); background:transparent; font-size:12px; text-align:left; border-radius:5px; }.footer-link:hover { color:var(--text); background:var(--surface); }
-  .add-project { width:100%; display:flex; align-items:center; gap:9px; padding:9px 10px; margin-top:4px; border:1px solid var(--line); border-radius:6px; color:var(--muted); background:var(--surface); text-align:left; font-size:12px; }.add-project:hover { border-color:var(--accent); color:var(--text); }.remove-project { color:var(--subtle); font-size:11px; }
-  .empty-projects { padding:8px 10px; color:var(--subtle); font-size:12px; line-height:1.6; }
-  .resize-handle { width:4px; flex-shrink:0; cursor:col-resize; background:var(--line); opacity:.45; }.resize-handle:hover { background:var(--accent); opacity:1; }.panel-handle { background:var(--line); }
-  .main-pane { flex:1; min-width:0; display:flex; flex-direction:column; overflow:hidden; position:relative; }.details-pane { width:var(--panel-width); min-width:320px; max-width:850px; display:flex; flex-direction:column; overflow:hidden; background:var(--sidebar); }
-  .details-pane { animation: panel-arrive .14s ease-out; }
-  @keyframes panel-arrive { from { opacity: .65; } to { opacity: 1; } }
+  .app-shell { display:flex; width:100vw; height:100vh; min-width:780px; background:var(--bg); overflow:hidden; }
+
+  /* ---------- Sidebar ---------- */
+  .sidebar { background:var(--sidebar); width:var(--sidebar-width); min-width:205px; max-width:390px; display:flex; flex-direction:column; flex-shrink:0; overflow:hidden; user-select:none; }
+  .sidebar-top { height:var(--header-height); min-height:var(--header-height); display:flex; align-items:center; justify-content:flex-end; padding:0 10px 0 84px; }
+  .sidebar-tools { display:flex; gap:2px; }
+  .icon-button, .mini-button { border:0; background:transparent; color:var(--muted); display:inline-flex; align-items:center; justify-content:center; border-radius:var(--radius-sm); width:28px; height:28px; flex-shrink:0; transition:background .12s, color .12s; }
+  .mini-button { width:22px; height:22px; }
+  .icon-button:hover:not(:disabled), .mini-button:hover, .icon-button.pressed { background:var(--surface-2); color:var(--text); }
+  .project-list { flex:1; overflow:auto; padding:4px 8px 12px; }
+  .section-label { display:flex; align-items:center; justify-content:space-between; height:28px; padding:0 4px 0 10px; color:var(--subtle); font-size:11px; font-weight:600; }
+  .section-label .mini-button { opacity:0; }
+  .project-list:hover .section-label .mini-button, .section-label .mini-button:focus-visible { opacity:1; }
+  .project-section { margin-bottom:2px; }
+  .project-row { position:relative; display:flex; align-items:center; border-radius:var(--radius-sm); }
+  .project-row:hover { background:color-mix(in srgb, var(--surface-2) 70%, transparent); }
+  .project-toggle { flex:1; min-width:0; display:flex; align-items:center; gap:7px; border:0; background:transparent; color:var(--text); text-align:left; padding:6px 6px 6px 6px; font-weight:600; font-size:13px; }
+  .project-toggle :global(.chev) { color:var(--subtle); transition:transform .15s var(--ease); flex-shrink:0; }
+  .project-toggle :global(.chev.open) { transform:rotate(90deg); }
+  .project-glyph { width:18px; height:18px; display:inline-flex; align-items:center; justify-content:center; border-radius:5px; color:var(--muted); background:var(--surface-2); font-size:10px; font-weight:700; flex-shrink:0; }
+  .project-row.active .project-glyph { color:var(--on-accent); background:var(--accent-strong); }
+  .project-name { flex:1; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+  .row-more, .thread-more { display:flex; opacity:0; width:22px; height:22px; border:0; border-radius:5px; background:transparent; color:var(--muted); align-items:center; justify-content:center; margin-right:4px; flex-shrink:0; }
+  .project-row:hover .row-more, .row-more[aria-expanded='true'], .row-more:focus-visible { opacity:1; }
+  .row-more:hover, .thread-more:hover { color:var(--text); background:var(--surface-3); }
+  .project-menu { position:absolute; top:calc(100% + 4px); right:0; z-index:20; min-width:220px; max-width:260px; padding:4px; background:var(--elevated); border-radius:var(--radius); box-shadow:var(--shadow); animation:ui-pop .12s var(--ease); }
+  .menu-caption { padding:6px 8px 7px; color:var(--subtle); font-size:11px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; border-bottom:1px solid var(--line); margin-bottom:4px; }
+  .project-menu button { width:100%; display:flex; align-items:center; gap:8px; border:0; background:transparent; padding:6px 8px; border-radius:5px; font-size:12.5px; text-align:left; }
+  .project-menu button:hover { background:var(--surface-2); }
+  .project-menu button.danger { color:var(--bad); }
+  .project-menu button.danger:hover { background:var(--bad-bg); }
+
+  .thread-list { margin:2px 0 8px 12px; padding-left:8px; border-left:1px solid var(--line); }
+  .new-thread-row { display:flex; align-items:center; gap:4px; margin-bottom:1px; }
+  .new-thread { flex:1; display:flex; align-items:center; gap:8px; border:0; background:transparent; padding:5px 8px; border-radius:var(--radius-sm); color:var(--muted); font-size:12.5px; text-align:left; }
+  .new-thread:hover:not(:disabled) { color:var(--text); background:color-mix(in srgb, var(--surface-2) 70%, transparent); }
+  .new-thread :global(svg) { color:var(--accent); }
+  .harness-picker { position:relative; display:flex; align-items:center; gap:2px; color:var(--subtle); padding:0 6px; height:22px; border-radius:5px; }
+  .harness-picker:hover { background:var(--surface-2); color:var(--text); }
+  .harness-picker select { appearance:none; border:0; background:transparent; color:inherit; font-size:10.5px; font-weight:600; letter-spacing:.04em; cursor:pointer; padding:0; }
+  .harness-picker :global(svg) { pointer-events:none; }
+  .thread-row { display:flex; align-items:center; border-radius:var(--radius-sm); height:28px; margin:1px 0; }
+  .thread-row:hover { background:color-mix(in srgb, var(--surface-2) 70%, transparent); }
+  .thread-row.active { background:var(--surface-2); }
+  .thread-row.active .thread-title { color:var(--text); font-weight:500; }
+  .thread-row:hover .thread-more, .thread-row.active .thread-more, .thread-more:focus-visible { opacity:1; }
+  .thread-link { flex:1; min-width:0; display:flex; align-items:center; gap:9px; height:100%; border:0; background:none; color:var(--muted); text-align:left; padding:0 6px 0 8px; font-size:12.5px; }
+  .thread-title { flex:1; min-width:0; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+  .thread-link :global(.pin-mark) { color:var(--subtle); flex-shrink:0; }
+  .threads-empty { padding:4px 8px 6px; color:var(--subtle); font-size:11.5px; }
+  .thread-actions { margin:4px 0 8px; background:var(--elevated); border-radius:var(--radius); box-shadow:var(--shadow); padding:6px; display:grid; grid-template-columns:1fr 1fr; gap:4px; animation:ui-pop .12s var(--ease); }
+  .thread-actions form { grid-column:span 2; display:flex; gap:4px; }
+  .thread-actions input { background:var(--bg); border:1px solid var(--line-strong); padding:4px 7px; min-width:0; flex:1; border-radius:5px; font-size:12px; }
+  .thread-actions input:focus { border-color:var(--accent); box-shadow:var(--focus-ring); }
+  .thread-actions button { display:flex; align-items:center; justify-content:center; gap:5px; border:0; border-radius:5px; background:var(--surface-2); color:var(--muted); padding:5px; font-size:11.5px; }
+  .thread-actions button:hover { color:var(--text); background:var(--surface-3); }
+
+  .status-dot { position:relative; width:8px; height:8px; flex-shrink:0; border-radius:50%; background:transparent; box-shadow:inset 0 0 0 1.5px var(--subtle); }
+  .status-dot.active { background:var(--accent); box-shadow:0 0 0 3px var(--accent-bg); animation:ui-pulse 1.8s ease-in-out infinite; }
+  .status-dot.waiting { background:var(--warn); box-shadow:0 0 0 3px var(--warn-bg); }
+  .status-dot.completed { background:var(--good); box-shadow:none; opacity:.85; }
+  .status-dot.failed, .status-dot.disconnected { background:var(--bad); box-shadow:none; }
+  .status-dot.idle { opacity:.7; }
+
+  .empty-projects { padding:8px 10px; color:var(--subtle); font-size:12px; line-height:1.55; }
+  .sidebar-bottom { display:flex; align-items:center; gap:2px; padding:8px; border-top:1px solid var(--line); }
+  .footer-button { display:flex; align-items:center; gap:8px; padding:6px 8px; border:0; border-radius:var(--radius-sm); color:var(--muted); background:transparent; font-size:12.5px; }
+  .footer-button:hover:not(:disabled) { color:var(--text); background:var(--surface-2); }
+  .grow { flex:1; }
+
+  .resize-handle { position:relative; width:1px; flex-shrink:0; cursor:col-resize; background:var(--line); }
+  .resize-handle::after { content:''; position:absolute; inset:0 -3px; }
+  .resize-handle:hover, .resize-handle:focus-visible { background:var(--accent); box-shadow:none; }
+
+  /* ---------- Main ---------- */
+  .main-pane { flex:1; min-width:0; display:flex; flex-direction:column; overflow:hidden; position:relative; background:var(--bg); container:main / inline-size; }
+  .main-header { height:var(--header-height); min-height:var(--header-height); display:flex; align-items:center; gap:12px; padding:0 14px 0 20px; border-bottom:1px solid var(--line); user-select:none; }
+  .crumbs { flex:1; min-width:0; display:flex; align-items:center; gap:6px; font-size:13px; white-space:nowrap; }
+  .crumb-project { color:var(--muted); flex-shrink:0; }
+  .crumbs :global(.crumb-sep) { color:var(--subtle); flex-shrink:0; }
+  .top-thread { font-weight:600; overflow:hidden; text-overflow:ellipsis; min-width:0; }
+  .status-pill { display:inline-flex; align-items:center; gap:6px; margin-left:6px; padding:2px 8px 2px 7px; border-radius:999px; background:var(--surface-2); color:var(--muted); font-size:11px; font-weight:500; flex-shrink:0; }
+  .status-pill .status-dot { width:6px; height:6px; box-shadow:none; }
+  .status-pill.active { color:var(--accent); background:var(--accent-bg); }
+  .status-pill.waiting { color:var(--warn); background:var(--warn-bg); }
+  .status-pill.completed { color:var(--good); background:var(--good-bg); }
+  .status-pill.failed, .status-pill.disconnected { color:var(--bad); background:var(--bad-bg); }
+  .header-actions { display:flex; align-items:center; gap:8px; flex-shrink:0; }
+  .badge { display:inline-flex; align-items:center; gap:4px; height:20px; padding:0 7px; border-radius:5px; border:1px solid var(--line-strong); color:var(--muted); font-size:10.5px; font-weight:600; letter-spacing:.03em; }
+  .badge.harness { border-color:transparent; background:var(--surface-2); }
+  .panel-toggles { display:flex; gap:2px; padding:2px; border-radius:8px; background:var(--surface); border:1px solid var(--line); }
+  .toggle-button { display:inline-flex; align-items:center; gap:6px; height:26px; padding:0 10px; border:0; border-radius:6px; background:transparent; color:var(--muted); font-size:12px; font-weight:500; }
+  .toggle-button:hover { color:var(--text); }
+  .toggle-button.pressed { background:var(--elevated); color:var(--text); box-shadow:var(--shadow-sm), 0 0 0 1px var(--line); }
+  .toggle-button .count { min-width:16px; height:16px; padding:0 4px; border-radius:8px; background:var(--accent); color:var(--on-accent); font-size:10px; font-weight:700; display:inline-flex; align-items:center; justify-content:center; }
+
+  .details-pane { width:var(--panel-width); min-width:320px; max-width:850px; display:flex; flex-direction:column; overflow:hidden; background:var(--panel); animation:panel-arrive .16s var(--ease); }
+  @keyframes panel-arrive { from { opacity:.4; transform:translateX(8px); } to { opacity:1; transform:none; } }
   .panel-loading { display:flex; align-items:center; justify-content:center; flex:1; gap:9px; color:var(--muted); font-size:12px; }
-  .main-empty { display:flex; flex-direction:column; align-items:center; justify-content:center; height:100%; text-align:center; padding:30px; }.main-empty h2 { font-size:20px; font-weight:600; letter-spacing:-.035em; margin:15px 0 5px; }.main-empty p { color:var(--muted); margin:0 0 20px; font-size:13px; }.main-empty strong { color:var(--text); }.empty-graphic { width:63px; height:63px; display:flex; align-items:center; justify-content:center; color:var(--accent); background:var(--accent-bg); border-radius:15px; }.empty-hint { color:var(--subtle); font-size:11px; margin-top:19px; }
-  .primary-button { display:inline-flex; align-items:center; gap:7px; background:var(--accent); border:1px solid var(--accent); color:var(--bg); border-radius:6px; font-weight:700; padding:8px 13px; }.primary-button:hover { filter:brightness(1.08); }
-  .error-banner { display:flex; align-items:center; gap:10px; padding:9px 15px; color:var(--bad); background:color-mix(in srgb,var(--bad) 10%,var(--bg)); border-bottom:1px solid color-mix(in srgb,var(--bad) 22%,var(--line)); font-size:12px; }.error-banner span { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }.error-banner button { display:flex; align-items:center; gap:5px; background:transparent; border:0; color:inherit; white-space:nowrap; }
-  .spin { animation:spin 1.5s linear infinite; color:var(--accent); }@keyframes spin { to { transform:rotate(360deg); } }
-  .onboarding { width:min(640px,calc(100% - 60px)); align-self:center; margin:auto; max-height:100%; overflow:auto; padding:30px 0; }.onboarding-eyebrow,.dialog-eyebrow { color:var(--accent); font-size:10px; font-weight:700; letter-spacing:.16em; }.onboarding h1 { font-size:32px; margin:8px 0 9px; font-weight:650; letter-spacing:-.05em; }.onboarding-intro { color:var(--muted); line-height:1.7; max-width:480px; margin:0 0 34px; font-size:13px; }.harness-choices { display:grid; gap:9px; }.harness-card { display:flex; align-items:center; gap:14px; padding:14px; background:var(--surface); border:1px solid var(--line); border-radius:8px; }.harness-icon { width:38px; height:38px; flex-shrink:0; display:flex; align-items:center; justify-content:center; border-radius:8px; background:var(--accent-bg); color:var(--accent); font-size:21px; font-weight:700; }.harness-card div:nth-child(2) { flex:1; }.harness-card h3 { margin:0 0 2px; font-size:14px; }.harness-card p { margin:0; color:var(--muted); font-size:11px; }.harness-card button { border:1px solid var(--line); border-radius:5px; background:var(--surface-2); padding:7px 10px; font-size:12px; }.harness-card button:hover { border-color:var(--accent); }.install-notice { color:var(--subtle); font-size:11px; line-height:1.8; margin:19px 0; }.install-notice code { color:var(--muted); }.install-log { background:#090b0e; color:var(--muted); border:1px solid var(--line); border-radius:6px; padding:11px; max-height:150px; overflow:auto; font-size:10px; white-space:pre-wrap; }.onboarding-actions { display:flex; flex-wrap:wrap; gap:14px; margin-top:21px; }.onboarding-actions button,.text-button { display:inline-flex; align-items:center; gap:5px; border:0; background:none; color:var(--muted); font-size:11px; padding:3px 0; }.onboarding-actions button:hover,.text-button:hover { color:var(--accent); }
-  .overlay { position:fixed; inset:0; background:#0009; z-index:30; display:flex; align-items:flex-start; justify-content:center; padding-top:16vh; backdrop-filter:blur(3px); }.dialog { width:min(560px,calc(100vw - 50px)); background:var(--surface); border:1px solid var(--line); border-radius:10px; box-shadow:var(--shadow); }.switch-search { height:52px; display:flex; align-items:center; gap:10px; padding:0 14px; border-bottom:1px solid var(--line); color:var(--subtle); }.switch-search input { background:transparent; border:0; outline:none; font-size:14px; flex:1; min-width:0; }.switch-search kbd,.dialog-footer kbd { font-family:inherit; border:1px solid var(--line); border-radius:3px; padding:1px 4px; color:var(--subtle); font-size:10px; }.switch-results { max-height:360px; overflow:auto; padding:6px; }.switch-results button { display:flex; align-items:center; gap:12px; width:100%; border:0; background:transparent; text-align:left; border-radius:5px; padding:8px 10px; }.switch-results button:hover,.switch-results button:focus-visible { background:var(--surface-2); }.switch-results strong { display:block; font-size:12px; }.switch-results small { display:block; color:var(--subtle); font-size:11px; }.switch-icon { color:var(--accent); font-size:18px; }.switch-results p { padding:14px; color:var(--muted); }.dialog-footer { display:flex; justify-content:space-between; padding:8px 13px; border-top:1px solid var(--line); font-size:10px; color:var(--subtle); }
-  .switch-results button.selected { background:var(--surface-2); }
-  .settings { max-height:74vh; overflow:auto; }
-  .settings header { display:flex; align-items:center; justify-content:space-between; padding:18px 20px; border-bottom:1px solid var(--line); }
-  .settings h2 { font-size:19px; margin:4px 0 0; letter-spacing:-.03em; }
-  .settings section { padding:15px 20px 18px; border-bottom:1px solid var(--line); }
-  .settings section:last-child { border:0; }
-  .settings h3 { font-size:12px; margin:0 0 3px; }
-  .settings p { color:var(--muted); font-size:11px; line-height:1.6; margin:0 0 15px; }
-  .setting-row { display:flex; align-items:center; gap:12px; padding:7px 0; min-height:41px; }
-  .setting-row > span:first-child { display:flex; align-items:center; gap:9px; margin-right:auto; white-space:nowrap; }
-  .setting-row > span:first-child :global(svg) { color:var(--subtle); }
-  .setting-row select,.setting-row button { background:var(--surface-2); border:1px solid var(--line); border-radius:5px; padding:5px 8px; font-size:11px; }
-  .setting-row button:hover { border-color:var(--accent); }
-  .install-path { font-size:11px; text-align:right; }
-  .install-path small { display:block; max-width:190px; color:var(--subtle); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  .missing { color:var(--subtle); font-size:11px; }
-  .error-details { white-space:pre-wrap; overflow:auto; max-height:50vh; padding:15px 20px; margin:0; font:11px/1.55 var(--mono); color:var(--muted); }
-  .provider-state { font-size:11px; color:var(--subtle); }.provider-state.authenticated { color:var(--good); }
-  @media (max-width: 1050px) { .top-thread,.context,.toolbar-select.effort { display:none; } }
-  @media (max-width: 850px) { .brand-soft,.toolbar-harness { display:none; } }
+
+  .main-empty { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; text-align:center; padding:30px; animation:ui-rise .25s var(--ease); }
+  .main-empty h2 { font-size:19px; font-weight:600; letter-spacing:-.02em; margin:16px 0 6px; }
+  .main-empty p { color:var(--muted); margin:0 0 22px; font-size:13px; max-width:380px; line-height:1.55; }
+  .main-empty strong { color:var(--text); font-weight:600; }
+  .main-empty :global(.spin) { color:var(--accent); }
+  .empty-graphic { width:56px; height:56px; display:flex; align-items:center; justify-content:center; color:var(--accent); background:var(--accent-bg); border-radius:16px; }
+  .empty-graphic.danger { color:var(--bad); background:var(--bad-bg); }
+  .empty-hint { display:flex; align-items:center; gap:4px; color:var(--subtle); font-size:11.5px; margin-top:22px; }
+  .dot-sep { width:3px; height:3px; border-radius:50%; background:var(--subtle); margin:0 6px; }
+  .primary-button, .secondary-button { display:inline-flex; align-items:center; justify-content:center; gap:7px; height:32px; padding:0 14px; border-radius:var(--radius); font-weight:600; font-size:13px; transition:filter .12s, background .12s; }
+  .primary-button { background:var(--accent-strong); border:0; color:var(--on-accent); box-shadow:var(--shadow-sm); }
+  .primary-button:hover:not(:disabled) { filter:brightness(1.08); }
+  .secondary-button { background:var(--surface); border:1px solid var(--line-strong); color:var(--text); }
+  .secondary-button:hover:not(:disabled) { background:var(--surface-2); }
+  .secondary-button.small { height:26px; padding:0 10px; font-size:12px; font-weight:500; border-radius:var(--radius-sm); }
+
+  .error-banner { display:flex; align-items:center; gap:10px; margin:10px 16px 0; padding:8px 8px 8px 12px; color:var(--bad); background:var(--bad-bg); border-radius:var(--radius); font-size:12.5px; animation:ui-rise .2s var(--ease); }
+  .error-banner span { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .error-banner button { display:flex; align-items:center; gap:5px; background:transparent; border:0; color:inherit; white-space:nowrap; padding:4px 8px; border-radius:var(--radius-sm); font-size:12px; font-weight:500; }
+  .error-banner button:hover { background:color-mix(in srgb, var(--bad) 14%, transparent); }
+
+  .onboarding { width:min(560px, calc(100% - 60px)); align-self:center; margin:auto; max-height:100%; overflow:auto; padding:40px 0; animation:ui-rise .3s var(--ease); }
+  .onboarding-mark { width:48px; height:48px; border-radius:14px; display:flex; align-items:center; justify-content:center; color:var(--on-accent); background:linear-gradient(145deg, var(--accent), var(--accent-strong)); box-shadow:0 8px 24px color-mix(in srgb, var(--accent) 35%, transparent); }
+  .onboarding h1 { font-size:28px; margin:20px 0 8px; font-weight:650; letter-spacing:-.03em; }
+  .onboarding-intro { color:var(--muted); line-height:1.65; margin:0 0 28px; font-size:14px; }
+  .harness-choices { display:grid; grid-template-columns:minmax(0, 1fr); gap:10px; }
+  .harness-card { display:flex; align-items:center; gap:14px; padding:14px 16px; background:var(--surface); border:1px solid var(--line); border-radius:var(--radius-lg); }
+  .harness-icon { width:40px; height:40px; flex-shrink:0; display:flex; align-items:center; justify-content:center; border-radius:10px; background:var(--elevated); box-shadow:var(--shadow-sm), 0 0 0 1px var(--line); color:var(--text); font-size:19px; font-weight:700; }
+  .harness-copy { flex:1; min-width:0; }
+  .harness-copy h3 { margin:0 0 1px; font-size:14px; font-weight:600; }
+  .harness-copy p { margin:0 0 6px; color:var(--muted); font-size:12px; }
+  .harness-copy code { display:block; color:var(--subtle); font-size:10.5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .install-notice { color:var(--subtle); font-size:12px; margin:14px 2px 0; }
+  .install-log { background:var(--sidebar); color:var(--muted); border:1px solid var(--line); border-radius:var(--radius); padding:12px; max-height:160px; overflow:auto; font-size:11px; white-space:pre-wrap; margin:14px 0 0; }
+  .onboarding-actions { display:flex; flex-wrap:wrap; gap:16px; margin-top:22px; }
+  .onboarding-actions button, .text-button { display:inline-flex; align-items:center; gap:5px; border:0; background:none; color:var(--muted); font-size:12px; padding:3px 0; }
+  .onboarding-actions button:hover, .text-button:hover { color:var(--accent); }
+
+  /* ---------- Dialogs ---------- */
+  .overlay { position:fixed; inset:0; background:rgb(0 0 0 / .35); z-index:30; display:flex; align-items:flex-start; justify-content:center; padding-top:14vh; backdrop-filter:blur(2px); animation:fade-in .12s ease-out; }
+  @keyframes fade-in { from { opacity:0; } to { opacity:1; } }
+  .dialog { width:min(580px, calc(100vw - 48px)); background:var(--elevated); border-radius:var(--radius-lg); box-shadow:var(--shadow); overflow:hidden; animation:ui-pop .16s var(--ease); }
+  .switch-search { height:54px; display:flex; align-items:center; gap:11px; padding:0 16px; border-bottom:1px solid var(--line); color:var(--subtle); }
+  .switch-search input { background:transparent; border:0; outline:none; font-size:15px; flex:1; min-width:0; color:var(--text); }
+  .switch-search input::placeholder { color:var(--subtle); }
+  .switch-search input:focus-visible { box-shadow:none; }
+  .switch-results { max-height:380px; overflow:auto; padding:6px; }
+  .switch-results button { display:flex; align-items:center; gap:11px; width:100%; border:0; background:transparent; text-align:left; border-radius:var(--radius); padding:7px 10px; }
+  .switch-results button.selected { background:var(--accent-bg); }
+  .switch-text { flex:1; min-width:0; }
+  .switch-results strong { display:block; font-size:13px; font-weight:500; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .switch-results small { display:block; color:var(--subtle); font-size:11.5px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .switch-icon { width:28px; height:28px; border-radius:7px; display:flex; align-items:center; justify-content:center; flex-shrink:0; color:var(--muted); background:var(--surface-2); }
+  .switch-results button.selected .switch-icon { color:var(--accent); background:var(--elevated); }
+  .switch-results p { padding:18px 14px; margin:0; color:var(--muted); text-align:center; }
+  .dialog-footer { display:flex; gap:16px; padding:8px 14px; border-top:1px solid var(--line); font-size:11px; color:var(--subtle); }
+  .dialog-footer span { display:flex; align-items:center; gap:4px; }
+
+  .settings { max-height:76vh; overflow:auto; }
+  .settings header { display:flex; align-items:center; justify-content:space-between; padding:14px 14px 14px 20px; border-bottom:1px solid var(--line); position:sticky; top:0; background:var(--elevated); z-index:1; }
+  .settings h2 { font-size:15px; font-weight:600; margin:0; }
+  .settings section { padding:16px 20px 18px; }
+  .settings section + section { border-top:1px solid var(--line); }
+  .settings h3 { font-size:12.5px; font-weight:600; margin:0 0 3px; }
+  .settings p { color:var(--muted); font-size:12px; line-height:1.55; margin:0 0 12px; }
+  .settings p.last { margin:0; }
+  .setting-group { border:1px solid var(--line); border-radius:var(--radius); padding:0 12px; margin-bottom:10px; background:var(--bg); }
+  .setting-group .setting-row + .setting-row { border-top:1px solid var(--line); }
+  .setting-row { display:flex; align-items:center; gap:12px; min-height:44px; }
+  .setting-row > span:first-child { display:flex; align-items:center; gap:9px; margin-right:auto; white-space:nowrap; font-size:12.5px; }
+  .setting-name :global(svg) { color:var(--subtle); }
+  .setting-empty { padding:12px 0; margin:0 !important; }
+  .segmented { display:flex; gap:2px; padding:2px; border-radius:8px; background:var(--surface); border:1px solid var(--line); }
+  .segmented button { display:inline-flex; align-items:center; gap:5px; height:24px; padding:0 10px; border:0; border-radius:6px; background:transparent; color:var(--muted); font-size:12px; }
+  .segmented button:hover { color:var(--text); }
+  .segmented button.on { background:var(--elevated); color:var(--text); box-shadow:var(--shadow-sm), 0 0 0 1px var(--line); }
+  .install-path { font-size:12px; text-align:right; min-width:0; }
+  .install-path .version { font-weight:500; }
+  .install-path small { display:block; max-width:220px; color:var(--subtle); font-size:11px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; direction:rtl; }
+  .missing { color:var(--subtle); font-size:12px; }
+  .error-details { white-space:pre-wrap; overflow:auto; max-height:52vh; padding:16px 20px; margin:0; font:11.5px/1.6 var(--mono); color:var(--muted); }
+  .provider-state { display:inline-flex; align-items:center; gap:4px; font-size:12px; color:var(--subtle); }
+  .provider-state.authenticated { color:var(--good); }
+
+  /* Header adapts to the main pane's own width (side panels shrink it). */
+  @container main (max-width: 760px) { .badge.harness, .toggle-button span:not(.count) { display:none; } .toggle-button { padding:0 8px; } }
+  @container main (max-width: 620px) { .crumb-project, .crumbs :global(.crumb-sep), .badge { display:none; } }
+  @container main (max-width: 520px) { .status-pill { padding:0; width:18px; height:18px; justify-content:center; } .status-pill .pill-label { display:none; } }
 </style>

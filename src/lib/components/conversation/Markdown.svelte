@@ -20,7 +20,7 @@
   let openFenceLang: string | undefined;
   let latestBoundary = 0;
   let activeText = '';
-  let activeSegments: MdSegment[] = [];
+  let activeSegments: readonly MdSegment[] = [];
   let previousValue = '';
   let previouslyStreaming = false;
   const MAX_ACTIVE_CHARS = 16_384;
@@ -32,7 +32,7 @@
     return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
 
-  function activeMarkdownSegments(input: string): MdSegment[] {
+  function activeMarkdownSegments(input: string): readonly MdSegment[] {
     if (input.length <= MAX_ACTIVE_CHARS) return markdownSegments(input, true);
     const split = input.length - MAX_ACTIVE_CHARS;
     return [
@@ -88,7 +88,7 @@
     previouslyStreaming = false;
   }
 
-  function renderSegments(value: string, active: boolean): MdSegment[] {
+  function renderSegments(value: string, active: boolean): readonly MdSegment[] {
     if (!active) {
       reset();
       previousValue = value;
@@ -140,14 +140,16 @@
 
 <style>
   .md {
-    font-size: 13px;
-    line-height: 1.55;
+    font-size: 14px;
+    line-height: 1.65;
     overflow-wrap: break-word;
   }
   .md :global(p) {
-    margin: 0 0 8px;
+    margin: 0 0 10px;
   }
-  .md :global(p:last-child) {
+  .md :global(p:last-child),
+  .md :global(ul:last-child),
+  .md :global(ol:last-child) {
     margin-bottom: 0;
   }
   .md :global(h1),
@@ -156,47 +158,59 @@
   .md :global(h4),
   .md :global(h5),
   .md :global(h6) {
-    margin: 14px 0 6px;
+    margin: 20px 0 8px;
     font-weight: 600;
     line-height: 1.3;
+    letter-spacing: -0.01em;
+  }
+  .md :global(h1:first-child),
+  .md :global(h2:first-child),
+  .md :global(h3:first-child) {
+    margin-top: 4px;
   }
   .md :global(h1) {
-    font-size: 17px;
+    font-size: 19px;
   }
   .md :global(h2) {
-    font-size: 15px;
+    font-size: 16.5px;
   }
   .md :global(h3) {
-    font-size: 14px;
+    font-size: 15px;
   }
   .md :global(h4),
   .md :global(h5),
   .md :global(h6) {
-    font-size: 13px;
+    font-size: 14px;
   }
   .md :global(ul),
   .md :global(ol) {
-    margin: 4px 0 8px;
-    padding-left: 20px;
+    margin: 4px 0 10px;
+    padding-left: 22px;
   }
   .md :global(li) {
-    margin: 2px 0;
+    margin: 3px 0;
+  }
+  .md :global(li::marker) {
+    color: var(--subtle);
   }
   .md :global(li > ul),
   .md :global(li > ol) {
     margin: 2px 0;
   }
   .md :global(blockquote) {
-    margin: 6px 0;
-    padding: 2px 10px;
-    border-left: 2px solid var(--line);
+    margin: 10px 0;
+    padding: 2px 14px;
+    border-left: 3px solid var(--line-strong);
     color: var(--muted);
+  }
+  .md :global(strong) {
+    font-weight: 600;
   }
   .md :global(code) {
     font-family: var(--mono);
-    font-size: 0.92em;
-    padding: 1px 4px;
-    border-radius: 4px;
+    font-size: 0.86em;
+    padding: 1.5px 5px;
+    border-radius: 5px;
     background: var(--surface-2);
   }
   .md :global(pre code) {
@@ -209,26 +223,40 @@
   }
   .md :global(a:hover) {
     text-decoration: underline;
+    text-underline-offset: 2px;
   }
   .md :global(table) {
-    border-collapse: collapse;
-    margin: 6px 0 10px;
-    font-size: 12px;
+    border-collapse: separate;
+    border-spacing: 0;
+    margin: 10px 0 12px;
+    font-size: 13px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    overflow: hidden;
   }
   .md :global(th),
   .md :global(td) {
-    border: 1px solid var(--line);
-    padding: 4px 8px;
+    padding: 6px 12px;
     text-align: left;
+    border-bottom: 1px solid var(--line);
+  }
+  .md :global(th + th),
+  .md :global(td + td) {
+    border-left: 1px solid var(--line);
+  }
+  .md :global(tr:last-child td) {
+    border-bottom: 0;
   }
   .md :global(th) {
-    background: var(--surface-2);
+    background: var(--surface);
     font-weight: 600;
+    color: var(--muted);
+    font-size: 12px;
   }
   .md :global(hr) {
     border: 0;
     border-top: 1px solid var(--line);
-    margin: 12px 0;
+    margin: 18px 0;
   }
   .md :global(img) {
     max-width: 100%;

@@ -65,16 +65,28 @@
     ) as Array<[string, string | number | boolean]>,
   );
   const complexArgs = $derived(argEntries.length - scalarArgs.length);
+  // Permission titles embed the command after a newline; the details below show it.
+  const heading = $derived(
+    request.method === 'permission' && request.toolName
+      ? `Allow ${request.toolName}?`
+      : request.title.split('\n')[0],
+  );
+  const kindLabel = $derived(
+    request.method === 'permission' ? 'Permission needed' : request.method === 'open_url' ? 'Sign-in' : 'Input needed',
+  );
 </script>
 
 <div class="request" role="group" aria-label={`Request: ${request.title}`}>
   <div class="head">
     <span class="icon" aria-hidden="true">
-      {#if request.method === 'open_url'}<ExternalLink size={13} />
-      {:else if isSecret}<KeyRound size={13} />
-      {:else}<Shield size={13} />{/if}
+      {#if request.method === 'open_url'}<ExternalLink size={15} strokeWidth={2} />
+      {:else if isSecret}<KeyRound size={15} strokeWidth={2} />
+      {:else}<Shield size={15} strokeWidth={2} />{/if}
     </span>
-    <span class="title">{request.title}</span>
+    <span class="titles">
+      <span class="kind">{kindLabel}</span>
+      <span class="title">{heading}</span>
+    </span>
     {#if secondsLeft !== null}
       <span class="timeout" aria-label="Time remaining">{secondsLeft}s</span>
     {/if}
@@ -94,15 +106,19 @@
   {/if}
   {#if linkFeedback}<p class="link-feedback" role="status">{linkFeedback}</p>{/if}
 
-  {#if request.cwd}
-    <div class="kv"><span class="k">Working directory</span><code class="v">{request.cwd}</code></div>
+  {#if request.cwd || request.toolName || scalarArgs.length > 0}
+    <div class="kvs">
+      {#if request.toolName}
+        <div class="kv"><span class="k">Tool</span><code class="v">{request.toolName}</code></div>
+      {/if}
+      {#each scalarArgs as [key, value], argIndex (argIndex + ':' + key)}
+        <div class="kv"><span class="k">{key}</span><code class="v">{String(value)}</code></div>
+      {/each}
+      {#if request.cwd}
+        <div class="kv"><span class="k">Directory</span><code class="v">{request.cwd}</code></div>
+      {/if}
+    </div>
   {/if}
-  {#if request.toolName}
-    <div class="kv"><span class="k">Operation</span><code class="v">{request.toolName}</code></div>
-  {/if}
-  {#each scalarArgs as [key, value] (key)}
-    <div class="kv"><span class="k">{key}</span><code class="v">{String(value)}</code></div>
-  {/each}
   {#if complexArgs > 0}
     <details class="raw">
       <summary>Arguments</summary>
@@ -113,7 +129,7 @@
   <fieldset class="actions" disabled={answered}>
     {#if request.method === 'select' && request.options && request.options.length > 0}
       <div class="options">
-        {#each request.options as option, i (option)}
+        {#each request.options as option, i (i + ':' + option)}
           <button type="button" class="opt" onclick={() => respond({ value: option })}>
             <span class="opt-label">{option}</span>
             {#if request.optionDetails?.[i]?.description}
@@ -139,7 +155,10 @@
           placeholder={request.placeholder ?? ''}
           bind:value={text}
           aria-label={request.title}
-          onkeydown={(e) => e.key === 'Enter' && respond({ value: text })}
+          onkeydown={(e) => {
+            if (e.isComposing || e.keyCode === 229) return;
+            if (e.key === 'Enter') void respond({ value: text });
+          }}
         />
       {/if}
       <div class="row-actions">
@@ -185,13 +204,15 @@
       </div>
     {:else if request.options && request.options.length > 0}
       <div class="row-actions">
-        {#each request.options as option, i (option)}
+        {#each request.options as option, i (i + ':' + option)}
           {@const last = i === request.options.length - 1}
+          {@const permission = request.method === 'permission'}
           <button
             type="button"
             class="btn"
-            class:primary={last}
-            class:ghost={!last}
+            class:primary={!permission && last}
+            class:ghost={!permission && !last}
+            class:danger={permission && /\b(deny|reject|block|no)\b/i.test(option)}
             onclick={() => respond({ value: option })}
           >
             {option}
@@ -212,170 +233,225 @@
 
 <style>
   .request {
-    border: 1px solid var(--warn);
-    border-radius: var(--radius);
-    background: var(--surface);
-    padding: 8px 10px;
-    margin: 6px 0;
-  }
-  .actions {
-    margin-top: 8px;
-    border: 0;
-    padding: 0;
-    min-width: 0;
+    margin: 0 0 10px;
+    padding: 14px 16px;
+    border-radius: var(--radius-xl);
+    background: var(--elevated);
+    box-shadow: var(--shadow);
+    animation: ui-rise 0.18s var(--ease);
   }
   .head {
     display: flex;
     align-items: center;
-    gap: 7px;
+    gap: 11px;
   }
   .icon {
     display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: none;
+    width: 30px;
+    height: 30px;
+    border-radius: 9px;
     color: var(--warn);
+    background: var(--warn-bg);
+  }
+  .titles {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+  }
+  .kind {
+    color: var(--warn);
+    font-size: 11px;
+    font-weight: 600;
   }
   .title {
-    flex: 1;
     font-weight: 600;
-    font-size: 12.5px;
-    min-width: 0;
-  }
-  .launch-note {
-    margin: 3px 0 0;
-    color: var(--muted);
-    font-size: 10.5px;
+    font-size: 14px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .timeout {
     flex: none;
+    padding: 2px 8px;
+    border-radius: 999px;
+    background: var(--surface-2);
     color: var(--muted);
-    font-size: 11px;
+    font-size: 11.5px;
     font-variant-numeric: tabular-nums;
   }
   .message {
-    margin: 6px 0 0;
-    font-size: 12px;
-    color: var(--text);
+    margin: 10px 0 0;
+    font-size: 13px;
+    color: var(--muted);
     white-space: pre-wrap;
     overflow-wrap: anywhere;
   }
+  .launch-note {
+    margin: 6px 0 0;
+    color: var(--muted);
+    font-size: 11.5px;
+  }
   .url-row {
-    margin-top: 6px;
-    padding: 5px 8px;
-    border-radius: 6px;
-    background: var(--bg);
+    margin-top: 10px;
+    padding: 7px 10px;
+    border-radius: var(--radius);
+    background: var(--surface);
     overflow-x: auto;
   }
   .url {
     font-family: var(--mono);
-    font-size: 11.5px;
+    font-size: 12px;
     color: var(--accent);
     white-space: nowrap;
   }
-  .link-feedback { margin: 6px 0 0; color: var(--warn); font-size: 11px; }
+  .link-feedback {
+    margin: 8px 0 0;
+    color: var(--warn);
+    font-size: 12px;
+  }
+  .kvs {
+    margin-top: 12px;
+    padding: 8px 12px;
+    border-radius: var(--radius);
+    background: var(--surface);
+    border: 1px solid var(--line);
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
   .kv {
     display: flex;
-    gap: 8px;
+    gap: 12px;
     align-items: baseline;
-    margin-top: 5px;
-    font-size: 11.5px;
+    font-size: 12px;
     min-width: 0;
   }
   .k {
     flex: none;
-    color: var(--muted);
-    min-width: 110px;
+    min-width: 72px;
+    color: var(--subtle);
   }
   .v {
     font-family: var(--mono);
-    font-size: 11px;
+    font-size: 12px;
     overflow-wrap: anywhere;
     min-width: 0;
   }
   .raw {
-    margin-top: 5px;
+    margin-top: 8px;
   }
   .raw summary {
     cursor: pointer;
     color: var(--muted);
-    font-size: 11px;
+    font-size: 12px;
   }
   .raw pre {
-    margin: 4px 0 0;
-    padding: 6px 8px;
-    border-radius: 6px;
-    background: var(--bg);
+    margin: 6px 0 0;
+    padding: 8px 10px;
+    border-radius: var(--radius);
+    background: var(--surface);
+    border: 1px solid var(--line);
     font-family: var(--mono);
-    font-size: 11px;
+    font-size: 11.5px;
     overflow-x: auto;
     white-space: pre-wrap;
     overflow-wrap: anywhere;
+    max-height: 240px;
+    overflow-y: auto;
   }
   .actions {
-    margin-top: 8px;
+    margin: 14px 0 0;
+    border: 0;
+    padding: 0;
+    min-width: 0;
   }
   .options {
     display: flex;
     flex-direction: column;
-    gap: 4px;
-    margin-bottom: 6px;
+    gap: 6px;
+    margin-bottom: 10px;
   }
   .opt {
     display: flex;
     flex-direction: column;
-    gap: 1px;
-    padding: 5px 8px;
-    border: 1px solid var(--line);
-    border-radius: 6px;
-    background: var(--surface-2);
+    gap: 2px;
+    padding: 8px 12px;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--radius);
+    background: var(--surface);
     color: var(--text);
-    font-size: 12px;
+    font-size: 13px;
     text-align: left;
+    transition: border-color 0.12s, background 0.12s;
   }
   .opt:hover {
     border-color: var(--accent);
+    background: var(--accent-bg);
   }
   .opt-desc {
     color: var(--muted);
-    font-size: 11px;
+    font-size: 12px;
   }
   .row-actions {
     display: flex;
-    gap: 6px;
+    gap: 8px;
     justify-content: flex-end;
     flex-wrap: wrap;
   }
   .btn {
-    padding: 4px 12px;
-    border: 1px solid var(--line);
-    border-radius: 6px;
-    background: var(--surface-2);
+    height: 30px;
+    padding: 0 14px;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--radius);
+    background: var(--surface);
     color: var(--text);
-    font-size: 12px;
+    font-size: 12.5px;
+    font-weight: 500;
+    transition: background 0.12s, filter 0.12s;
   }
-  .btn:hover {
-    background: var(--surface-3);
+  .btn:hover:not(:disabled) {
+    background: var(--surface-2);
   }
   .btn.primary {
-    background: var(--accent-bg);
+    background: var(--accent-strong);
     border-color: transparent;
-    color: var(--text);
+    color: var(--on-accent);
+    font-weight: 600;
+  }
+  .btn.primary:hover:not(:disabled) {
+    background: var(--accent-strong);
+    filter: brightness(1.08);
   }
   .btn.danger {
     color: var(--bad);
   }
   .btn.ghost {
     background: transparent;
+    border-color: transparent;
     color: var(--muted);
+  }
+  .btn.ghost:hover:not(:disabled) {
+    color: var(--text);
+    background: var(--surface-2);
   }
   .field {
     width: 100%;
-    padding: 6px 8px;
-    border: 1px solid var(--line);
-    border-radius: 6px;
+    padding: 8px 10px;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--radius);
     background: var(--bg);
     color: var(--text);
-    font-size: 12px;
+    font-size: 13px;
     font-family: inherit;
     resize: vertical;
-    margin-bottom: 6px;
+    margin-bottom: 10px;
+  }
+  .field:focus {
+    border-color: var(--accent);
+    box-shadow: var(--focus-ring);
   }
 </style>

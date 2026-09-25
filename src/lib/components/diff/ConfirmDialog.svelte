@@ -68,10 +68,10 @@
 <div class="confirm-backdrop" role="presentation" onmousedown={(e) => { if (e.target === e.currentTarget && !busy) onCancel(); }}>
   <div bind:this={dialogEl} class="confirm" role="alertdialog" aria-modal="true" aria-label={title} tabindex="-1">
     <div class="confirm-head">
-      <TriangleAlert size={14} />
+      <span class="confirm-icon"><TriangleAlert size={15} strokeWidth={2} /></span>
       <span class="confirm-title">{title}</span>
     </div>
-    <div class="confirm-path" title={path}>{path}</div>
+    <div class="confirm-path" title={path}><bdi>{path}</bdi></div>
     {#if detail}
       <div class="confirm-detail">{detail}</div>
     {/if}
@@ -88,42 +88,57 @@
   .confirm-backdrop {
     position: fixed;
     inset: 0;
-    background: color-mix(in srgb, var(--bg) 55%, transparent);
+    background: rgb(0 0 0 / 0.35);
+    backdrop-filter: blur(2px);
     display: flex;
     align-items: center;
     justify-content: center;
     z-index: 60;
+    animation: fade-in 0.12s ease-out;
+  }
+  @keyframes fade-in {
+    from { opacity: 0; }
+    to { opacity: 1; }
   }
   .confirm {
     width: min(420px, calc(100vw - 48px));
-    background: var(--surface);
-    border: 1px solid var(--line);
-    border-radius: 8px;
-    padding: 14px;
+    background: var(--elevated);
+    border-radius: var(--radius-lg);
+    padding: 18px;
     display: flex;
     flex-direction: column;
-    gap: 8px;
-    box-shadow: 0 12px 40px color-mix(in srgb, var(--bg) 70%, transparent);
+    gap: 10px;
+    box-shadow: var(--shadow);
+    animation: ui-pop 0.16s var(--ease);
   }
   .confirm-head {
     display: flex;
     align-items: center;
-    gap: 6px;
-    color: var(--warn);
+    gap: 10px;
+  }
+  .confirm-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 30px;
+    height: 30px;
+    border-radius: 9px;
+    color: var(--bad);
+    background: var(--bad-bg);
   }
   .confirm-title {
-    font-size: 12px;
+    font-size: 14px;
     font-weight: 600;
     color: var(--text);
   }
   .confirm-path {
-    font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
-    font-size: 11px;
+    font-family: var(--mono);
+    font-size: 12px;
     color: var(--text);
-    background: var(--surface-2);
+    background: var(--surface);
     border: 1px solid var(--line);
-    border-radius: 4px;
-    padding: 5px 8px;
+    border-radius: var(--radius);
+    padding: 7px 10px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -131,38 +146,43 @@
     text-align: left;
   }
   .confirm-detail {
-    font-size: 11px;
+    font-size: 12.5px;
     color: var(--muted);
-    line-height: 1.5;
+    line-height: 1.55;
   }
   .confirm-actions {
     display: flex;
     justify-content: flex-end;
-    gap: 6px;
-    margin-top: 4px;
+    gap: 8px;
+    margin-top: 6px;
   }
   .btn {
     font: inherit;
-    font-size: 11px;
-    padding: 4px 12px;
-    border-radius: 5px;
-    border: 1px solid var(--line);
-    background: var(--surface-2);
+    font-size: 12.5px;
+    font-weight: 500;
+    height: 30px;
+    padding: 0 14px;
+    border-radius: var(--radius);
+    border: 1px solid var(--line-strong);
+    background: var(--surface);
     color: var(--text);
     cursor: pointer;
   }
   .btn:hover:not(:disabled) {
-    border-color: var(--muted);
+    background: var(--surface-2);
   }
   .btn:disabled {
     opacity: 0.5;
     cursor: default;
   }
   .btn.danger {
-    border-color: var(--bad);
-    color: var(--bad);
+    border-color: transparent;
+    background: var(--bad);
+    color: #fff;
+    font-weight: 600;
   }
   .btn.danger:hover:not(:disabled) {
-    background: color-mix(in srgb, var(--bad) 15%, transparent);
+    background: var(--bad);
+    filter: brightness(1.08);
   }
 </style>

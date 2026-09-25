@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { Wrench } from '@lucide/svelte';
   import ToolShell from './ToolShell.svelte';
   import {
     argPath,
@@ -25,9 +26,10 @@
   const truncated = $derived(output.length > 3000);
   const shownOutput = $derived(truncated ? `${output.slice(0, 3000)}\n…` : output);
   const hasArgs = $derived(Object.keys(item.args).length > 0);
+  const MAX_DUMP_CHARS = 20_000;
 </script>
 
-<ToolShell status={item.status} failed={item.status === 'failed' || item.result?.isError === true} {meta}>
+<ToolShell icon={Wrench} status={item.status} failed={item.status === 'failed' || item.result?.isError === true} {meta}>
   {#snippet summary()}
     <span class="line">
       {item.toolName}
@@ -50,13 +52,13 @@
     {#if hasArgs}
       <details class="raw">
         <summary>Arguments</summary>
-        <pre>{prettyJson(item.args)}</pre>
+        <pre>{prettyJson(item.args, MAX_DUMP_CHARS)}</pre>
       </details>
     {/if}
     {#if item.result?.details !== undefined}
       <details class="raw">
         <summary>Result details</summary>
-        <pre>{prettyJson(item.result.details)}</pre>
+        <pre>{prettyJson(item.result.details, MAX_DUMP_CHARS)}</pre>
       </details>
     {/if}
   {/snippet}

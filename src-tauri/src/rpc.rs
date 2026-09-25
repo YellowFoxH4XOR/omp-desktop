@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{oneshot, watch, Mutex};
 
 pub const MAX_FRAME_BYTES: usize = 1_048_576; // 1 MiB per OMP wire frame
 pub const MAX_PI_FRAME_BYTES: usize = 8 * 1024 * 1024; // bounded Pi monolithic history frame
@@ -17,11 +17,20 @@ const STDERR_TAIL_BYTES: usize = 16 * 1024;
 const DEFAULT_CMD_TIMEOUT_SECS: u64 = 60;
 const STDIN_IO_TIMEOUT_SECS: u64 = 10;
 const MAX_PENDING_REQUESTS: usize = 256;
+const LEADER_DRAIN_GRACE_MS: u64 = 250;
+/// Up to 16 live processes each poll their leader; 25ms polling cost ~640
+/// wakeups/s for an exit signal that tolerates tenths of a second of latency.
+const LEADER_POLL_INTERVAL_MS: u64 = 100;
 
+/// Read one `\n`-terminated line capped at `max` bytes (excluding the newline).
+/// Returns raw bytes so callers choose strict (stdout frames) or lossy (stderr
+/// tail) decoding. An oversized line fails with `ErrorKind::InvalidData`
+/// WITHOUT consuming its terminator, so the caller can fail closed (stdout)
+/// or discard the remainder and keep draining (stderr).
 async fn read_bounded_line<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     max: usize,
-) -> std::io::Result<Option<String>> {
+) -> std::io::Result<Option<Vec<u8>>> {
     let mut buf = Vec::new();
     loop {
         let available = reader.fill_buf().await?;
@@ -55,9 +64,78 @@ async fn read_bounded_line<R: AsyncBufRead + Unpin>(
     if buf.last() == Some(&b'\r') {
         buf.pop();
     }
-    String::from_utf8(buf)
-        .map(Some)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    Ok(Some(buf))
+}
+
+/// Consume the remainder of one line (through `\n` or EOF) in bounded
+/// `fill_buf` chunks without buffering it. Used to skip an oversized stderr
+/// line while keeping the pipe open.
+async fn discard_line_rest<R: AsyncBufRead + Unpin>(reader: &mut R) -> std::io::Result<()> {
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(());
+        }
+        if let Some(pos) = available.iter().position(|byte| *byte == b'\n') {
+            reader.consume(pos + 1);
+            return Ok(());
+        }
+        let len = available.len();
+        reader.consume(len);
+    }
+}
+
+/// Append one stderr line to the capped tail, keeping the last
+/// `STDERR_TAIL_BYTES` bytes on a char boundary.
+async fn append_stderr_tail(inner: &Arc<RpcInner>, line: &str) {
+    let mut tail = inner.stderr_tail.lock().await;
+    tail.push_str(line);
+    tail.push('\n');
+    if tail.len() > STDERR_TAIL_BYTES {
+        let mut cut = tail.len() - STDERR_TAIL_BYTES;
+        while !tail.is_char_boundary(cut) {
+            cut += 1;
+        }
+        tail.drain(..cut);
+    }
+}
+
+/// ASCII-whitespace check for raw stdout lines (already `\n`-stripped).
+fn trim_ascii_whitespace(line: &[u8]) -> &[u8] {
+    let is_space = |byte: &u8| matches!(*byte, b' ' | b'\t' | b'\r');
+    let start = line
+        .iter()
+        .position(|byte| !is_space(byte))
+        .unwrap_or(line.len());
+    let end = line
+        .iter()
+        .rposition(|byte| !is_space(byte))
+        .map(|pos| pos + 1)
+        .unwrap_or(0);
+    &line[start.min(end)..end]
+}
+
+/// Report the leader exit the poll monitor recorded. Called exactly once by
+/// the stdout reader after draining buffered frames (or on the bounded
+/// deadline), preserving the existing `mark_exited` "exactly once" guarantee.
+async fn finish_leader_exit(inner: &Arc<RpcInner>, exit: Option<LeaderExit>) {
+    let Some(exit) = exit else {
+        let tail = inner.stderr_tail.lock().await.clone();
+        mark_exited(inner, inner.on_exit.clone(), None, tail).await;
+        return;
+    };
+    let tail = inner.stderr_tail.lock().await.clone();
+    if let Some(error) = exit.wait_error {
+        mark_exited(
+            inner,
+            inner.on_exit.clone(),
+            None,
+            format!("{tail}\nCould not wait for harness process: {error}"),
+        )
+        .await;
+        return;
+    }
+    mark_exited(inner, inner.on_exit.clone(), exit.code, tail).await;
 }
 
 /// One pending RPC request awaiting its `response` frame.
@@ -92,6 +170,19 @@ struct RpcInner {
     /// Process-group id captured before the leader can be reaped. Kept so a
     /// descendant cannot inherit stdout and keep a dead leader alive.
     process_group_id: Option<i32>,
+    /// Watch sender for the leader status observed by the poll monitor. The
+    /// monitor records the reaped status here; the stdout reader drains
+    /// buffered frames, then reports it. Never used for group signalling.
+    leader_exit_tx: watch::Sender<Option<LeaderExit>>,
+    /// Exit callback, stored so stdin-failure paths can fail the client.
+    on_exit: Arc<Box<dyn Fn(Option<i32>, String, bool) + Send + Sync>>,
+}
+
+/// Leader status observed by the poll monitor.
+#[derive(Clone)]
+struct LeaderExit {
+    code: Option<i32>,
+    wait_error: Option<String>,
 }
 
 /// Callbacks the process supervisor supplies.
@@ -129,6 +220,10 @@ impl RpcClient {
         let stdin = child.stdin.take().expect("child stdin piped");
         #[cfg(unix)]
         let process_group_id = child.id().map(|pid| pid as i32);
+        #[cfg(not(unix))]
+        let process_group_id: Option<i32> = None;
+        let (leader_exit_tx, _) = watch::channel(None);
+        let on_exit = Arc::new(handlers.on_exit);
         let inner = Arc::new(RpcInner {
             stdin: Mutex::new(stdin),
             pending: Mutex::new(HashMap::new()),
@@ -138,32 +233,40 @@ impl RpcClient {
             expected_exit: AtomicBool::new(false),
             stderr_tail: Mutex::new(String::new()),
             process_group_id,
+            leader_exit_tx,
+            on_exit: on_exit.clone(),
         });
-        let on_exit = Arc::new(handlers.on_exit);
         // stderr tail collector
         {
             let inner = inner.clone();
             tokio::spawn(async move {
                 let mut stderr = BufReader::new(stderr);
-                while let Ok(Some(line)) = read_bounded_line(&mut stderr, max_frame_bytes).await {
-                    let mut tail = inner.stderr_tail.lock().await;
-                    tail.push_str(&line);
-                    tail.push('\n');
-                    if tail.len() > STDERR_TAIL_BYTES {
-                        let mut cut = tail.len() - STDERR_TAIL_BYTES;
-                        while !tail.is_char_boundary(cut) {
-                            cut += 1;
+                loop {
+                    match read_bounded_line(&mut stderr, max_frame_bytes).await {
+                        Ok(Some(line)) => {
+                            append_stderr_tail(&inner, &String::from_utf8_lossy(&line)).await;
                         }
-                        tail.drain(..cut);
+                        Ok(None) => return,
+                        Err(error) => {
+                            if error.kind() != std::io::ErrorKind::InvalidData {
+                                return;
+                            }
+                            // Oversized line: discard the remainder in bounded
+                            // chunks and keep draining so the pipe stays open.
+                            let _ = discard_line_rest(&mut stderr).await;
+                            append_stderr_tail(&inner, "[truncated oversized stderr line]").await;
+                        }
                     }
                 }
             });
         }
-        // Poll the leader independently of stdout. A descendant may inherit
-        // the pipe forever, but it must not make a dead leader reusable.
+        // Poll the leader independently of stdout. A descendant may inherit the
+        // pipe forever, but it must not make a dead leader reusable. The
+        // monitor only records the reaped status; the stdout reader below owns
+        // the final drain and the single `mark_exited` call, so buffered final
+        // frames are still delivered before exit is reported.
         {
             let inner = inner.clone();
-            let on_exit = on_exit.clone();
             tokio::spawn(async move {
                 loop {
                     let status = {
@@ -172,40 +275,74 @@ impl RpcClient {
                     };
                     match status {
                         Ok(Some(status)) => {
-                            kill_process_group(inner.process_group_id);
-                            let tail = inner.stderr_tail.lock().await.clone();
-                            mark_exited(&inner, on_exit, status.code(), tail).await;
+                            let _ = inner.leader_exit_tx.send(Some(LeaderExit {
+                                code: status.code(),
+                                wait_error: None,
+                            }));
                             return;
                         }
-                        Ok(None) => tokio::time::sleep(std::time::Duration::from_millis(25)).await,
+                        Ok(None) => {
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                LEADER_POLL_INTERVAL_MS,
+                            ))
+                            .await
+                        }
                         Err(error) => {
-                            let tail = inner.stderr_tail.lock().await.clone();
-                            mark_exited(
-                                &inner,
-                                on_exit,
-                                None,
-                                format!("{tail}\nCould not wait for harness process: {error}"),
-                            )
-                            .await;
+                            let _ = inner.leader_exit_tx.send(Some(LeaderExit {
+                                code: None,
+                                wait_error: Some(error.to_string()),
+                            }));
                             return;
                         }
                     }
                 }
             });
         }
-        // stdout reader. Process exit is supervised independently above.
+        // stdout reader. Owns the single `mark_exited` call: once the leader
+        // is reaped it keeps draining buffered frames until EOF or a bounded
+        // deadline, then reports the exit. The reader never waits on the pipe
+        // indefinitely: a descendant holding stdout open cannot keep a dead
+        // leader alive past the deadline.
         {
             let inner = inner.clone();
+            let mut leader_rx = inner.leader_exit_tx.subscribe();
             tokio::spawn(async move {
                 let mut chunk_state: Option<ChunkState> = None;
                 let mut stdout = BufReader::new(stdout);
+                let mut leader_exit: Option<LeaderExit> = None;
+                let mut drain_deadline: Option<tokio::time::Instant> = None;
                 loop {
-                    match read_bounded_line(&mut stdout, max_frame_bytes).await {
+                    if leader_exit.is_none() {
+                        // `borrow_and_update` marks this snapshot seen so a
+                        // later `changed()` only fires on a new leader status.
+                        if let Some(exit) = leader_rx.borrow_and_update().clone() {
+                            leader_exit = Some(exit);
+                            drain_deadline = Some(
+                                tokio::time::Instant::now()
+                                    + std::time::Duration::from_millis(LEADER_DRAIN_GRACE_MS),
+                            );
+                        }
+                    }
+                    let read = read_bounded_line(&mut stdout, max_frame_bytes);
+                    let line = if let Some(deadline) = drain_deadline {
+                        match tokio::time::timeout_at(deadline, read).await {
+                            Ok(line) => line,
+                            Err(_) => {
+                                finish_leader_exit(&inner, leader_exit.clone()).await;
+                                let mut child = inner.child.lock().await;
+                                terminate_child(&mut child, inner.process_group_id).await;
+                                return;
+                            }
+                        }
+                    } else {
+                        read.await
+                    };
+                    match line {
                         Ok(Some(line)) => {
-                            if line.trim().is_empty() {
+                            if trim_ascii_whitespace(&line).is_empty() {
                                 continue;
                             }
-                            let Ok(frame) = serde_json::from_str::<Value>(&line) else {
+                            let Ok(frame) = serde_json::from_slice::<Value>(&line) else {
                                 continue; // non-JSON noise on stdout
                             };
                             let frame = match push_chunk(&mut chunk_state, frame) {
@@ -243,8 +380,12 @@ impl RpcClient {
                             }
                         }
                         Ok(None) => {
-                            let tail = inner.stderr_tail.lock().await.clone();
-                            mark_exited(&inner, on_exit.clone(), None, tail).await;
+                            if let Some(exit) = leader_exit.clone() {
+                                finish_leader_exit(&inner, Some(exit)).await;
+                            } else {
+                                let tail = inner.stderr_tail.lock().await.clone();
+                                mark_exited(&inner, on_exit.clone(), None, tail).await;
+                            }
                             let mut child = inner.child.lock().await;
                             terminate_child(&mut child, inner.process_group_id).await;
                             return;
@@ -287,6 +428,23 @@ impl RpcClient {
             .await
     }
 
+    /// A timed-out or failed stdin write can leave a partial JSONL line in the
+    /// pipe, permanently desyncing every later frame. Fail the client (same
+    /// `mark_exited` + group termination as the reader error paths) so later
+    /// calls fail with the existing "exited" error and the backend restarts.
+    async fn fail_on_broken_stdin(&self) {
+        let tail = self.inner.stderr_tail.lock().await.clone();
+        let msg = util::redact_secrets(&if tail.is_empty() {
+            "Stdin write to the harness process failed; the JSONL stream may be desynced."
+                .to_string()
+        } else {
+            format!("Stdin write to the harness process failed; the JSONL stream may be desynced. Stderr: {tail}")
+        });
+        mark_exited(&self.inner, self.inner.on_exit.clone(), None, msg).await;
+        let mut child = self.inner.child.lock().await;
+        terminate_child(&mut child, self.inner.process_group_id).await;
+    }
+
     pub async fn call_with_timeout(
         &self,
         command: &str,
@@ -321,13 +479,25 @@ impl RpcClient {
             stdin.write_all(frame.as_bytes()).await?;
             stdin.flush().await
         };
-        if let Err(error) =
-            tokio::time::timeout(std::time::Duration::from_secs(STDIN_IO_TIMEOUT_SECS), write).await
-        {
-            self.inner.pending.lock().await.remove(&id);
-            return Err(AppError::new(format!(
-                "Could not write to the harness process: {error}"
-            )));
+        let write_result =
+            tokio::time::timeout(std::time::Duration::from_secs(STDIN_IO_TIMEOUT_SECS), write)
+                .await;
+        match write_result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                self.inner.pending.lock().await.remove(&id);
+                self.fail_on_broken_stdin().await;
+                return Err(AppError::new(format!(
+                    "Could not write to the harness process: {error}"
+                )));
+            }
+            Err(error) => {
+                self.inner.pending.lock().await.remove(&id);
+                self.fail_on_broken_stdin().await;
+                return Err(AppError::new(format!(
+                    "Could not write to the harness process: {error}"
+                )));
+            }
         }
         match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx).await {
             Ok(Ok(Ok(data))) => Ok(data),
@@ -355,10 +525,24 @@ impl RpcClient {
             stdin.write_all(s.as_bytes()).await?;
             stdin.flush().await
         };
-        tokio::time::timeout(std::time::Duration::from_secs(STDIN_IO_TIMEOUT_SECS), write)
-            .await
-            .map_err(|_| AppError::new("Timed out writing to the harness process."))?
-            .map_err(|e| AppError::new(format!("Could not write to the harness process: {e}")))
+        let write_result =
+            tokio::time::timeout(std::time::Duration::from_secs(STDIN_IO_TIMEOUT_SECS), write)
+                .await;
+        match write_result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => {
+                self.fail_on_broken_stdin().await;
+                Err(AppError::new(format!(
+                    "Could not write to the harness process: {error}"
+                )))
+            }
+            Err(error) => {
+                self.fail_on_broken_stdin().await;
+                Err(AppError::new(format!(
+                    "Could not write to the harness process: {error}"
+                )))
+            }
+        }
     }
 
     /// Graceful stop: SIGTERM, then SIGKILL after a grace period.
@@ -372,18 +556,24 @@ impl RpcClient {
 async fn terminate_child(child: &mut Child, process_group_id: Option<i32>) -> bool {
     #[cfg(unix)]
     if let Some(pgid) = process_group_id {
-        unsafe {
-            libc::kill(-pgid, libc::SIGTERM);
+        // Only signal the group while the leader is still unreaped. `wait`
+        // reaps the leader; signalling the pgid afterwards could hit a
+        // recycled process group, so check liveness before every signal.
+        if matches!(child.try_wait(), Ok(None)) {
+            unsafe {
+                libc::kill(-pgid, libc::SIGTERM);
+            }
         }
         if matches!(
             tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await,
             Ok(Ok(_))
         ) {
-            kill_process_group(process_group_id);
             return true;
         }
-        kill_process_group(process_group_id);
-        let _ = child.start_kill();
+        if matches!(child.try_wait(), Ok(None)) {
+            kill_process_group(process_group_id);
+            let _ = child.start_kill();
+        }
         return matches!(
             tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await,
             Ok(Ok(_))
@@ -593,6 +783,19 @@ pub fn normalize_outgoing_frame(mut frame: Value) -> Value {
         }
         return frame;
     }
+    if matches!(
+        ftype,
+        "tool_execution_update" | "tool_stream_update" | "tool_update"
+    ) {
+        if let Some(obj) = frame.as_object_mut() {
+            for key in ["partialResult", "result", "partial"] {
+                if let Some(partial) = obj.get_mut(key) {
+                    cap_partial_result(partial);
+                }
+            }
+        }
+        return frame;
+    }
     if ftype != "message_update" {
         return frame;
     }
@@ -600,35 +803,68 @@ pub fn normalize_outgoing_frame(mut frame: Value) -> Value {
         obj.remove("message");
         if let Some(ame) = obj.get_mut("assistantMessageEvent") {
             if let Some(ame_obj) = ame.as_object_mut() {
+                let partial = ame_obj.remove("partial");
                 let is_toolcall_start =
                     ame_obj.get("type").and_then(Value::as_str) == Some("toolcall_start");
-                if is_toolcall_start {
-                    let content_index = ame_obj
-                        .get("contentIndex")
-                        .and_then(Value::as_u64)
-                        .map(|v| v as usize);
-                    if let (Some(partial), Some(idx)) =
-                        (ame_obj.get("partial").cloned(), content_index)
+                let content_index = ame_obj
+                    .get("contentIndex")
+                    .and_then(Value::as_u64)
+                    .map(|v| v as usize);
+                if let (true, Some(partial), Some(idx)) =
+                    (is_toolcall_start, partial.as_ref(), content_index)
+                {
+                    if let Some(content) = partial
+                        .get("content")
+                        .and_then(Value::as_array)
+                        .and_then(|arr| arr.get(idx))
                     {
-                        if let Some(content) = partial
-                            .get("content")
-                            .and_then(Value::as_array)
-                            .and_then(|arr| arr.get(idx))
-                        {
-                            if let Some(id) = content.get("id").and_then(Value::as_str) {
-                                ame_obj.insert("id".to_string(), json!(id));
-                            }
-                            if let Some(name) = content.get("name").and_then(Value::as_str) {
-                                ame_obj.insert("name".to_string(), json!(name));
-                            }
+                        if let Some(id) = content.get("id").and_then(Value::as_str) {
+                            ame_obj.insert("id".to_string(), json!(id));
+                        }
+                        if let Some(name) = content.get("name").and_then(Value::as_str) {
+                            ame_obj.insert("name".to_string(), json!(name));
                         }
                     }
                 }
-                ame_obj.remove("partial");
             }
         }
     }
     frame
+}
+
+/// Tool progress frames repeat all output so far, so a long command streams
+/// O(n²) bytes to the webview, which only renders a short tail. Forward the tail.
+const MAX_PARTIAL_TEXT_BYTES: usize = 64 * 1024;
+
+fn keep_tail(text: &mut String, max: usize) {
+    if text.len() <= max {
+        return;
+    }
+    let mut cut = text.len() - max;
+    while !text.is_char_boundary(cut) {
+        cut += 1;
+    }
+    text.replace_range(..cut, "");
+}
+
+fn cap_partial_result(partial: &mut Value) {
+    let Some(obj) = partial.as_object_mut() else {
+        return;
+    };
+    if let Some(content) = obj.get_mut("content").and_then(Value::as_array_mut) {
+        for block in content {
+            if let Some(Value::String(text)) = block.get_mut("text") {
+                keep_tail(text, MAX_PARTIAL_TEXT_BYTES);
+            }
+        }
+    }
+    if let Some(details) = obj.get_mut("details").and_then(Value::as_object_mut) {
+        for value in details.values_mut() {
+            if let Value::String(text) = value {
+                keep_tail(text, MAX_PARTIAL_TEXT_BYTES);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -682,6 +918,34 @@ mod tests {
         assert_eq!(ame.get("id").and_then(Value::as_str), Some("call_1"));
         assert_eq!(ame.get("name").and_then(Value::as_str), Some("bash"));
         assert!(ame.get("partial").is_none());
+    }
+
+    #[test]
+    fn caps_cumulative_tool_partials_to_utf8_tail() {
+        let long = format!("{}é-end", "x".repeat(MAX_PARTIAL_TEXT_BYTES * 2));
+        let frame = json!({
+            "type": "tool_execution_update",
+            "toolCallId": "t1",
+            "partialResult": {
+                "content": [{"type": "text", "text": long}],
+                "details": {"output": long, "exitCode": 0}
+            }
+        });
+        let out = normalize_outgoing_frame(frame);
+        let text = out["partialResult"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.len() <= MAX_PARTIAL_TEXT_BYTES);
+        assert!(text.ends_with("é-end"));
+        let output = out["partialResult"]["details"]["output"].as_str().unwrap();
+        assert!(output.len() <= MAX_PARTIAL_TEXT_BYTES);
+        assert_eq!(out["partialResult"]["details"]["exitCode"], 0);
+        assert_eq!(out["toolCallId"], "t1");
+    }
+
+    #[test]
+    fn keep_tail_respects_char_boundaries() {
+        let mut text = "aéé".to_string();
+        keep_tail(&mut text, 3);
+        assert_eq!(text, "é");
     }
 
     #[test]

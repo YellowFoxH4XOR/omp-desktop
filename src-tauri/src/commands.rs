@@ -13,6 +13,17 @@ use tauri::State;
 
 static ACTIVE_INSTALL: Mutex<Option<HarnessKind>> = Mutex::new(None);
 
+/// Sync Tauri commands run on the main thread and freeze the window while
+/// they work. Filesystem, git, and SQLite scans go to the blocking pool.
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> crate::error::AppResult<T> + Send + 'static,
+) -> CmdResult<T> {
+    tauri::async_runtime::spawn_blocking(work)
+        .await
+        .map_err(|error| format!("Background task failed: {error}"))?
+        .map_err(cmd_err)
+}
+
 struct ActiveInstallGuard;
 
 impl ActiveInstallGuard {
@@ -70,6 +81,13 @@ pub async fn install_harness(state: State<'_, AppState>, kind: HarnessKind) -> C
         .map_err(cmd_err)
 }
 
+/// Display copies of the fixed install commands, built from the same source
+/// as the executed argv so the UI text cannot drift from what actually runs.
+#[tauri::command]
+pub fn harness_install_commands() -> Vec<crate::dto::HarnessInstallCommand> {
+    crate::harness::install_commands()
+}
+
 // ---------------------------------------------------------------------
 // Projects
 // ---------------------------------------------------------------------
@@ -80,16 +98,17 @@ pub fn list_projects(state: State<'_, AppState>) -> CmdResult<Vec<Project>> {
 }
 
 #[tauri::command]
-pub fn add_project(
+pub async fn add_project(
     state: State<'_, AppState>,
     path: String,
     harness: HarnessKind,
 ) -> CmdResult<Project> {
-    add_project_inner(&state, &path, harness).map_err(cmd_err)
+    let store = state.store.clone();
+    blocking(move || add_project_inner(&store, &path, harness)).await
 }
 
 fn add_project_inner(
-    state: &AppState,
+    store: &crate::store::Store,
     path: &str,
     harness: HarnessKind,
 ) -> crate::error::AppResult<Project> {
@@ -116,7 +135,7 @@ fn add_project_inner(
         .map(|n| n.to_string_lossy().to_string())
         .filter(|n| !n.is_empty())
         .unwrap_or_else(|| resolved.to_string_lossy().to_string());
-    state.store.add_project(
+    store.add_project(
         &resolved.to_string_lossy(),
         &display_name,
         preferred,
@@ -139,22 +158,28 @@ pub async fn remove_project(state: State<'_, AppState>, project_id: String) -> C
 // ---------------------------------------------------------------------
 
 #[tauri::command]
-pub fn list_threads(state: State<'_, AppState>, project_id: String) -> CmdResult<Vec<Thread>> {
-    let _ = state.store.touch_project(&project_id);
-    state.threads.list_threads(&project_id).map_err(cmd_err)
+pub async fn list_threads(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> CmdResult<Vec<Thread>> {
+    let store = state.store.clone();
+    let threads = state.threads.clone();
+    blocking(move || {
+        let _ = store.touch_project(&project_id);
+        threads.list_threads(&project_id)
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn create_thread(
+pub async fn create_thread(
     state: State<'_, AppState>,
     project_id: String,
     harness: HarnessKind,
     isolated: Option<bool>,
 ) -> CmdResult<Thread> {
-    state
-        .threads
-        .create_thread(&project_id, harness, isolated.unwrap_or(false))
-        .map_err(cmd_err)
+    let threads = state.threads.clone();
+    blocking(move || threads.create_thread(&project_id, harness, isolated.unwrap_or(false))).await
 }
 
 #[tauri::command]
@@ -360,29 +385,37 @@ pub async fn login_provider(
 // ---------------------------------------------------------------------
 
 #[tauri::command]
-pub fn git_status(state: State<'_, AppState>, thread_id: String) -> CmdResult<ChangesSummary> {
+pub async fn git_status(
+    state: State<'_, AppState>,
+    thread_id: String,
+) -> CmdResult<ChangesSummary> {
     let cwd = state.threads.thread_cwd(&thread_id).map_err(cmd_err)?;
-    git::status(&cwd).map_err(cmd_err)
+    blocking(move || git::status(&cwd)).await
 }
 
 #[tauri::command]
-pub fn git_file(state: State<'_, AppState>, thread_id: String, path: String) -> CmdResult<GitFile> {
-    let cwd = state.threads.thread_cwd(&thread_id).map_err(cmd_err)?;
-    git::file(&cwd, &path).map_err(cmd_err)
-}
-
-#[tauri::command]
-pub fn git_revert_file(
+pub async fn git_file(
     state: State<'_, AppState>,
     thread_id: String,
     path: String,
-) -> CmdResult<()> {
+) -> CmdResult<GitFile> {
     let cwd = state.threads.thread_cwd(&thread_id).map_err(cmd_err)?;
-    git::revert_file(&cwd, &path).map_err(cmd_err)
+    blocking(move || git::file(&cwd, &path)).await
 }
 
 #[tauri::command]
-pub fn git_write_if_unchanged(
+pub async fn git_revert_file(
+    state: State<'_, AppState>,
+    thread_id: String,
+    path: String,
+    expected_hash: Option<String>,
+) -> CmdResult<()> {
+    let cwd = state.threads.thread_cwd(&thread_id).map_err(cmd_err)?;
+    blocking(move || git::revert_file(&cwd, &path, expected_hash.as_deref())).await
+}
+
+#[tauri::command]
+pub async fn git_write_if_unchanged(
     state: State<'_, AppState>,
     thread_id: String,
     path: String,
@@ -390,18 +423,18 @@ pub fn git_write_if_unchanged(
     content: String,
 ) -> CmdResult<()> {
     let cwd = state.threads.thread_cwd(&thread_id).map_err(cmd_err)?;
-    git::write_if_unchanged(&cwd, &path, &expected_hash, &content).map_err(cmd_err)
+    blocking(move || git::write_if_unchanged(&cwd, &path, &expected_hash, &content)).await
 }
 
 #[tauri::command]
-pub fn open_changed_file(
+pub async fn open_changed_file(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     thread_id: String,
     path: String,
 ) -> CmdResult<()> {
     let cwd = state.threads.thread_cwd(&thread_id).map_err(cmd_err)?;
-    let abs = git::openable_path(&cwd, &path).map_err(cmd_err)?;
+    let abs = blocking(move || git::openable_path(&cwd, &path)).await?;
     tauri_plugin_opener::OpenerExt::opener(&app)
         .open_path(abs.to_string_lossy().to_string(), None::<&str>)
         .map_err(|error| cmd_err(AppError::new(format!("Could not open file: {error}"))))

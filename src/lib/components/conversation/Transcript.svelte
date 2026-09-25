@@ -1,10 +1,12 @@
 <script lang="ts">
   import { onDestroy } from 'svelte';
   import { VList, type VListHandle } from 'virtua/svelte';
-  import { Brain, ChevronDown, ChevronRight, Info, Sparkles, TriangleAlert } from '@lucide/svelte';
+  import { ArrowDown, Brain, Info, Puzzle, Sparkles, TriangleAlert } from '@lucide/svelte';
   import type { AgentInfo, ConversationItem } from '../../types';
   import CommandCard from '../tools/CommandCard.svelte';
   import ToolCard from '../tools/ToolCard.svelte';
+  import ToolShell from '../tools/ToolShell.svelte';
+  import { preview } from '../tools/tool-utils';
   import type { ToolItem } from '../tools/tool-utils';
   import Markdown from './Markdown.svelte';
 
@@ -116,6 +118,11 @@
 
   type CustomItem = Extract<ConversationItem, { kind: 'custom' | 'notice' | 'advisor' }>;
 
+  /** Tool calls, thinking, and harness events render as one connected timeline. */
+  function isStep(item: ConversationItem | undefined): boolean {
+    return !!item && (item.kind === 'tool' || item.kind === 'thinking' || item.kind === 'custom');
+  }
+
   /** bashExecution custom messages render through the command card. */
   function asCommandItem(item: CustomItem): ToolItem {
     const details =
@@ -142,8 +149,9 @@
 <div class="transcript">
   {#if items.length === 0}
     <div class="empty">
-      <p>No messages yet.</p>
-      <p class="muted">Send a message to start the session.</p>
+      <div class="empty-mark"><Sparkles size={18} strokeWidth={1.6} /></div>
+      <p>No messages yet</p>
+      <p class="muted">Describe what you want to build, fix, or understand.</p>
     </div>
   {:else}
     <div class="list-wrap" bind:this={wrap}>
@@ -155,59 +163,69 @@
         bufferSize={400}
         ssrCount={12}
       >
-        {#snippet children(item)}
-          <div class="row">
-            {#if item.kind === 'user'}
-              <div class="user">
-                <div class="user-text">{item.text}</div>
-              </div>
-            {:else if item.kind === 'text'}
-              <div class="assistant">
-                <Markdown text={item.text} streaming={item.streaming ?? false} />
-                {#if item.streaming}<span class="caret" aria-hidden="true"></span>{/if}
-              </div>
-            {:else if item.kind === 'thinking'}
-              <details class="thinking" open={item.streaming ?? false}>
-                <summary>
-                  <Brain size={12} />
-                  <span>{item.streaming ? 'Thinking…' : 'Thought'}</span>
-                </summary>
-                <div class="think-body">{item.text}</div>
-              </details>
-            {:else if item.kind === 'tool'}
-              <ToolCard {item} {agents} {onShowChanges} {onShowAgents} />
-            {:else if item.kind === 'advisor'}
-              <div class="advisor">
-                <div class="advisor-head">
-                  <Sparkles size={12} />
-                  <span>Advisor</span>
+        {#snippet children(item, index)}
+          {@const step = isStep(item)}
+          <div
+            class="row kind-{item.kind}"
+            class:step
+            class:step-first={step && !isStep(renderedItems[index - 1])}
+            class:step-last={step && !isStep(renderedItems[index + 1])}
+            class:first={index === 0}
+          >
+            <div class="row-inner">
+              {#if item.kind === 'user'}
+                <div class="user">
+                  <div class="user-text">{item.text}</div>
                 </div>
-                <Markdown text={item.text} />
-              </div>
-            {:else if item.kind === 'notice'}
-              <div class="notice" class:warn={item.level === 'warn'} class:error={item.level === 'error'}>
-                {#if item.level === 'error' || item.level === 'warn'}
-                  <TriangleAlert size={12} />
+              {:else if item.kind === 'text'}
+                <div class="assistant" class:streaming={item.streaming}>
+                  <Markdown text={item.text} streaming={item.streaming ?? false} />
+                </div>
+              {:else if item.kind === 'thinking'}
+                <ToolShell status={item.streaming ? 'running' : 'completed'} icon={Brain} initiallyOpen={item.streaming ?? false} quiet>
+                  {#snippet summary()}
+                    <span class="think-label">{item.streaming ? 'Thinking' : 'Thought'}</span>
+                    {#if !item.streaming && item.text}<span class="think-preview">{preview(item.text, 110)}</span>{/if}
+                  {/snippet}
+                  {#snippet detail()}
+                    <div class="think-body">{item.text}</div>
+                  {/snippet}
+                </ToolShell>
+              {:else if item.kind === 'tool'}
+                <ToolCard {item} {agents} {onShowChanges} {onShowAgents} />
+              {:else if item.kind === 'advisor'}
+                <div class="advisor">
+                  <div class="advisor-head">
+                    <Sparkles size={12} strokeWidth={2} />
+                    <span>Advisor</span>
+                  </div>
+                  <Markdown text={item.text} />
+                </div>
+              {:else if item.kind === 'notice'}
+                <div class="notice" class:warn={item.level === 'warn'} class:error={item.level === 'error'}>
+                  {#if item.level === 'error' || item.level === 'warn'}
+                    <TriangleAlert size={12} strokeWidth={2} />
+                  {:else}
+                    <Info size={12} strokeWidth={2} />
+                  {/if}
+                  <span>{item.text}</span>
+                </div>
+              {:else if item.kind === 'custom'}
+                {#if item.customType === 'bashExecution'}
+                  <CommandCard item={asCommandItem(item)} />
                 {:else}
-                  <Info size={12} />
+                  <ToolShell status="completed" icon={Puzzle} quiet>
+                    {#snippet summary()}
+                      <span class="custom-type">{item.customType ?? 'event'}</span>
+                      <span class="think-preview">{preview(item.text, 100)}</span>
+                    {/snippet}
+                    {#snippet detail()}
+                      <div class="custom-body">{item.text}</div>
+                    {/snippet}
+                  </ToolShell>
                 {/if}
-                <span>{item.text}</span>
-              </div>
-            {:else if item.kind === 'custom'}
-              {#if item.customType === 'bashExecution'}
-                <CommandCard item={asCommandItem(item)} />
-              {:else}
-                <details class="custom">
-                  <summary>
-                    <ChevronRight size={11} class="c-closed" />
-                    <ChevronDown size={11} class="c-open" />
-                    <span class="custom-type">{item.customType ?? 'event'}</span>
-                    <span class="custom-text">{item.text.slice(0, 100)}</span>
-                  </summary>
-                  <div class="custom-body">{item.text}</div>
-                </details>
               {/if}
-            {/if}
+            </div>
           </div>
         {/snippet}
       </VList>
@@ -215,7 +233,7 @@
 
     {#if !stickToBottom}
       <button type="button" class="to-bottom" onclick={scrollToBottom} aria-label="Scroll to latest">
-        <ChevronDown size={13} /> Latest
+        <ArrowDown size={13} strokeWidth={2} /> Latest
       </button>
     {/if}
   {/if}
@@ -248,8 +266,52 @@
     min-height: 0;
   }
   .row {
-    padding: 2px 16px;
+    padding: 3px 0;
     user-select: text;
+  }
+  .row.first {
+    padding-top: 24px;
+  }
+  .row-inner {
+    position: relative;
+    max-width: calc(var(--content-width) + 48px);
+    margin: 0 auto;
+    padding: 0 24px;
+  }
+  .row.kind-user {
+    padding: 14px 0 10px;
+  }
+  .row.kind-user.first {
+    padding-top: 24px;
+  }
+  .row.step {
+    padding: 0;
+  }
+  .row.step-first {
+    padding-top: 6px;
+  }
+  .row.step-last {
+    padding-bottom: 8px;
+  }
+  /* Timeline rail through the step nodes (node centre: 24px gutter + 4px + 10px). */
+  .row.step .row-inner::before {
+    content: '';
+    position: absolute;
+    left: 37.5px;
+    top: 0;
+    bottom: 0;
+    width: 1px;
+    background: color-mix(in srgb, var(--subtle) 40%, transparent);
+  }
+  .row.step-first .row-inner::before {
+    top: 14px;
+  }
+  .row.step-last .row-inner::before {
+    bottom: auto;
+    height: 14px;
+  }
+  .row.step-first.step-last .row-inner::before {
+    display: none;
   }
   .empty {
     flex: 1;
@@ -259,98 +321,105 @@
     justify-content: center;
     gap: 2px;
     color: var(--text);
-    font-size: 13px;
+    font-size: 13.5px;
+  }
+  .empty p {
+    margin: 0;
+  }
+  .empty-mark {
+    width: 40px;
+    height: 40px;
+    margin-bottom: 12px;
+    border-radius: 12px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--accent);
+    background: var(--accent-bg);
   }
   .empty .muted {
     color: var(--muted);
-    font-size: 12px;
+    font-size: 12.5px;
   }
   .user {
     display: flex;
     justify-content: flex-end;
-    margin: 6px 0;
   }
   .user-text {
-    max-width: 78%;
-    padding: 6px 10px;
-    border-radius: 10px;
+    max-width: 82%;
+    padding: 9px 14px;
+    border-radius: 18px 18px 6px 18px;
     background: var(--surface-2);
-    font-size: 13px;
-    line-height: 1.45;
+    font-size: 14px;
+    line-height: 1.55;
     white-space: pre-wrap;
     overflow-wrap: anywhere;
   }
   .assistant {
-    margin: 4px 0 8px;
+    padding: 4px 0;
     max-width: 100%;
+    font-size: 14px;
   }
-  .caret {
+  /* Inline caret after the last streamed block (or on its own line when empty). */
+  .assistant.streaming :global(.md > :last-child)::after,
+  .assistant.streaming :global(.md:empty)::after {
+    content: '';
     display: inline-block;
     width: 7px;
-    height: 14px;
-    margin-left: 2px;
-    vertical-align: text-bottom;
+    height: 15px;
+    margin-left: 3px;
+    border-radius: 2px;
+    vertical-align: -2px;
     background: var(--accent);
-    animation: blink 1s steps(2) infinite;
+    animation: blink 1.1s steps(2) infinite;
   }
   @keyframes blink {
     50% {
       opacity: 0;
     }
   }
-  .thinking {
-    margin: 3px 0;
-    border-left: 2px solid var(--line);
-    padding-left: 10px;
+  .think-label {
     color: var(--muted);
+    font-weight: 500;
   }
-  .thinking summary {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    cursor: pointer;
-    font-size: 11.5px;
-    list-style: none;
-    padding: 2px 0;
-  }
-  .thinking summary::-webkit-details-marker {
-    display: none;
+  .think-preview {
+    margin-left: 6px;
+    color: var(--subtle);
   }
   .think-body {
-    font-size: 12px;
+    color: var(--muted);
+    font-size: 12.5px;
+    line-height: 1.6;
     white-space: pre-wrap;
     overflow-wrap: anywhere;
-    padding: 2px 0 6px;
-    font-style: italic;
   }
   .advisor {
     margin: 6px 0;
-    border: 1px solid var(--accent-bg);
-    border-left: 3px solid var(--accent);
-    border-radius: var(--radius);
-    background: var(--surface);
-    padding: 7px 10px;
+    border-radius: var(--radius-lg);
+    background: var(--accent-bg);
+    padding: 10px 14px;
   }
   .advisor-head {
     display: flex;
     align-items: center;
     gap: 6px;
     color: var(--accent);
-    font-size: 11px;
+    font-size: 11.5px;
     font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
     margin-bottom: 4px;
   }
   .notice {
     display: flex;
-    align-items: baseline;
-    gap: 7px;
-    margin: 3px 0;
-    padding: 4px 8px;
-    border-radius: 6px;
-    color: var(--muted);
-    font-size: 11.5px;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    margin: 6px 0;
+    color: var(--subtle);
+    font-size: 12px;
+    text-align: center;
+  }
+  .notice :global(svg) {
+    flex: none;
   }
   .notice.warn {
     color: var(--warn);
@@ -358,66 +427,37 @@
   .notice.error {
     color: var(--bad);
   }
-  .custom {
-    margin: 3px 0;
-    font-size: 12px;
+  .custom-type {
+    font-family: var(--mono);
+    font-size: 11.5px;
     color: var(--muted);
   }
-  .custom summary {
-    display: flex;
-    align-items: center;
-    gap: 5px;
-    cursor: pointer;
-    list-style: none;
-    padding: 2px 0;
-    min-width: 0;
-  }
-  .custom summary::-webkit-details-marker {
-    display: none;
-  }
-  .custom summary :global(.c-open) {
-    display: none;
-  }
-  .custom[open] summary :global(.c-open) {
-    display: inline-flex;
-  }
-  .custom[open] summary :global(.c-closed) {
-    display: none;
-  }
-  .custom-type {
-    flex: none;
-    font-family: var(--mono);
-    font-size: 11px;
-    color: var(--subtle);
-  }
-  .custom-text {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
   .custom-body {
-    padding: 4px 0 4px 16px;
     white-space: pre-wrap;
     overflow-wrap: anywhere;
     color: var(--text);
-    font-size: 12px;
+    font-size: 12.5px;
   }
   .to-bottom {
     position: absolute;
-    bottom: 10px;
-    right: 16px;
+    bottom: 12px;
+    left: 50%;
+    transform: translateX(-50%);
     display: inline-flex;
     align-items: center;
-    gap: 4px;
-    padding: 4px 10px;
-    border: 1px solid var(--line);
-    border-radius: 14px;
-    background: var(--surface);
+    gap: 5px;
+    height: 28px;
+    padding: 0 12px;
+    border: 0;
+    border-radius: 999px;
+    background: var(--elevated);
     color: var(--text);
-    font-size: 11.5px;
+    font-size: 12px;
+    font-weight: 500;
     box-shadow: var(--shadow);
+    animation: ui-rise 0.15s var(--ease);
   }
   .to-bottom:hover {
-    background: var(--surface-2);
+    color: var(--accent);
   }
 </style>

@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { AgentInfo } from '../../types';
+  import { Network } from '@lucide/svelte';
   import ToolShell from './ToolShell.svelte';
   import { firstString, formatDuration, preview, resultDuration, type ToolItem } from './tool-utils';
 
@@ -46,9 +47,9 @@
   };
 </script>
 
-<ToolShell status={item.status} failed={item.status === 'failed' || item.result?.isError === true} meta={meta || undefined}>
+<ToolShell icon={Network} status={item.status} failed={item.status === 'failed' || item.result?.isError === true} meta={meta || undefined}>
   {#snippet summary()}
-    <span class="line">Delegated work{#if task} <span class="t">— {preview(task, 60)}</span>{/if}</span>
+    <span class="line">Delegated{#if task}&nbsp;<span class="t">{preview(task, 70)}</span>{:else}&nbsp;work{/if}</span>
   {/snippet}
   {#snippet detail()}
     {#if task}
@@ -56,7 +57,7 @@
     {/if}
     {#if linked.length > 0}
       <div class="agents">
-        {#each linked as agent (agent.id)}
+        {#each linked as agent, linkIndex (linkIndex + ':' + agent.id)}
           <div class="agent">
             <span class="glyph s-{agent.status}" aria-hidden="true">{STATUS_GLYPH[agent.status]}</span>
             <span class="name">{agent.name}</span>
@@ -79,7 +80,7 @@
     min-width: 0;
   }
   .t {
-    color: var(--muted);
+    color: var(--text);
   }
   .agents {
     display: flex;

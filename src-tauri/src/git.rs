@@ -28,11 +28,35 @@ fn repo_root(cwd: &Path) -> AppResult<PathBuf> {
 
 const MAX_FILE_BYTES: u64 = 1024 * 1024; // 1 MiB inline content cap
 
+/// Repository-selection variables git inherits from the process environment.
+/// `-C` does not override these, so an inherited value can redirect every git
+/// invocation away from `cwd` (making clean files look changed or hiding real
+/// changes). Every git invocation goes through `git_command`.
+const GIT_SCOPE_VARS: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_PREFIX",
+];
+
+/// Base `git` command scoped to `cwd` and insulated from repository-selection
+/// environment variables. Callers add subcommand args and stdio, then spawn.
+fn git_command(cwd: &Path) -> Command {
+    let mut cmd = Command::new("git");
+    for var in GIT_SCOPE_VARS {
+        cmd.env_remove(var);
+    }
+    cmd.arg("--literal-pathspecs").arg("-C").arg(cwd);
+    cmd
+}
+
 fn git(cwd: &Path, args: &[&str]) -> AppResult<std::process::Output> {
-    let out = Command::new("git")
-        .arg("--literal-pathspecs")
-        .arg("-C")
-        .arg(cwd)
+    let out = git_command(cwd)
         .args(args)
         .stdin(std::process::Stdio::null())
         .output()
@@ -47,10 +71,7 @@ const MAX_CHANGED_FILE_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 fn git_ok_capped(cwd: &Path, args: &[&str], cap: usize) -> AppResult<Vec<u8>> {
     use std::io::Read;
 
-    let mut child = Command::new("git")
-        .arg("--literal-pathspecs")
-        .arg("-C")
-        .arg(cwd)
+    let mut child = git_command(cwd)
         .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -277,6 +298,16 @@ fn c_path(path: &Path) -> AppResult<std::ffi::CString> {
 
 #[cfg(unix)]
 fn open_checked_dir(root: &Path, path: &Path) -> AppResult<std::fs::File> {
+    open_checked_dir_impl(root, path, true)
+}
+
+#[cfg(unix)]
+fn open_checked_dir_no_create(root: &Path, path: &Path) -> AppResult<std::fs::File> {
+    open_checked_dir_impl(root, path, false)
+}
+
+#[cfg(unix)]
+fn open_checked_dir_impl(root: &Path, path: &Path, create: bool) -> AppResult<std::fs::File> {
     use std::os::fd::{AsRawFd, FromRawFd};
     let relative = path
         .strip_prefix(root)
@@ -306,7 +337,10 @@ fn open_checked_dir(root: &Path, path: &Path) -> AppResult<std::fs::File> {
                 libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
             )
         };
-        if next < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) {
+        if next < 0
+            && create
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT)
+        {
             let created = unsafe { libc::mkdirat(current.as_raw_fd(), name.as_ptr(), 0o755) };
             if created != 0 {
                 return Err(AppError::new(format!(
@@ -335,11 +369,25 @@ fn open_checked_dir(root: &Path, path: &Path) -> AppResult<std::fs::File> {
 
 #[cfg(unix)]
 fn open_checked_file(root: &Path, abs: &Path) -> AppResult<std::fs::File> {
+    open_checked_file_impl(root, abs, true)
+}
+
+#[cfg(unix)]
+fn open_checked_file_no_create(root: &Path, abs: &Path) -> AppResult<std::fs::File> {
+    open_checked_file_impl(root, abs, false)
+}
+
+#[cfg(unix)]
+fn open_checked_file_impl(root: &Path, abs: &Path, create: bool) -> AppResult<std::fs::File> {
     use std::os::fd::{AsRawFd, FromRawFd};
     let parent = abs
         .parent()
         .ok_or_else(|| AppError::new("Path is outside the repository."))?;
-    let parent_dir = open_checked_dir(root, parent)?;
+    let parent_dir = if create {
+        open_checked_dir(root, parent)?
+    } else {
+        open_checked_dir_no_create(root, parent)?
+    };
     let name = abs
         .file_name()
         .ok_or_else(|| AppError::new("Path must name a file."))?;
@@ -583,28 +631,79 @@ fn atomic_replace(
     parent: &std::fs::File,
     temp: &std::ffi::CString,
     name: &std::ffi::CString,
-    _root: &Path,
-    _abs: &Path,
-    _expected_hash: &str,
+    root: &Path,
+    abs: &Path,
+    expected_hash: &str,
     current_was_present: bool,
 ) -> AppResult<()> {
     use std::os::fd::AsRawFd;
     if current_was_present {
-        let renamed = unsafe {
-            libc::renameat(
+        // Verified exchange: swap temp into place, hash the displaced bytes,
+        // and roll back on mismatch so a concurrent edit is never silently
+        // overwritten. Mirrors the macOS RENAME_SWAP path via renameat2
+        // RENAME_EXCHANGE.
+        let exchanged = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
                 parent.as_raw_fd(),
                 temp.as_ptr(),
                 parent.as_raw_fd(),
                 name.as_ptr(),
+                libc::RENAME_EXCHANGE,
             )
         };
-        if renamed != 0 {
+        if exchanged != 0 {
             unlink_at(parent, temp);
             return Err(AppError::new(format!(
                 "Could not atomically replace file: {}",
                 std::io::Error::last_os_error()
             )));
         }
+        let temp_name = temp.to_string_lossy();
+        let old_path = abs.with_file_name(temp_name.as_ref());
+        let old_hash = match hash_file(root, &old_path) {
+            Ok(hash) => hash,
+            Err(error) => {
+                let rollback = unsafe {
+                    libc::syscall(
+                        libc::SYS_renameat2,
+                        parent.as_raw_fd(),
+                        temp.as_ptr(),
+                        parent.as_raw_fd(),
+                        name.as_ptr(),
+                        libc::RENAME_EXCHANGE,
+                    )
+                };
+                return if rollback == 0 {
+                    unlink_at(parent, temp);
+                    Err(error)
+                } else {
+                    Err(AppError::new(
+                        "Could not verify swapped file; rollback failed.",
+                    ))
+                };
+            }
+        };
+        if old_hash != expected_hash {
+            let rollback = unsafe {
+                libc::syscall(
+                    libc::SYS_renameat2,
+                    parent.as_raw_fd(),
+                    temp.as_ptr(),
+                    parent.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::RENAME_EXCHANGE,
+                )
+            };
+            if rollback != 0 {
+                return Err(AppError::new("Concurrent edit detected; rollback failed."));
+            }
+            unlink_at(parent, temp);
+            return Err(AppError::new(
+                "The file changed on disk while saving. Refresh the diff and try again.",
+            ));
+        }
+        unlink_at(parent, temp);
         return Ok(());
     }
     let renamed = unsafe {
@@ -694,6 +793,11 @@ fn write_checked_unix(
     std::fs::write(abs, content).map_err(|e| AppError::new(format!("Could not write file: {e}")))
 }
 
+/// Cap on bytes scanned when counting untracked lines. A multi-gigabyte
+/// artifact stays listed without blocking the review command on a full read;
+/// lines are counted only within the scanned prefix.
+const MAX_UNTRACKED_SCAN_BYTES: u64 = 256 * 1024;
+
 /// Count working-tree lines in bounded memory. Nonregular paths, including
 /// symlinks, are represented as binary rather than read through.
 fn count_untracked_lines(path: &Path) -> Option<(u64, bool)> {
@@ -706,10 +810,12 @@ fn count_untracked_lines(path: &Path) -> Option<(u64, bool)> {
     let mut buf = [0u8; 64 * 1024];
     let mut lines = 0u64;
     let mut inspected = 0usize;
+    let mut scanned = 0u64;
     let mut last = 0u8;
     let mut had_bytes = false;
-    loop {
-        let n = file.read(&mut buf).ok()?;
+    while scanned < MAX_UNTRACKED_SCAN_BYTES {
+        let want = (MAX_UNTRACKED_SCAN_BYTES - scanned).min(buf.len() as u64) as usize;
+        let n = file.read(&mut buf[..want]).ok()?;
         if n == 0 {
             break;
         }
@@ -717,6 +823,7 @@ fn count_untracked_lines(path: &Path) -> Option<(u64, bool)> {
             return Some((0, true));
         }
         inspected += n;
+        scanned += n as u64;
         had_bytes = true;
         last = buf[n - 1];
         lines += buf[..n].iter().filter(|&&b| b == b'\n').count() as u64;
@@ -725,53 +832,78 @@ fn count_untracked_lines(path: &Path) -> Option<(u64, bool)> {
 }
 
 /// Parse `git status --porcelain=v1 -z` output.
-/// Rename/copy entries store the new path first, then the original path.
+/// Rename/copy entries are `XY new\0old\0`; the first path is the worktree
+/// entry. `-z` emits raw bytes without quoting, so paths are matched bytewise
+/// and only valid UTF-8 paths are reported (non-UTF-8 entries are skipped so
+/// two distinct files can never collapse to one `String`).
 fn parse_porcelain(data: &[u8]) -> Vec<ChangedFile> {
-    let text = String::from_utf8_lossy(data);
-    let mut fields = text.split('\0');
     let mut out = Vec::new();
+    let mut fields = data.split(|b| *b == 0);
     while let Some(field) = fields.next() {
         if field.len() < 4 {
             continue;
         }
-        let x = field.as_bytes()[0] as char;
-        let y = field.as_bytes()[1] as char;
-        let mut path = field[3..].to_string();
-        let status = if x == '?' && y == '?' {
-            "untracked"
-        } else if x == '!' && y == '!' {
-            fields.next();
-            continue;
-        } else {
-            match (x, y) {
-                ('R', _) | ('C', _) => {
-                    // -z format: "XY new\0old\0"
-                    let _old = fields.next();
-                    if x == 'R' {
-                        "renamed"
-                    } else {
-                        "copied"
-                    }
-                }
-                ('A', _) | (_, 'A') => "added",
-                ('D', _) | (_, 'D') => "deleted",
-                ('T', _) | (_, 'T') => "typechange",
-                ('U', _) | (_, 'U') => "conflicted",
-                _ => "modified",
+        let x = field[0];
+        let y = field[1];
+        if x == b'?' && y == b'?' {
+            let Ok(path) = std::str::from_utf8(&field[3..]) else {
+                continue;
+            };
+            if path.is_empty() {
+                continue;
             }
-        };
-        if status == "deleted" {
-            // keep path as-is
+            out.push(ChangedFile {
+                path: path.to_string(),
+                status: "untracked".to_string(),
+                additions: 0,
+                deletions: 0,
+                binary: false,
+            });
+            continue;
         }
+        if x == b'!' && y == b'!' {
+            continue;
+        }
+        let is_rename = x == b'R' || y == b'R';
+        let is_copy = x == b'C' || y == b'C';
+        if is_rename || is_copy {
+            // `-z` rename/copy: `XY new\0old\0`. Always consume the extra
+            // source field even when the destination is skipped below.
+            let _old = fields.next();
+            let Ok(path) = std::str::from_utf8(&field[3..]) else {
+                continue;
+            };
+            if path.is_empty() {
+                continue;
+            }
+            out.push(ChangedFile {
+                path: path.to_string(),
+                status: if is_rename {
+                    "renamed".to_string()
+                } else {
+                    "copied".to_string()
+                },
+                additions: 0,
+                deletions: 0,
+                binary: false,
+            });
+            continue;
+        }
+        let status = match (x as char, y as char) {
+            ('A', _) | (_, 'A') => "added",
+            ('D', _) | (_, 'D') => "deleted",
+            ('T', _) | (_, 'T') => "typechange",
+            ('U', _) | (_, 'U') => "conflicted",
+            _ => "modified",
+        };
+        let Ok(path) = std::str::from_utf8(&field[3..]) else {
+            continue;
+        };
         if path.is_empty() {
             continue;
         }
-        // Strip quoting git may add for unusual names (porcelain -z does not quote).
-        if path.starts_with('"') && path.ends_with('"') && path.len() > 1 {
-            path = path[1..path.len() - 1].to_string();
-        }
         out.push(ChangedFile {
-            path,
+            path: path.to_string(),
             status: status.to_string(),
             additions: 0,
             deletions: 0,
@@ -782,29 +914,41 @@ fn parse_porcelain(data: &[u8]) -> Vec<ChangedFile> {
 }
 
 /// Parse `git diff --numstat -z` → map path → (adds, dels, binary).
+/// Paths are matched bytewise and only valid UTF-8 paths are reported, so two
+/// distinct files can never collapse to one lossy `String` key.
 fn parse_numstat(data: &[u8]) -> std::collections::HashMap<String, (u64, u64, bool)> {
-    let text = String::from_utf8_lossy(data);
-    let mut fields = text.split('\0').peekable();
+    fn split_record(field: &[u8]) -> Option<(&[u8], &[u8], &[u8])> {
+        let mut parts = field.splitn(3, |byte| *byte == b'\t');
+        Some((parts.next()?, parts.next()?, parts.next()?))
+    }
+    let mut fields = data.split(|byte| *byte == 0);
     let mut map = std::collections::HashMap::new();
     while let Some(field) = fields.next() {
         if field.is_empty() {
             continue;
         }
-        let mut parts = field.splitn(3, '\t');
-        let (Some(a), Some(d), Some(p)) = (parts.next(), parts.next(), parts.next()) else {
+        let Some((a, d, p)) = split_record(field) else {
             continue;
         };
-        let binary = a == "-" && d == "-";
-        let adds = a.parse::<u64>().unwrap_or(0);
-        let dels = d.parse::<u64>().unwrap_or(0);
+        let binary = a == b"-" && d == b"-";
+        let parse_count = |raw: &[u8]| {
+            std::str::from_utf8(raw)
+                .ok()
+                .and_then(|text| text.parse::<u64>().ok())
+                .unwrap_or(0)
+        };
+        let adds = parse_count(a);
+        let dels = parse_count(d);
         if p.is_empty() {
             // Rename: next two NUL fields are old path then new path.
             let _old_path = fields.next();
-            let new_path = fields.next().unwrap_or("").to_string();
+            let new_path = fields.next().unwrap_or_default();
             if !new_path.is_empty() {
-                map.insert(new_path, (adds, dels, binary));
+                if let Ok(new_path) = std::str::from_utf8(new_path) {
+                    map.insert(new_path.to_string(), (adds, dels, binary));
+                }
             }
-        } else {
+        } else if let Ok(p) = std::str::from_utf8(p) {
             map.insert(p.to_string(), (adds, dels, binary));
         }
     }
@@ -815,9 +959,7 @@ fn parse_numstat(data: &[u8]) -> std::collections::HashMap<String, (u64, u64, bo
 /// so hashing semantics never drift. The reader is streamed in fixed-size
 /// chunks, keeping memory bounded even for multi-gigabyte worktree files.
 fn hash_reader(cwd: &Path, reader: &mut impl std::io::Read) -> AppResult<String> {
-    let mut child = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
+    let mut child = git_command(cwd)
         .args(["hash-object", "--stdin"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -865,6 +1007,52 @@ fn hash_file(cwd: &Path, abs: &Path) -> AppResult<String> {
         Err(e) => Err(AppError::new(format!("Could not read file: {e}"))),
     }
 }
+/// Read the HEAD blob through the worktree filter path (`text`/`eol`
+/// attributes, `core.autocrlf`) so the old side of the diff matches how the
+/// file materializes in the worktree. Returns `None` when filters do not
+/// apply, letting the caller keep the raw blob.
+fn old_through_filters(root: &Path, rel: &str, object: &str) -> Option<Vec<u8>> {
+    let out = git(
+        root,
+        &["cat-file", "--filters", &format!("--path={rel}"), object],
+    )
+    .ok()?;
+    if !out.status.success() || !out.stderr.is_empty() {
+        return None;
+    }
+    Some(out.stdout)
+}
+
+/// Read reviewable bytes and their content hash from one open descriptor.
+/// On Unix the descriptor comes from the existing no-follow checked-file
+/// helpers, so a symlink swap between the link check and the read cannot
+/// serve bytes from outside the repository. On other platforms the same
+/// `hash_file` bytes are used for both identity and content.
+#[cfg(unix)]
+fn read_reviewed_bytes(root: &Path, abs: &Path) -> AppResult<(Vec<u8>, String)> {
+    use std::io::Read;
+    let mut file = open_checked_file_no_create(root, abs)?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| AppError::new(format!("Could not inspect file: {e}")))?;
+    if !metadata.is_file() {
+        return Err(AppError::new("Only regular files can be reviewed."));
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|e| AppError::new(format!("Could not read file: {e}")))?;
+    let hash = hash_reader(root, &mut &bytes[..])?;
+    Ok((bytes, hash))
+}
+
+#[cfg(not(unix))]
+fn read_reviewed_bytes(root: &Path, abs: &Path) -> AppResult<(Vec<u8>, String)> {
+    let bytes =
+        std::fs::read(abs).map_err(|e| AppError::new(format!("Could not read file: {e}")))?;
+    let hash = hash_reader(root, &mut &bytes[..])?;
+    Ok((bytes, hash))
+}
+
 pub fn file(cwd: &Path, rel: &str) -> AppResult<GitFile> {
     let root = repo_root(cwd)?;
     let abs = validate_repo_path_at(&root, rel)?;
@@ -887,41 +1075,47 @@ pub fn file(cwd: &Path, rel: &str) -> AppResult<GitFile> {
         .and_then(|size| size.trim().parse::<u64>().ok());
     let mut old_too_large = old_size.is_some_and(|size| size > MAX_FILE_BYTES);
     let old = if old_size.is_some() && !old_too_large {
-        let bytes = git_ok(&root, &["show", &object])?;
+        // Prefer the worktree-filtered bytes; keep the raw blob only when
+        // filters are irrelevant or fail.
+        let filtered = old_through_filters(&root, rel, &object);
+        let raw;
+        let bytes = match filtered.as_ref() {
+            Some(bytes) => bytes,
+            None => {
+                raw = git_ok(&root, &["show", &object])?;
+                &raw
+            }
+        };
         if bytes.len() as u64 > MAX_FILE_BYTES {
             old_too_large = true;
             Vec::new()
         } else {
-            bytes
+            bytes.clone()
         }
     } else {
         Vec::new()
     };
-    let meta = match std::fs::metadata(&abs) {
+    let meta = match std::fs::symlink_metadata(&abs) {
         Ok(meta) => Some(meta),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(AppError::new(format!("Could not inspect file: {e}"))),
     };
-    let (current_bytes, cur_too_large) = match &meta {
-        Some(m) if m.is_file() => {
-            if m.len() > MAX_FILE_BYTES {
-                (Vec::new(), true)
-            } else {
-                (
-                    std::fs::read(&abs)
-                        .map_err(|e| AppError::new(format!("Could not read file: {e}")))?,
-                    false,
-                )
-            }
+    // The no-follow reader fails closed on symlinks/directories, so a swap
+    // between `linked_entry` and this read surfaces as an error rather than
+    // outside-repo bytes.
+    let (current_bytes, cur_too_large, current_hash) = match &meta {
+        Some(m) if m.len() > MAX_FILE_BYTES => (Vec::new(), true, hash_file(&root, &abs)?),
+        Some(_) => {
+            let (bytes, hash) = read_reviewed_bytes(&root, &abs)?;
+            (bytes, false, hash)
         }
-        _ => (Vec::new(), false),
+        None => (Vec::new(), false, hash_bytes(&root, b"")?),
     };
     let too_large = cur_too_large || old_too_large;
     let binary = util::looks_binary(&current_bytes)
         || util::looks_binary(&old)
         || std::str::from_utf8(&current_bytes).is_err()
         || std::str::from_utf8(&old).is_err();
-    let current_hash = hash_file(&root, &abs)?;
     let (old, current) = if binary || too_large {
         (String::new(), String::new())
     } else {
@@ -941,7 +1135,7 @@ pub fn file(cwd: &Path, rel: &str) -> AppResult<GitFile> {
 }
 
 fn staged_rename_source(root: &Path, new_path: &str) -> AppResult<Option<String>> {
-    let data = match git(
+    let data = match git_ok_capped(
         root,
         &[
             "diff",
@@ -952,8 +1146,9 @@ fn staged_rename_source(root: &Path, new_path: &str) -> AppResult<Option<String>
             "HEAD",
             "--",
         ],
+        MAX_CHANGED_FILE_OUTPUT_BYTES,
     ) {
-        Ok(output) if output.status.success() => output.stdout,
+        Ok(data) => data,
         _ => return Ok(None),
     };
     let mut fields = data
@@ -970,7 +1165,10 @@ fn staged_rename_source(root: &Path, new_path: &str) -> AppResult<Option<String>
         }
         let new = fields.next().unwrap_or_default();
         if status.first() == Some(&b'R') && new == new_path.as_bytes() {
-            return Ok(Some(String::from_utf8_lossy(first).into_owned()));
+            let Ok(source) = std::str::from_utf8(first) else {
+                return Ok(None);
+            };
+            return Ok(Some(source.to_owned()));
         }
     }
     Ok(None)
@@ -978,22 +1176,85 @@ fn staged_rename_source(root: &Path, new_path: &str) -> AppResult<Option<String>
 
 /// Revert one file to HEAD. Files absent from HEAD are moved to Trash, never
 /// permanently deleted as an implicit fallback. Staged additions are unstaged.
-pub fn revert_file(cwd: &Path, rel: &str) -> AppResult<()> {
+/// When `expected_hash` is `Some`, the current worktree bytes are hashed
+/// (the same hash as `GitFile.currentHash`) immediately before any
+/// destructive step and a mismatch aborts with a refresh error.
+pub fn revert_file(cwd: &Path, rel: &str, expected_hash: Option<&str>) -> AppResult<()> {
+    revert_file_guarded(cwd, rel, expected_hash)
+}
+
+/// Snapshot the worktree bytes for the revert guard through `hash_file`, the
+/// same hash used for `GitFile.currentHash` (absent paths hash as empty).
+fn revert_snapshot(root: &Path, abs: &Path) -> AppResult<String> {
+    hash_file(root, abs)
+}
+
+/// Verify the current worktree bytes still match the caller's hash immediately
+/// before any destructive git/filesystem action.
+fn check_revert_guard(root: &Path, abs: &Path, expected_hash: Option<&str>) -> AppResult<()> {
+    if let Some(expected) = expected_hash {
+        let current = match revert_snapshot(root, abs) {
+            Ok(hash) => hash,
+            // A symlink swap or unreadable file fails closed with the same
+            // refresh message rather than proceeding destructively.
+            Err(_) => {
+                return Err(AppError::new(
+                    "The file changed on disk; refresh the file list and try again.",
+                ));
+            }
+        };
+        if current != expected {
+            return Err(AppError::new(
+                "The file changed on disk; refresh the file list and try again.",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Reject gitlink (submodule) entries. `git checkout HEAD -- <rel>` can leave
+/// a changed submodule dirty while reporting success, so revert refuses them
+/// instead of reporting Ok while the entry stays dirty.
+fn reject_gitlink(root: &Path, rel: &str) -> AppResult<()> {
+    for args in [
+        ["ls-files", "--stage", "--", rel],
+        ["ls-tree", "HEAD", "--", rel],
+    ] {
+        let output = git(root, &args)?;
+        if output.status.success() && output.stdout.starts_with(b"160000 ") {
+            return Err(AppError::new(
+                "Submodule changes cannot be reverted file-by-file. Revert the submodule from its own checkout.",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn revert_file_guarded(cwd: &Path, rel: &str, expected_hash: Option<&str>) -> AppResult<()> {
     let root = repo_root(cwd)?;
     let abs = validate_repo_path_at(&root, rel)?;
     ensure_changed_path_at(&root, rel)?;
+    reject_gitlink(&root, rel)?;
+    // Early mismatch check before the read-only probes below; every
+    // destructive branch re-checks immediately before mutating, so a change
+    // between this probe and the destructive step still aborts.
+    check_revert_guard(&root, &abs, expected_hash)?;
     let in_head = git(&root, &["cat-file", "-e", &format!("HEAD:{rel}")])
         .map(|o| o.status.success())
         .unwrap_or(false);
     if in_head {
+        check_revert_guard(&root, &abs, expected_hash)?;
         git_ok(&root, &["checkout", "HEAD", "--", rel])?;
         return Ok(());
     }
 
     // A staged rename has a source path in HEAD even though the destination
     // does not. Restore that source only when it will not overwrite new work.
+    // The checkout below only creates the absent source path; the guard on
+    // `rel` runs after these read-only probes, immediately before the first
+    // destructive step touching `rel`.
     let rename_source = staged_rename_source(&root, rel)?;
-    let mut restored_source = None;
+    let mut restored_source: Option<(PathBuf, String)> = None;
     if let Some(source) = rename_source.as_deref() {
         let source_abs = validate_repo_path_at(&root, source)?;
         if std::fs::symlink_metadata(&source_abs).is_ok() {
@@ -1002,7 +1263,10 @@ pub fn revert_file(cwd: &Path, rel: &str) -> AppResult<()> {
             ));
         }
         git_ok(&root, &["checkout", "HEAD", "--", source])?;
-        restored_source = Some(source_abs);
+        // Identity of the bytes this operation restored, so rollback below
+        // never permanently deletes work another process wrote afterwards.
+        let restored_hash = hash_file(&root, &source_abs)?;
+        restored_source = Some((source_abs, restored_hash));
     }
 
     // A new file may be staged, untracked, or a dangling symlink. Reject a
@@ -1021,12 +1285,22 @@ pub fn revert_file(cwd: &Path, rel: &str) -> AppResult<()> {
         .status
         .success();
     if staged {
+        check_revert_guard(&root, &abs, expected_hash)?;
         git_ok(&root, &["rm", "-f", "--cached", "--", rel])?;
     }
     if exists {
+        check_revert_guard(&root, &abs, expected_hash)?;
         if let Err(error) = trash::delete(&abs) {
-            if let Some(source_abs) = &restored_source {
-                let _ = std::fs::remove_file(source_abs);
+            if let Some((source_abs, restored_hash)) = &restored_source {
+                // Only remove the source this operation restored, and only
+                // when it still holds those bytes; otherwise leave the
+                // recreated work in place and report the Trash failure.
+                let still_ours = hash_file(&root, source_abs)
+                    .map(|hash| &hash == restored_hash)
+                    .unwrap_or(false);
+                if still_ours {
+                    let _ = trash::delete(source_abs);
+                }
                 if let Some(source) = rename_source.as_deref() {
                     let _ = git(&root, &["rm", "-f", "--cached", "--", source]);
                 }
@@ -1173,6 +1447,41 @@ mod tests {
         assert!(!map.contains_key("oldname.txt"));
     }
 
+    /// `-z` porcelain never quotes: a file literally named `"secret"` must
+    /// not collapse onto `secret`.
+    #[test]
+    fn porcelain_keeps_literal_quotes() {
+        let data = b" M \"secret\"\0";
+        let files = parse_porcelain(data);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "\"secret\"");
+        assert_eq!(files[0].status, "modified");
+    }
+
+    /// Rename/copy detection looks at both columns: a worktree rename (`RM`)
+    /// still consumes the extra source field.
+    #[test]
+    fn porcelain_worktree_rename_consumes_source() {
+        let data = b"RM new.txt\0old.txt\0 M keep.txt\0";
+        let files = parse_porcelain(data);
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].path, "new.txt");
+        assert_eq!(files[0].status, "renamed");
+        assert_eq!(files[1].path, "keep.txt");
+        assert_eq!(files[1].status, "modified");
+    }
+
+    /// Non-UTF-8 paths are skipped so two distinct files can never share one
+    /// lossy `String` key.
+    #[test]
+    fn porcelain_skips_non_utf8_paths() {
+        let mut data = b" M ok.txt\0".to_vec();
+        data.extend_from_slice(b" M \xff.txt\0");
+        let files = parse_porcelain(&data);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "ok.txt");
+    }
+
     /// Path validation rejects escapes and accepts normal relative paths.
     #[test]
     fn repo_path_validation() {
@@ -1302,8 +1611,23 @@ mod tests {
         assert!(status(&dir).unwrap().files.is_empty());
 
         std::fs::write(&path, "alpha\ndelta\n").unwrap();
-        revert_file(&dir, "example.txt").unwrap();
+        revert_file(&dir, "example.txt", None).unwrap();
         assert!(status(&dir).unwrap().files.is_empty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "alpha\nbeta\n");
+
+        // The hash-guarded revert refuses to discard an edit made after the
+        // diff was read, and succeeds while the caller's hash still matches.
+        std::fs::write(&path, "alpha\nepsilon\n").unwrap();
+        let stale = file(&dir, "example.txt").unwrap();
+        std::fs::write(&path, "alpha\nzeta\n").unwrap();
+        let error = revert_file(&dir, "example.txt", Some(&stale.current_hash)).unwrap_err();
+        assert!(
+            error.to_string().contains("changed on disk"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "alpha\nzeta\n");
+        let fresh = file(&dir, "example.txt").unwrap();
+        revert_file(&dir, "example.txt", Some(&fresh.current_hash)).unwrap();
         assert_eq!(std::fs::read_to_string(path).unwrap(), "alpha\nbeta\n");
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -1459,7 +1783,7 @@ mod tests {
         write_if_unchanged(&subdir, "root.txt", &diff.current_hash, "base\n").unwrap();
         assert!(status(&subdir).unwrap().files.is_empty());
         std::fs::write(root.join("root.txt"), "again\n").unwrap();
-        revert_file(&subdir, "root.txt").unwrap();
+        revert_file(&subdir, "root.txt", None).unwrap();
         assert_eq!(
             std::fs::read_to_string(root.join("root.txt")).unwrap(),
             "base\n"
@@ -1502,7 +1826,7 @@ mod tests {
             .status()
             .unwrap()
             .success());
-        revert_file(&root, "new.txt").unwrap();
+        revert_file(&root, "new.txt", None).unwrap();
         assert!(!root.join("new.txt").exists());
         assert_eq!(
             std::fs::read_to_string(root.join("old.txt")).unwrap(),

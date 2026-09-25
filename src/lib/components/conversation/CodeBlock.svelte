@@ -2,7 +2,6 @@
   import { onDestroy } from 'svelte';
   import { Check, Copy } from '@lucide/svelte';
   import { highlightCode, plainCodeHtml } from './highlight';
-  import { sanitizeHtml } from './markdown';
 
   interface Props {
     code: string;
@@ -27,7 +26,7 @@
     html = null;
     let stale = false;
     void highlightCode(source, language).then((result) => {
-      if (!stale) html = result ? sanitizeHtml(result) : null;
+      if (!stale) html = result;
     });
     return () => {
       stale = true;
@@ -68,9 +67,10 @@
 
 <style>
   .code-block {
-    margin: 6px 0;
+    position: relative;
+    margin: 10px 0;
     border: 1px solid var(--line);
-    border-radius: var(--radius);
+    border-radius: var(--radius-lg);
     background: var(--surface);
     overflow: hidden;
   }
@@ -78,47 +78,58 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 3px 6px 3px 10px;
+    height: 30px;
+    padding: 0 6px 0 12px;
     border-bottom: 1px solid var(--line);
-    background: var(--surface-2);
   }
   .lang {
-    font-size: 10px;
-    color: var(--muted);
-    text-transform: lowercase;
-    letter-spacing: 0.04em;
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--subtle);
   }
   .copy {
     display: inline-flex;
     align-items: center;
-    padding: 3px;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
     border: 0;
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     background: transparent;
-    color: var(--muted);
+    color: var(--subtle);
+    opacity: 0;
+    transition: opacity 0.12s;
+  }
+  .code-block:hover .copy,
+  .copy:focus-visible {
+    opacity: 1;
   }
   .copy:hover {
     color: var(--text);
-    background: var(--surface-3);
+    background: var(--surface-2);
   }
   .shiki-wrap {
     overflow-x: auto;
-    font-size: 12px;
-    line-height: 1.5;
+    font-size: 12.5px;
+    line-height: 1.6;
   }
   .shiki-wrap :global(pre) {
     margin: 0;
-    padding: 8px 10px;
+    padding: 10px 14px 12px;
     background: transparent !important;
   }
   .shiki-wrap :global(code) {
     font-family: var(--mono);
+    padding: 0;
+    background: transparent;
+    border-radius: 0;
+    font-size: inherit;
   }
-  /* Dual-theme shiki output: pick the variable matching the app theme. */
+  /* Dual-theme shiki output: pick the variable matching the app theme. Only
+     foreground styling; token spans must never paint their own background. */
   .shiki-wrap :global(.shiki),
   .shiki-wrap :global(.shiki span) {
     color: var(--shiki-dark);
-    background-color: var(--shiki-dark-bg);
     font-style: var(--shiki-dark-font-style);
     font-weight: var(--shiki-dark-font-weight);
     text-decoration: var(--shiki-dark-text-decoration);
@@ -127,7 +138,6 @@
     :global(:root:not([data-theme='dark'])) .shiki-wrap :global(.shiki),
     :global(:root:not([data-theme='dark'])) .shiki-wrap :global(.shiki span) {
       color: var(--shiki-light);
-      background-color: var(--shiki-light-bg);
       font-style: var(--shiki-light-font-style);
       font-weight: var(--shiki-light-font-weight);
       text-decoration: var(--shiki-light-text-decoration);
@@ -136,7 +146,6 @@
   :global(:root[data-theme='light']) .shiki-wrap :global(.shiki),
   :global(:root[data-theme='light']) .shiki-wrap :global(.shiki span) {
     color: var(--shiki-light);
-    background-color: var(--shiki-light-bg);
     font-style: var(--shiki-light-font-style);
     font-weight: var(--shiki-light-font-weight);
     text-decoration: var(--shiki-light-text-decoration);

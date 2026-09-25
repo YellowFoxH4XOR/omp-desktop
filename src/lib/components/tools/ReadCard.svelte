@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { FileText } from '@lucide/svelte';
   import ToolShell from './ToolShell.svelte';
   import {
     argPath,
@@ -41,7 +42,7 @@
   const shownOutput = $derived(truncated ? `${output.slice(0, 3000)}\n…` : output);
 </script>
 
-<ToolShell status={item.status} failed={item.status === 'failed' || item.result?.isError === true} meta={meta || undefined}>
+<ToolShell icon={FileText} status={item.status} failed={item.status === 'failed' || item.result?.isError === true} meta={meta || undefined}>
   {#snippet summary()}
     <span class="line">Read <code class="c">{preview(path, 80)}</code></span>
   {/snippet}

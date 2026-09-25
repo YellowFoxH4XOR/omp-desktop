@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { FilePen, FilePlus2 } from '@lucide/svelte';
   import ToolShell from './ToolShell.svelte';
   import {
     argPath,
@@ -52,7 +53,7 @@
   const shownOutput = $derived(truncated ? `${output.slice(0, 2000)}\n…` : output);
 </script>
 
-<ToolShell status={item.status} failed={item.status === 'failed' || item.result?.isError === true} meta={meta || undefined}>
+<ToolShell icon={write ? FilePlus2 : FilePen} status={item.status} failed={item.status === 'failed' || item.result?.isError === true} meta={meta || undefined}>
   {#snippet summary()}
     <span class="line">{verb} <code class="c">{preview(path || item.toolName, 80)}</code></span>
   {/snippet}

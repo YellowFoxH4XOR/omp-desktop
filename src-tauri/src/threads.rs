@@ -31,6 +31,13 @@ const PI_READY_TIMEOUT_SECS: u64 = 45;
 const LOGIN_TIMEOUT_SECS: u64 = 600;
 /// Hard cap prevents an unbounded number of live harness process trees.
 const MAX_LIVE_THREADS: usize = 16;
+/// Aggregate budgets for OMP message-history pagination.
+const MAX_HISTORY_PAGES: usize = 64;
+const MAX_HISTORY_MESSAGES: usize = 16_384;
+const MAX_HISTORY_BYTES: usize = 32 * 1024 * 1024;
+/// Pi can acknowledge a prompt before its turn emits `agent_start`. The
+/// checkout reservation is held this long waiting for the turn to appear.
+const PI_PROMPT_SETTLE_SECS: u64 = 30;
 /// Same-thread prompts are serialized so an older failed/reservation release
 /// cannot tear down a newer accepted turn.
 
@@ -43,9 +50,10 @@ pub struct LiveThread {
     streaming: AtomicBool,
     failed: AtomicBool,
     active_subagents: Mutex<std::collections::HashSet<String>>,
-    /// Ids of interactive extension_ui_request frames (select, confirm,
-    /// input, editor) still waiting on an extension_ui_response.
-    pending_ui_requests: Mutex<std::collections::HashSet<String>>,
+    /// Interactive extension_ui_request frames (select, confirm, input,
+    /// editor, permission) still waiting on an extension_ui_response, mapped
+    /// to the requested method so answers can be validated before sending.
+    pending_ui_requests: Mutex<HashMap<String, String>>,
     /// Ids of fire-and-forget extension_ui_request frames (open_url, widgets)
     /// that never expect an extension_ui_response.
     ui_fire_and_forget: Mutex<std::collections::HashSet<String>>,
@@ -89,6 +97,45 @@ fn merge_agents(mut current: Vec<AgentInfo>, history: Vec<AgentInfo>) -> Vec<Age
     }
     current
 }
+/// Serialization shared by prompts, stops, and idle suspension. The watcher's
+/// delayed task runs without a `ThreadManager` handle, so the map lives in
+/// static storage and every path takes the same entry. Prompt takes `prompt`,
+/// stop/idle take `prompt` then `lifecycle` in the same order. Entries are
+/// reaped when uncontended so both the manager map and this map stay
+/// O(active threads).
+fn shared_locks_map() -> &'static Mutex<HashMap<String, Arc<ThreadLocks>>> {
+    static LOCKS: std::sync::LazyLock<Mutex<HashMap<String, Arc<ThreadLocks>>>> =
+        std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+    &LOCKS
+}
+
+fn shared_locks(thread_id: &str) -> Arc<ThreadLocks> {
+    shared_locks_map()
+        .lock()
+        .entry(thread_id.to_string())
+        .or_insert_with(|| {
+            Arc::new(ThreadLocks {
+                lifecycle: AsyncMutex::new(()),
+                prompt: AsyncMutex::new(()),
+            })
+        })
+        .clone()
+}
+
+/// Drop a shared-lock entry when nobody else can be holding it. Every clone
+/// happens under the map lock, so a concurrent holder blocks reaping and a
+/// later caller transparently creates a fresh entry.
+fn reap_shared_locks(thread_id: &str, locks: &Arc<ThreadLocks>) {
+    let mut map = shared_locks_map().lock();
+    if map
+        .get(thread_id)
+        .is_some_and(|entry| Arc::ptr_eq(entry, locks))
+        && Arc::strong_count(locks) == 2
+    {
+        map.remove(thread_id);
+    }
+}
+
 /// Link saved top-level subagents back to their parent task call so the
 /// delegation card remains useful after resuming a session.
 fn attach_task_metadata(agents: &mut [AgentInfo], messages: &[Value]) {
@@ -191,16 +238,12 @@ fn resume_arguments(
         }),
     }
 }
-
 pub struct ThreadManager {
     store: Arc<Store>,
     registry: Arc<HarnessRegistry>,
     watcher: Arc<WatcherManager>,
     app: AppHandle,
     live: Arc<Mutex<HashMap<String, Arc<LiveThread>>>>,
-    /// One async lock per thread serializes spawn/stop and prompt calls. The
-    /// entry is retained so stop/shutdown can join an in-flight spawn.
-    lifecycles: Arc<Mutex<HashMap<String, Arc<ThreadLocks>>>>,
     next_generation: AtomicU64,
     /// Exclusive owner of a non-isolated checkout. A reservation is made
     /// before a prompt starts and lives until that turn becomes terminal or
@@ -228,36 +271,11 @@ impl ThreadManager {
             watcher,
             app,
             live: Arc::new(Mutex::new(HashMap::new())),
-            lifecycles: Arc::new(Mutex::new(HashMap::new())),
             next_generation: AtomicU64::new(1),
             checkout_owners: Arc::new(Mutex::new(HashMap::new())),
             shutting_down: AtomicBool::new(false),
             live_admissions: Mutex::new(0),
         })
-    }
-    fn touch_activity(&self, thread_id: &str) {
-        if let Some(l) = self.live.lock().get(thread_id) {
-            l.note_activity();
-        }
-    }
-
-    fn set_streaming(&self, thread_id: &str, streaming: bool) {
-        if let Some(l) = self.live.lock().get(thread_id) {
-            l.streaming.store(streaming, Ordering::SeqCst);
-            l.note_activity();
-        }
-    }
-    fn thread_locks(&self, thread_id: &str) -> Arc<ThreadLocks> {
-        self.lifecycles
-            .lock()
-            .entry(thread_id.to_string())
-            .or_insert_with(|| {
-                Arc::new(ThreadLocks {
-                    lifecycle: AsyncMutex::new(()),
-                    prompt: AsyncMutex::new(()),
-                })
-            })
-            .clone()
     }
 
     fn admit_live(&self, thread_id: &str) -> AppResult<()> {
@@ -285,6 +303,28 @@ impl ThreadManager {
         util::resolve_path(Path::new(cwd))
             .to_string_lossy()
             .into_owned()
+    }
+
+    fn touch_activity(&self, thread_id: &str) {
+        if let Some(l) = self.live.lock().get(thread_id) {
+            l.note_activity();
+        }
+    }
+
+    fn set_streaming(&self, thread_id: &str, streaming: bool) {
+        if let Some(l) = self.live.lock().get(thread_id) {
+            l.streaming.store(streaming, Ordering::SeqCst);
+            l.note_activity();
+        }
+    }
+
+    fn live_client(&self, thread_id: &str) -> Option<Arc<RpcClient>> {
+        self.live.lock().get(thread_id).map(|l| l.client.clone())
+    }
+
+    /// Client for a thread, spawning the process when needed.
+    async fn client_for(&self, thread_id: &str) -> AppResult<Arc<RpcClient>> {
+        Ok(self.ensure_running(thread_id).await?.client.clone())
     }
 
     /// Atomically acquire a checkout for an active turn. The owner remains
@@ -438,11 +478,15 @@ impl ThreadManager {
     /// Spawn (or resume) the harness process for a thread. Returns the live
     /// handle. Idempotent: returns the existing process when still running.
     pub async fn ensure_running(&self, thread_id: &str) -> AppResult<Arc<LiveThread>> {
-        // Register the lifecycle before checking the shutdown flag. This makes
-        // shutdown_all's snapshot include every operation that passed the
-        // pre-shutdown check, while the second check still prevents spawning
-        // once shutdown has started.
-        let locks = self.thread_locks(thread_id);
+        // Validate before inserting so repeated calls with unknown ids can
+        // never grow the map; every clone happens under the map lock so an
+        // uncontended entry can be reaped safely. Register the lifecycle
+        // before checking the shutdown flag. This makes shutdown_all's
+        // snapshot include every operation that passed the pre-shutdown
+        // check, while the second check still prevents spawning once
+        // shutdown has started.
+        self.store.get_thread(thread_id)?;
+        let locks = shared_locks(thread_id);
         if self.shutting_down.load(Ordering::SeqCst) {
             return Err(AppError::new("The app is shutting down."));
         }
@@ -572,11 +616,23 @@ impl ThreadManager {
                 else {
                     return;
                 };
+                // A stop/restart on another thread can replace the live process
+                // between any two statements below. Re-check that this frame's
+                // generation is still live immediately before every shared side
+                // effect; a stale frame must never mutate its replacement.
+                let is_current = || {
+                    live_ev
+                        .lock()
+                        .get(&tid_ev)
+                        .is_some_and(|current| Arc::ptr_eq(current, &l))
+                };
                 match ftype {
                     "agent_start" => {
                         l.streaming.store(true, Ordering::SeqCst);
                         l.failed.store(false, Ordering::SeqCst);
-                        let _ = store_ev.update_thread_status(&tid_ev, "active");
+                        if is_current() {
+                            let _ = store_ev.update_thread_status(&tid_ev, "active");
+                        }
                     }
                     "agent_end" => {
                         let pi = store_ev
@@ -585,7 +641,9 @@ impl ThreadManager {
                             .is_some_and(|row| row.harness == HarnessKind::Pi);
                         // Pi can still compact or drain queued handlers after agent_end.
                         if pi {
-                            l.note_activity();
+                            if is_current() {
+                                l.note_activity();
+                            }
                         } else if frame.get("isTerminal") != Some(&Value::Bool(false))
                             && frame.get("willRetry") != Some(&Value::Bool(true))
                         {
@@ -597,8 +655,10 @@ impl ThreadManager {
                             } else {
                                 "completed"
                             };
-                            let _ = store_ev.update_thread_status(&tid_ev, status);
-                            if status != "active" {
+                            if is_current() {
+                                let _ = store_ev.update_thread_status(&tid_ev, status);
+                            }
+                            if status != "active" && is_current() {
                                 release_owner(&checkout_owners_ev, &cwd_ev, &tid_ev);
                             }
                         }
@@ -612,8 +672,10 @@ impl ThreadManager {
                         } else {
                             "completed"
                         };
-                        let _ = store_ev.update_thread_status(&tid_ev, status);
-                        if status != "active" {
+                        if is_current() {
+                            let _ = store_ev.update_thread_status(&tid_ev, status);
+                        }
+                        if status != "active" && is_current() {
                             release_owner(&checkout_owners_ev, &cwd_ev, &tid_ev);
                         }
                     }
@@ -636,16 +698,24 @@ impl ThreadManager {
                     {
                         l.streaming.store(false, Ordering::SeqCst);
                         l.failed.store(true, Ordering::SeqCst);
-                        let _ = store_ev.update_thread_status(&tid_ev, "failed");
-                        release_owner(&checkout_owners_ev, &cwd_ev, &tid_ev);
+                        if is_current() {
+                            let _ = store_ev.update_thread_status(&tid_ev, "failed");
+                        }
+                        if is_current() {
+                            release_owner(&checkout_owners_ev, &cwd_ev, &tid_ev);
+                        }
                     }
                     "prompt_result"
                         if frame.get("agentInvoked").and_then(Value::as_bool) == Some(false) =>
                     {
                         l.streaming.store(false, Ordering::SeqCst);
                         l.failed.store(false, Ordering::SeqCst);
-                        let _ = store_ev.update_thread_status(&tid_ev, "completed");
-                        release_owner(&checkout_owners_ev, &cwd_ev, &tid_ev);
+                        if is_current() {
+                            let _ = store_ev.update_thread_status(&tid_ev, "completed");
+                        }
+                        if is_current() {
+                            release_owner(&checkout_owners_ev, &cwd_ev, &tid_ev);
+                        }
                     }
                     "subagent_lifecycle" => {
                         if let Some(payload) = frame.get("payload") {
@@ -667,19 +737,28 @@ impl ThreadManager {
                             } else {
                                 "completed"
                             };
-                            let _ = store_ev.update_thread_status(&tid_ev, status);
-                            if status != "active" {
+                            if is_current() {
+                                let _ = store_ev.update_thread_status(&tid_ev, status);
+                            }
+                            if status != "active" && is_current() {
                                 release_owner(&checkout_owners_ev, &cwd_ev, &tid_ev);
                             }
                         }
                     }
                     "extension_ui_request" => {
                         let method = frame.get("method").and_then(Value::as_str).unwrap_or("");
-                        if matches!(method, "select" | "confirm" | "input" | "editor") {
+                        if matches!(
+                            method,
+                            "select" | "confirm" | "input" | "editor" | "permission"
+                        ) {
                             if let Some(id) = frame.get("id").and_then(Value::as_str) {
-                                l.pending_ui_requests.lock().insert(id.to_string());
+                                l.pending_ui_requests
+                                    .lock()
+                                    .insert(id.to_string(), method.to_string());
                             }
-                            let _ = store_ev.update_thread_status(&tid_ev, "waiting");
+                            if is_current() {
+                                let _ = store_ev.update_thread_status(&tid_ev, "waiting");
+                            }
                         }
                         if method == "cancel" {
                             let target = frame
@@ -692,9 +771,14 @@ impl ThreadManager {
                             }
                             if l.pending_ui_requests.lock().is_empty()
                                 && !l.streaming.load(Ordering::SeqCst)
+                                && l.active_subagents.lock().is_empty()
                             {
-                                let _ = store_ev.update_thread_status(&tid_ev, "completed");
-                                release_owner(&checkout_owners_ev, &cwd_ev, &tid_ev);
+                                if is_current() {
+                                    let _ = store_ev.update_thread_status(&tid_ev, "completed");
+                                }
+                                if is_current() {
+                                    release_owner(&checkout_owners_ev, &cwd_ev, &tid_ev);
+                                }
                             }
                         }
                         if matches!(
@@ -717,14 +801,16 @@ impl ThreadManager {
                     }
                     _ => {}
                 }
-                l.note_activity();
-                let _ = app_ev.emit(
-                    "desktop-event",
-                    BackendEvent::Rpc {
-                        thread_id: tid_ev.clone(),
-                        frame: normalize_outgoing_frame(frame),
-                    },
-                );
+                if is_current() {
+                    l.note_activity();
+                    let _ = app_ev.emit(
+                        "desktop-event",
+                        BackendEvent::Rpc {
+                            thread_id: tid_ev.clone(),
+                            frame: normalize_outgoing_frame(frame),
+                        },
+                    );
+                }
             }),
             on_exit: Box::new(move |code: Option<i32>, stderr: String, expected: bool| {
                 let mut map = live_map.lock();
@@ -779,7 +865,7 @@ impl ThreadManager {
             streaming: AtomicBool::new(false),
             failed: AtomicBool::new(false),
             active_subagents: Mutex::new(std::collections::HashSet::new()),
-            pending_ui_requests: Mutex::new(std::collections::HashSet::new()),
+            pending_ui_requests: Mutex::new(HashMap::new()),
             ui_fire_and_forget: Mutex::new(std::collections::HashSet::new()),
             activity: Notify::new(),
             idle_watch: Mutex::new(None),
@@ -926,36 +1012,73 @@ impl ThreadManager {
     }
 
     /// Graceful stop: SIGTERM → SIGKILL; emits `exited` with expected=true.
+    /// The live entry is removed first so a failed stop never blocks a fresh
+    /// spawn, but the checkout stays reserved and the status stays `active`
+    /// until the harness is confirmed dead: callers (and `restart()`) must
+    /// not treat an unconfirmed stop as success.
     pub async fn stop(&self, thread_id: &str) -> AppResult<()> {
-        let locks = self.thread_locks(thread_id);
+        // Stopping an already-removed thread must still kill its process, so
+        // a live handle bypasses store validation and goes straight to the
+        // map; an unknown id without a handle fails closed with no insert.
+        // Every clone happens under the map lock so uncontended entries can
+        // be reaped safely when the stop completes.
+        let locks = if self.live.lock().contains_key(thread_id) {
+            shared_locks(thread_id)
+        } else {
+            self.store.get_thread(thread_id)?;
+            shared_locks(thread_id)
+        };
         let _prompt = locks.prompt.lock().await;
         let _lifecycle = locks.lifecycle.lock().await;
         let live = self.live.lock().remove(thread_id);
-        if let Some(live) = live {
-            live.cancel_idle_watch();
-            live.client.expect_exit();
-            self.watcher.unwatch(thread_id);
-            live.client.shutdown().await;
+        let Some(live) = live else {
+            if self.store.get_thread(thread_id).is_ok() {
+                self.set_status(thread_id, "idle");
+            }
+            drop(_lifecycle);
+            drop(_prompt);
+            reap_shared_locks(thread_id, &locks);
+            return Ok(());
+        };
+        live.cancel_idle_watch();
+        live.client.expect_exit();
+        live.client.shutdown().await;
+        // Give the exit monitor a beat to observe the reaped child before
+        // declaring the stop unconfirmed; the poll loop runs every ~25ms.
+        for _ in 0..40 {
+            if live.client.is_exited() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        if live.client.is_exited() {
             if let Ok(row) = self.store.get_thread(thread_id) {
                 self.release_checkout(&row.cwd, thread_id);
+                self.set_status(thread_id, "idle");
             }
+            drop(_lifecycle);
+            drop(_prompt);
+            reap_shared_locks(thread_id, &locks);
+            return Ok(());
         }
-        self.set_status(thread_id, "idle");
-        Ok(())
+        // Termination unconfirmed: restore the handle so the session stays
+        // cached and retryable, keep the checkout reserved, and fail loudly
+        // instead of letting `restart()` spawn a second harness.
+        self.live.lock().insert(thread_id.to_string(), live);
+        if let Ok(row) = self.store.get_thread(thread_id) {
+            let _ = self.reserve_checkout(&row.cwd, thread_id);
+            self.set_status(thread_id, "active");
+        }
+        Err(AppError::new(
+            "The harness process did not stop. It may still be running — try stopping again.",
+        ))
     }
-    /// Stop then spawn again (crash recovery / user restart).
+    /// Stop then spawn again (crash recovery / user restart). A stop that
+    /// cannot confirm termination keeps the reservation and fails instead
+    /// of spawning a second harness for the same session.
     pub async fn restart(&self, thread_id: &str) -> AppResult<Arc<LiveThread>> {
-        self.stop(thread_id).await.ok();
+        self.stop(thread_id).await?;
         self.ensure_running(thread_id).await
-    }
-
-    fn live_client(&self, thread_id: &str) -> Option<Arc<RpcClient>> {
-        self.live.lock().get(thread_id).map(|l| l.client.clone())
-    }
-
-    /// Client for a thread, spawning the process when needed.
-    async fn client_for(&self, thread_id: &str) -> AppResult<Arc<RpcClient>> {
-        Ok(self.ensure_running(thread_id).await?.client.clone())
     }
 
     // ------------------------------------------------------------------
@@ -1027,6 +1150,7 @@ impl ThreadManager {
         match kind {
             HarnessKind::Omp => {
                 let mut out = Vec::new();
+                let mut out_bytes: usize = 0;
                 let mut cursor: Option<String> = None;
                 let mut cursors = std::collections::HashSet::new();
                 loop {
@@ -1046,6 +1170,7 @@ impl ThreadManager {
                                 .ok_or_else(|| {
                                     AppError::new("OMP returned invalid message history.")
                                 })?;
+                            Self::check_history_budgets(messages)?;
                             return Ok(messages.clone());
                         }
                     };
@@ -1053,12 +1178,27 @@ impl ThreadManager {
                         .get("messages")
                         .and_then(Value::as_array)
                         .ok_or_else(|| AppError::new("OMP returned an invalid message page."))?;
-                    out.extend(messages.iter().cloned());
+                    for message in messages {
+                        let encoded = serde_json::to_vec(message)
+                            .map_err(|_| AppError::new("OMP returned an invalid message page."))?;
+                        out_bytes = out_bytes.saturating_add(encoded.len());
+                        if out.len() + 1 > MAX_HISTORY_MESSAGES || out_bytes > MAX_HISTORY_BYTES {
+                            return Err(AppError::new(
+                                "OMP returned more message history than the app can hold. Ask the harness for a compacted view and try again.",
+                            ));
+                        }
+                        out.push(message.clone());
+                    }
                     match data.get("nextCursor").and_then(Value::as_str) {
                         Some(next) if !next.is_empty() => {
                             if !cursors.insert(next.to_string()) {
                                 return Err(AppError::new(
                                     "OMP repeated a message-history cursor.",
+                                ));
+                            }
+                            if cursors.len() >= MAX_HISTORY_PAGES {
+                                return Err(AppError::new(
+                                    "OMP returned more message-history pages than the app can follow.",
                                 ));
                             }
                             cursor = Some(next.to_string());
@@ -1073,9 +1213,30 @@ impl ThreadManager {
                     .get("messages")
                     .and_then(Value::as_array)
                     .ok_or_else(|| AppError::new("Pi returned invalid message history."))?;
+                Self::check_history_budgets(messages)?;
                 Ok(messages.clone())
             }
         }
+    }
+
+    fn check_history_budgets(messages: &[Value]) -> AppResult<()> {
+        if messages.len() > MAX_HISTORY_MESSAGES {
+            return Err(AppError::new(
+                "The harness returned more message history than the app can hold. Ask it for a compacted view and try again.",
+            ));
+        }
+        let mut bytes: usize = 0;
+        for message in messages {
+            let encoded = serde_json::to_vec(message)
+                .map_err(|_| AppError::new("The harness returned invalid message history."))?;
+            bytes = bytes.saturating_add(encoded.len());
+            if bytes > MAX_HISTORY_BYTES {
+                return Err(AppError::new(
+                    "The harness returned more message history than the app can hold. Ask it for a compacted view and try again.",
+                ));
+            }
+        }
+        Ok(())
     }
 
     async fn fetch_models(&self, client: &Arc<RpcClient>) -> Vec<ModelInfo> {
@@ -1122,7 +1283,8 @@ impl ThreadManager {
     // ------------------------------------------------------------------
 
     pub async fn send_prompt(&self, thread_id: &str, message: &str, mode: &str) -> AppResult<()> {
-        let locks = self.thread_locks(thread_id);
+        self.store.get_thread(thread_id)?;
+        let locks = shared_locks(thread_id);
         let _prompt = locks.prompt.lock().await;
         let row = self.store.get_thread(thread_id)?;
         let key = Self::checkout_key(&row.cwd);
@@ -1164,15 +1326,80 @@ impl ThreadManager {
             .is_some_and(|live| live.is_busy());
         let invoked = match row.harness {
             HarnessKind::Omp => prompt_invokes_agent(row.harness, &data),
-            HarnessKind::Pi => busy,
+            // Pi can ack before its turn emits `agent_start`; the ack alone
+            // must not release the checkout while the turn is about to run.
+            HarnessKind::Pi => true,
         };
         if invoked {
             self.set_status(thread_id, "active");
-        } else {
-            self.set_streaming(thread_id, false);
-            self.set_status(thread_id, "completed");
-            self.release_checkout(&row.cwd, thread_id);
+            self.touch_activity(thread_id);
+            if row.harness == HarnessKind::Pi && !busy && !already_owned {
+                // Pi can ack before its turn emits `agent_start`; the ack alone
+                // must not release the checkout while the turn is about to
+                // run. Hold the reservation and give the turn a bounded window
+                // to declare itself in the background (agent_start sets
+                // streaming/busy; the event handlers release the reservation
+                // on prompt_result or failure). Only a deadline pass with no
+                // turn at all treats the ack as a no-op and releases here,
+                // serialized on the prompt lock so a racing turn wins.
+                let store = self.store.clone();
+                let owners = self.checkout_owners.clone();
+                let live_map = self.live.clone();
+                let tid = thread_id.to_string();
+                let cwd = row.cwd.clone();
+                let key = key.clone();
+                tauri::async_runtime::spawn(async move {
+                    let deadline = Instant::now() + Duration::from_secs(PI_PROMPT_SETTLE_SECS);
+                    while Instant::now() < deadline {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        let state = live_map.lock().get(&tid).map(|live| {
+                            (
+                                live.streaming.load(Ordering::SeqCst),
+                                live.failed.load(Ordering::SeqCst),
+                                live.is_busy(),
+                            )
+                        });
+                        let Some((streaming, failed, now_busy)) = state else {
+                            return;
+                        };
+                        if streaming || failed || now_busy {
+                            return;
+                        }
+                        if !owners.lock().get(&key).is_some_and(|owner| owner == &tid) {
+                            return;
+                        }
+                    }
+                    let locks = shared_locks(&tid);
+                    let _prompt = locks.prompt.lock().await;
+                    let Some(live) = live_map.lock().get(&tid).cloned() else {
+                        return;
+                    };
+                    if live.streaming.load(Ordering::SeqCst)
+                        || live.failed.load(Ordering::SeqCst)
+                        || live.is_busy()
+                    {
+                        return;
+                    }
+                    if !owners.lock().get(&key).is_some_and(|owner| owner == &tid) {
+                        return;
+                    }
+                    if store
+                        .get_thread(&tid)
+                        .ok()
+                        .is_some_and(|row| row.status == "active")
+                    {
+                        live.streaming.store(false, Ordering::SeqCst);
+                        live.note_activity();
+                        let _ = store.update_thread_status(&tid, "completed");
+                        release_owner(&owners, &cwd, &tid);
+                    }
+                });
+            }
+            return Ok(());
         }
+        self.set_streaming(thread_id, false);
+        self.set_status(thread_id, "completed");
+        self.release_checkout(&row.cwd, thread_id);
         self.touch_activity(thread_id);
         Ok(())
     }
@@ -1260,8 +1487,32 @@ impl ThreadManager {
         if live.ui_fire_and_forget.lock().remove(request_id) {
             return Ok(());
         }
-        if !live.pending_ui_requests.lock().contains(request_id) {
-            return Err(AppError::new("The UI request has already expired."));
+        let method = live
+            .pending_ui_requests
+            .lock()
+            .get(request_id)
+            .cloned()
+            .ok_or_else(|| AppError::new("The UI request has already expired."))?;
+        let cancelled = response.cancelled.unwrap_or(false);
+        if !cancelled {
+            let usable = match method.as_str() {
+                "select" | "input" | "editor" | "permission" => response
+                    .value
+                    .as_ref()
+                    .is_some_and(|value| !value.is_empty()),
+                "confirm" => response.confirmed.is_some(),
+                _ => false,
+            };
+            if !usable {
+                return Err(AppError::new(format!(
+                    "This answer is missing the {method} request's required field; the request is still waiting."
+                )));
+            }
+            if response.value.is_some() && response.confirmed.is_some() {
+                return Err(AppError::new(
+                    "This answer mixes a value with a confirmation; the request is still waiting.",
+                ));
+            }
         }
         let mut frame = Map::from_iter([
             ("type".into(), json!("extension_ui_response")),
@@ -1316,7 +1567,14 @@ impl ThreadManager {
             ));
         }
         if !row.session_file.is_empty() {
-            if let Ok(messages) = sessions::read_agent_messages(&row.session_file, agent_id) {
+            // Transcripts can be tens of MiB; keep the parse off async workers.
+            let session_file = row.session_file.clone();
+            let agent = agent_id.to_string();
+            let read = tauri::async_runtime::spawn_blocking(move || {
+                sessions::read_agent_messages(&session_file, &agent)
+            })
+            .await;
+            if let Ok(Ok(messages)) = read {
                 return Ok(messages);
             }
         }
@@ -1424,23 +1682,49 @@ impl ThreadManager {
                 }
                 let elapsed = watched.last_activity.lock().elapsed();
                 let Some(remaining) = idle_for.checked_sub(elapsed) else {
-                    // Suspend only if this process is still the live one; a
-                    // stale watch must never kill a replacement.
-                    let current = live_map
-                        .lock()
-                        .get(&tid)
-                        .is_some_and(|l| Arc::ptr_eq(l, &watched));
-                    if !current || watched.client.is_exited() {
+                    // Serialize with in-flight prompts/stops through the same
+                    // per-thread locks `stop()` takes (prompt, then lifecycle,
+                    // same order). Holding both across the re-check and the
+                    // shutdown closes the window where a prompt sits between
+                    // its RPC return and its busy flag. The guards are scoped
+                    // so the locks are released before the task waits again.
+                    let locks = shared_locks(&tid);
+                    {
+                        let _prompt = locks.prompt.lock().await;
+                        let _lifecycle = locks.lifecycle.lock().await;
+                        // Suspend only if this process is still the live one; a
+                        // stale watch must never kill a replacement.
+                        let current = live_map
+                            .lock()
+                            .get(&tid)
+                            .is_some_and(|l| Arc::ptr_eq(l, &watched));
+                        if !current || watched.client.is_exited() {
+                            reap_shared_locks(&tid, &locks);
+                            return;
+                        }
+                        if watched.is_busy() || watched.last_activity.lock().elapsed() < idle_for {
+                            continue;
+                        }
+                        watched.client.expect_exit();
+                        watched.client.shutdown().await;
+                        // A prompt that raced the shutdown wins if it made the
+                        // process busy or replaced the live pointer; never write
+                        // `idle` or release a reservation that no longer belongs
+                        // to this generation.
+                        if !live_map
+                            .lock()
+                            .get(&tid)
+                            .is_some_and(|l| Arc::ptr_eq(l, &watched))
+                            || watched.is_busy()
+                        {
+                            reap_shared_locks(&tid, &locks);
+                            return;
+                        }
+                        let _ = store.update_thread_status(&tid, "idle");
+                        release_owner(&owners, &cwd, &tid);
+                        reap_shared_locks(&tid, &locks);
                         return;
                     }
-                    if watched.is_busy() || watched.last_activity.lock().elapsed() < idle_for {
-                        continue;
-                    }
-                    watched.client.expect_exit();
-                    watched.client.shutdown().await;
-                    let _ = store.update_thread_status(&tid, "idle");
-                    release_owner(&owners, &cwd, &tid);
-                    return;
                 };
                 if remaining.is_zero() {
                     continue;
@@ -1460,8 +1744,7 @@ impl ThreadManager {
     /// Stop every live process (app shutdown).
     pub async fn shutdown_all(&self) {
         self.shutting_down.store(true, Ordering::SeqCst);
-        let entries: Vec<(String, Arc<ThreadLocks>)> = self
-            .lifecycles
+        let entries: Vec<(String, Arc<ThreadLocks>)> = shared_locks_map()
             .lock()
             .iter()
             .map(|(id, locks)| (id.clone(), locks.clone()))
@@ -1857,7 +2140,7 @@ printf '%s\n' '{"type":"response","id":"3","command":"get_messages","success":tr
             streaming: AtomicBool::new(false),
             failed: AtomicBool::new(false),
             active_subagents: Mutex::new(std::collections::HashSet::new()),
-            pending_ui_requests: Mutex::new(std::collections::HashSet::new()),
+            pending_ui_requests: Mutex::new(HashMap::new()),
             ui_fire_and_forget: Mutex::new(std::collections::HashSet::new()),
             activity: Notify::new(),
             idle_watch: Mutex::new(None),
@@ -1926,7 +2209,9 @@ printf '%s\n' '{"type":"response","id":"3","command":"get_messages","success":tr
     #[tokio::test]
     async fn idle_watch_waits_out_pending_ui_request() {
         let live = live_cat();
-        live.pending_ui_requests.lock().insert("req-1".to_string());
+        live.pending_ui_requests
+            .lock()
+            .insert("req-1".to_string(), "input".to_string());
         let map = live_map_with("t3", &live);
         ThreadManager::start_idle_watch(
             &live,
