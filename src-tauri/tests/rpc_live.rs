@@ -1,18 +1,30 @@
-//! Live smoke tests against real harness binaries. Ignored by default:
+//! Live smoke tests against πDesk's private Pi. Never installs or uses system Pi.
+//! Ignored by default:
 //! `cargo test --test rpc_live -- --ignored`
 
-use omp_desktop_lib::rpc::{RpcClient, RpcHandlers};
+use pidesk_lib::rpc::{RpcClient, RpcHandlers};
 use serde_json::{json, Map, Value};
 use std::process::Stdio;
 use std::sync::mpsc::channel;
 use tokio::process::Command;
 
-fn spawn(
-    bin: &str,
-    args: &[&str],
-    cwd: &std::path::Path,
-) -> (RpcClient, std::sync::mpsc::Receiver<Value>) {
+fn spawn(args: &[&str], cwd: &std::path::Path) -> (RpcClient, std::sync::mpsc::Receiver<Value>) {
+    let home = std::env::var_os("HOME").expect("HOME");
+    let root = std::path::PathBuf::from(&home).join(".pidesk");
+    let bin = root.join("runtime/node_modules/.bin/pi");
+    assert!(
+        bin.is_file(),
+        "Install private Pi through πDesk before running live tests."
+    );
     let mut child = Command::new(bin)
+        .env_clear()
+        .env("HOME", home)
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("PI_CODING_AGENT_DIR", root.join("agent"))
+        .env("PI_CODING_AGENT_SESSION_DIR", root.join("agent/sessions"))
+        .env("PI_TELEMETRY", "0")
+        .env("PI_SKIP_VERSION_CHECK", "1")
+        .arg("--no-approve")
         .args(args)
         .current_dir(cwd)
         .stdin(Stdio::piped())
@@ -33,7 +45,6 @@ fn spawn(
                 let _ = tx.send(f);
             }),
             on_exit: Box::new(|_, _, _| {}),
-            on_ready: None,
         },
     );
     (client, rx)
@@ -41,56 +52,10 @@ fn spawn(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
-async fn omp_handshake_and_state() {
-    let dir = std::env::temp_dir().join("omp-rpc-live");
-    std::fs::create_dir_all(&dir).unwrap();
-    let (client, rx) = spawn("omp", &["--mode", "rpc"], &dir);
-    // The harness claims stdin before extension discovery; get_state can be
-    // sent immediately, without timing-sensitive sleeps.
-    let neg = client
-        .call(
-            "negotiate_protocol",
-            Map::from_iter([("protocolVersion".into(), json!(2))]),
-        )
-        .await
-        .expect("negotiate");
-    assert_eq!(neg.get("protocolVersion").and_then(Value::as_u64), Some(2));
-    let state = client
-        .call("get_state", Map::new())
-        .await
-        .expect("get_state");
-    assert!(state.get("sessionId").and_then(Value::as_str).is_some());
-    let msgs = client
-        .call(
-            "get_messages_page",
-            Map::from_iter([("limit".into(), json!(256))]),
-        )
-        .await
-        .expect("get_messages_page");
-    assert!(msgs.get("messages").is_some());
-    let stats = client
-        .call("get_session_stats", Map::new())
-        .await
-        .expect("stats");
-    assert!(stats.get("tokens").is_some());
-    client.shutdown().await;
-    // Drain events to prove frames flowed.
-    let mut saw = 0;
-    while rx
-        .recv_timeout(std::time::Duration::from_millis(200))
-        .is_ok()
-    {
-        saw += 1;
-    }
-    assert!(saw > 0, "expected at least one event frame");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
-async fn pi_no_ready_state() {
+async fn pi_state_and_messages() {
     let dir = std::env::temp_dir().join("pi-rpc-live");
     std::fs::create_dir_all(&dir).unwrap();
-    let (client, rx) = spawn("pi", &["--mode", "rpc"], &dir);
+    let (client, rx) = spawn(&["--mode", "rpc", "--no-session"], &dir);
     let state = tokio::time::timeout(
         std::time::Duration::from_secs(45),
         client.call("get_state", Map::new()),
@@ -105,35 +70,13 @@ async fn pi_no_ready_state() {
         .expect("get_messages");
     assert!(msgs.get("messages").is_some());
     client.shutdown().await;
-    // Pi has no `ready` frame: `get_state` is the readiness probe. Drain the
-    // event channel briefly and fail if a `ready` frame ever arrived.
-    let mut saw_ready = false;
-    while let Ok(frame) = rx.recv_timeout(std::time::Duration::from_millis(200)) {
-        if frame.get("type").and_then(Value::as_str) == Some("ready") {
-            saw_ready = true;
-            break;
-        }
-    }
-    assert!(
-        !saw_ready,
-        "Pi must not emit a `ready` frame; `get_state` is the readiness probe"
-    );
+    drop(rx);
 }
 
-async fn smoke_prompt(bin: &str, args: &[&str], terminal_event: &str) {
-    let dir = std::env::temp_dir().join(format!("omp-rpc-prompt-{}", uuid::Uuid::new_v4()));
+async fn smoke_prompt(args: &[&str]) {
+    let dir = std::env::temp_dir().join(format!("pidesk-rpc-prompt-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
-    let (client, events) = spawn(bin, args, &dir);
-    if bin == "omp" {
-        let negotiated = client
-            .call(
-                "negotiate_protocol",
-                Map::from_iter([("protocolVersion".into(), json!(2))]),
-            )
-            .await
-            .expect("OMP protocol negotiation");
-        assert_eq!(negotiated["protocolVersion"], 2);
-    }
+    let (client, events) = spawn(args, &dir);
     let state = client
         .call("get_state", Map::new())
         .await
@@ -176,10 +119,7 @@ async fn smoke_prompt(bin: &str, args: &[&str], terminal_event: &str) {
                 }
             }
         }
-        if event.get("type").and_then(Value::as_str) == Some(terminal_event)
-            && (terminal_event != "agent_end"
-                || event.get("isTerminal") != Some(&Value::Bool(false)))
-        {
+        if event.get("type").and_then(Value::as_str) == Some("agent_settled") {
             break;
         }
     }
@@ -192,30 +132,7 @@ async fn smoke_prompt(bin: &str, args: &[&str], terminal_event: &str) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "sends one real model prompt through OMP"]
-async fn omp_prompt_streams_reply() {
-    smoke_prompt(
-        "omp",
-        &[
-            "--mode",
-            "rpc",
-            "--no-session",
-            "--no-tools",
-            "--model",
-            "devin/swe-2",
-        ],
-        "agent_end",
-    )
-    .await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "sends one real model prompt through Pi"]
 async fn pi_prompt_streams_reply() {
-    smoke_prompt(
-        "pi",
-        &["--mode", "rpc", "--no-session", "--no-tools"],
-        "agent_settled",
-    )
-    .await;
+    smoke_prompt(&["--mode", "rpc", "--no-session", "--no-tools"]).await;
 }

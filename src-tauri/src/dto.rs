@@ -4,25 +4,15 @@ use serde_json::Value;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HarnessKind {
-    Omp,
     Pi,
 }
 
 impl HarnessKind {
     pub fn as_str(self) -> &'static str {
-        match self {
-            HarnessKind::Omp => "omp",
-            HarnessKind::Pi => "pi",
-        }
-    }
-    pub fn binary_name(self) -> &'static str {
-        self.as_str()
+        "pi"
     }
     pub fn display_name(self) -> &'static str {
-        match self {
-            HarnessKind::Omp => "OMP",
-            HarnessKind::Pi => "Pi",
-        }
+        "Pi"
     }
 }
 
@@ -30,7 +20,6 @@ impl std::str::FromStr for HarnessKind {
     type Err = ();
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "omp" => Ok(HarnessKind::Omp),
             "pi" => Ok(HarnessKind::Pi),
             _ => Err(()),
         }
@@ -51,6 +40,17 @@ pub struct HarnessInstallation {
 pub struct HarnessInstallCommand {
     pub kind: HarnessKind,
     pub command: String,
+    pub install_path: String,
+    pub agent_dir: String,
+    pub login_command: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstallStage {
+    Preparing,
+    Installing,
+    Verifying,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -141,39 +141,23 @@ pub struct HarnessCapabilities {
 }
 
 impl HarnessCapabilities {
-    pub fn for_kind(kind: HarnessKind) -> Self {
-        match kind {
-            HarnessKind::Omp => Self {
-                agents: true,
-                nested_agents: true,
-                agent_steering: false,
-                agent_kill: false,
-                agent_revive: false,
-                plan_mode: false,
-                permissions: true,
-                model_switching: true,
-                effort_levels: true,
-                context_usage: true,
-                token_usage: true,
-                worktrees: true,
-            },
-            HarnessKind::Pi => Self {
-                agents: false,
-                nested_agents: false,
-                agent_steering: false,
-                agent_kill: false,
-                agent_revive: false,
-                plan_mode: false,
-                // Pi has no capability handshake in its RPC contract. Do not
-                // advertise permission UI until the host can verify support.
-                permissions: false,
-                // These are enabled per snapshot from successful RPC queries.
-                model_switching: false,
-                effort_levels: false,
-                context_usage: false,
-                token_usage: false,
-                worktrees: true,
-            },
+    pub fn for_kind(_kind: HarnessKind) -> Self {
+        Self {
+            agents: false,
+            nested_agents: false,
+            agent_steering: false,
+            agent_kill: false,
+            agent_revive: false,
+            plan_mode: false,
+            // Pi has no capability handshake in its RPC contract. Do not
+            // advertise permission UI until the host can verify support.
+            permissions: false,
+            // These are enabled per snapshot from successful RPC queries.
+            model_switching: false,
+            effort_levels: false,
+            context_usage: false,
+            token_usage: false,
+            worktrees: true,
         }
     }
 }
@@ -204,45 +188,6 @@ pub struct SessionSnapshot {
     pub models: Vec<ModelInfo>,
     pub levels: Vec<String>,
     pub capabilities: HarnessCapabilities,
-    pub agents: Vec<AgentInfo>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentInfo {
-    pub id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub parent_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub parent_tool_call_id: Option<String>,
-    pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub role: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub task: Option<String>,
-    pub status: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub effort: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub activity: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tokens: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub context_tokens: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub context_window: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cost: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub duration_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_count: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub session_file: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub worktree_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -288,15 +233,6 @@ pub struct GitFile {
     pub too_large: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LoginProvider {
-    pub id: String,
-    pub name: String,
-    pub available: bool,
-    pub authenticated: bool,
-}
-
 /// Events emitted to the frontend on the `desktop-event` channel.
 /// Field names are camelCase to match `BackendEvent` in types.ts.
 #[derive(Debug, Clone, Serialize)]
@@ -320,6 +256,10 @@ pub enum BackendEvent {
     GitChanged {
         thread_id: String,
     },
+    InstallStage {
+        kind: HarnessKind,
+        stage: InstallStage,
+    },
     InstallProgress {
         kind: HarnessKind,
         line: String,
@@ -330,4 +270,28 @@ pub enum BackendEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+}
+
+/// Live resource snapshot shown in the runtime monitor.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeStats {
+    /// Footprint of πDesk's own backend process (the WebView renders out of process).
+    pub app_bytes: Option<u64>,
+    pub threads: Vec<ThreadRuntime>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadRuntime {
+    pub thread_id: String,
+    pub project_id: String,
+    pub title: String,
+    pub pid: Option<i32>,
+    /// Pi plus every tool process in its process group.
+    pub memory_bytes: Option<u64>,
+    pub process_count: u32,
+    /// Streaming a turn or waiting on a permission/input answer.
+    pub busy: bool,
+    pub idle_seconds: u64,
 }

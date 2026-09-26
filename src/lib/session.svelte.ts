@@ -2,14 +2,12 @@
  * SessionModel — normalized, reactive conversation state for one thread.
  *
  * Flattens get_messages history into ConversationItem rows and reduces live
- * RPC frames (OMP + Pi) into the same SessionView. UI components never see
- * raw harness frames. Backend strips assistantMessageEvent.partial and
- * message_update.message before forwarding; this reducer tolerates both the
- * stripped OMP shape and Pi's delta-only shape.
+ * Pi RPC frames into the same SessionView. UI components never see raw
+ * protocol frames. Backend strips cumulative snapshots before forwarding;
+ * this reducer consumes deltas and reconciles authoritative message_end.
  */
 
 import type {
-	AgentInfo,
 	ConversationItem,
 	ContextUsage,
 	ModelInfo,
@@ -24,7 +22,6 @@ import type {
 } from './types';
 
 type ToolItem = Extract<ConversationItem, { kind: 'tool' }>;
-type AgentStatus = AgentInfo['status'];
 type TextItem = Extract<ConversationItem, { text: string }>;
 
 interface LiveBlock {
@@ -166,9 +163,8 @@ function contentSignature(m: RpcMessage): string {
 	return `${body}|${hash128(str(m.customType) ?? '')}`;
 }
 
-/** Identity of the visible message. Usage, stop reason, provider, and model
- * metadata are excluded: OMP sends the same assistant turn as message_end and
- * again as turn_end with those fields added. */
+/** Identity of the visible message, independent of usage/provider metadata
+ * that may change between message_end and turn_end. */
 function fingerprint(m: RpcMessage): string {
 	const id = stableMessageIdentity(m);
 	const body = `${m.role}|${m.timestamp ?? ''}|${contentSignature(m)}`;
@@ -177,35 +173,6 @@ function fingerprint(m: RpcMessage): string {
 
 function visibleFingerprint(m: RpcMessage): string {
 	return `visible:${m.role}|${m.timestamp ?? ''}|${contentSignature(m)}`;
-}
-
-function mapAgentStatus(s: string | undefined): AgentStatus | undefined {
-	switch (s) {
-		case 'started':
-		case 'running':
-		case 'in_progress':
-			return 'running';
-		case 'pending':
-			return 'pending';
-		case 'waiting':
-		case 'idle':
-			return 'waiting';
-		case 'completed':
-		case 'complete':
-		case 'done':
-			return 'completed';
-		case 'failed':
-		case 'error':
-			return 'failed';
-		case 'aborted':
-		case 'cancelled':
-		case 'killed':
-			return 'aborted';
-		case 'parked':
-			return 'parked';
-		default:
-			return undefined;
-	}
 }
 
 function mapLevel(s: string | undefined): string {
@@ -248,11 +215,6 @@ function advisorLevel(details: unknown): string | undefined {
 	const first = notes?.[0];
 	if (isRec(first)) return str(first.severity);
 	return undefined;
-}
-
-function dottedParent(id: string): string | undefined {
-	const i = id.lastIndexOf('.');
-	return i > 0 ? id.slice(0, i) : undefined;
 }
 
 /** Narrow an untrusted frame field to RpcMessage (requires a string role). */
@@ -513,7 +475,6 @@ export class SessionModel {
 		this.view = $state<SessionView>({
 			threadId: snapshot.thread?.id ?? '',
 			items: [],
-			agents: Array.isArray(snapshot.agents) ? snapshot.agents.map((a) => ({ ...a })) : [],
 			pendingRequests: [],
 			status: streaming ? 'active' : this.#idleStatus,
 			capabilities: snapshot.capabilities,
@@ -570,10 +531,8 @@ export class SessionModel {
 		this.#removeRequest(requestId);
 	}
 
-	/** Reconnect to the same harness session without discarding visible work.
-	 * The journal may not contain the interrupted streaming tail, and OMP's
-	 * get_messages can collapse older context. Keep those rows, reconcile
-	 * persisted completions, then let subsequent RPC frames append normally. */
+	/** Reconnect without discarding an unpersisted streaming tail. Reconcile
+	 * saved completions, then let subsequent Pi RPC frames append normally. */
 	reconnect(snapshot: SessionSnapshot): void {
 		const restored = new SessionModel(snapshot);
 		const rows = this.view.items;
@@ -629,7 +588,6 @@ export class SessionModel {
 			if (row.kind === 'tool' && (row.status === 'running' || row.status === 'queued')) row.status = 'cancelled';
 		}
 		this.view.items = [...rows, ...appended];
-		this.view.agents = restored.view.agents.length ? restored.view.agents : this.view.agents;
 		this.view.pendingRequests = [];
 		this.view.status = restored.view.status;
 		this.view.error = undefined;
@@ -664,16 +622,11 @@ export class SessionModel {
 				this.view.error = undefined;
 				this.#refreshStatus();
 				return;
-			case 'agent_end': {
-				const continuing = frame.isTerminal === false || frame.willRetry === true;
-				this.#runActive = continuing;
-				if (!continuing && this.#idleStatus !== 'failed') this.#idleStatus = 'completed';
+			case 'agent_end':
+				// Pi can still compact or handle queued work; agent_settled ends the run.
 				this.#finalizeLive();
-				this.#refreshStatus();
 				return;
-			}
 			case 'agent_settled':
-			case 'run_end':
 				this.#runActive = false;
 				if (this.#idleStatus !== 'failed') this.#idleStatus = 'completed';
 				this.#finalizeLive();
@@ -733,12 +686,6 @@ export class SessionModel {
 				return;
 			case 'extension_ui_request':
 				this.#onUiRequest(frame);
-				return;
-			case 'subagent_lifecycle':
-				this.#onSubagentLifecycle(frame);
-				return;
-			case 'subagent_progress':
-				this.#onSubagentProgress(frame);
 				return;
 			case 'available_commands_update': {
 				const cmds = arr(frame.commands);
@@ -816,7 +763,7 @@ export class SessionModel {
 				if (frame.success !== false) return;
 				const command = str(frame.command) ?? 'command';
 				this.#notice('error', `${command}: ${this.#errorText(frame) ?? 'The harness could not continue.'}`);
-				if (['prompt', 'abort_and_prompt', 'steer', 'follow_up'].includes(command)) {
+				if (['prompt', 'steer', 'follow_up'].includes(command)) {
 					this.#runActive = false;
 					this.#idleStatus = 'failed';
 					this.#finalizeLive();
@@ -1022,12 +969,7 @@ export class SessionModel {
 
 	#onMessageUpdate(frame: Record<string, unknown>): void {
 		const ev = frame.assistantMessageEvent;
-		if (!isRec(ev)) {
-			// Unstripped OMP frame carrying the full message — reconcile directly.
-			const um = asMsg(frame.message);
-			if (um) this.#ingestLive(um);
-			return;
-		}
+		if (!isRec(ev)) return;
 		const et = str(ev.type);
 		const live = this.#ensureLive();
 		switch (et) {
@@ -1278,34 +1220,9 @@ export class SessionModel {
 				const options = arr(frame.options)
 					?.map((o) => str(o) ?? (isRec(o) ? str(o.label) ?? str(o.value) : undefined))
 					.filter((o): o is string => typeof o === 'string' && o.length > 0);
-				// OMP sends optionDetails as a map keyed by option label;
-				// tolerate an array form too.
 				const optionDetails = arr(frame.optionDetails)
 					?.filter(isRec)
-					.map((d) => ({ description: str(d.description) })) ??
-					(isRec(frame.optionDetails) && options
-						? options.map((o) => {
-								const d = (frame.optionDetails as Record<string, unknown>)[o];
-								return { description: isRec(d) ? str(d.description) : undefined };
-							})
-						: undefined);
-				if (title.startsWith('Allow tool:')) {
-					const nl = title.indexOf('\n');
-					const name = (nl < 0 ? title.slice(11) : title.slice(11, nl)).trim();
-					const message = nl < 0 ? undefined : title.slice(nl + 1).trim() || undefined;
-					return {
-						id,
-						method: 'permission',
-						title,
-						message,
-						options,
-						optionDetails,
-						timeout,
-						toolName: toolName ?? name,
-						toolArgs,
-						cwd,
-					};
-				}
+					.map((d) => ({ description: str(d.description) }));
 				return { id, method: 'select', title, message: str(frame.message), options, optionDetails, timeout, toolName, toolArgs, cwd };
 			}
 			case 'confirm':
@@ -1350,70 +1267,10 @@ export class SessionModel {
 		this.#refreshStatus();
 	}
 
-	/* ---- subagents ---- */
-
-	#upsertAgent(patch: Partial<AgentInfo> & { id: string }): void {
-		const i = this.view.agents.findIndex((a) => a.id === patch.id);
-		if (i < 0) {
-			this.view.agents.push({ name: patch.id, status: 'pending', ...clean(patch as Record<string, unknown>) } as AgentInfo);
-			return;
-		}
-		const a = this.view.agents[i] as unknown as Record<string, unknown>;
-		for (const [k, v] of Object.entries(patch)) {
-			if (v !== undefined) a[k] = v;
-		}
-	}
-
-	#onSubagentLifecycle(frame: Record<string, unknown>): void {
-		const p = frame.payload;
-		if (!isRec(p)) return;
-		const id = str(p.id);
-		if (!id) return;
-		this.#upsertAgent({
-			id,
-			parentId: dottedParent(id),
-			parentToolCallId: str(p.parentToolCallId),
-			name: id.slice(id.lastIndexOf('.') + 1),
-			role: str(p.agent) ?? str(p.agentSource),
-			task: str(p.task) ?? str(p.assignment),
-			status: mapAgentStatus(str(p.status)),
-			activity: str(p.description),
-			sessionFile: str(p.sessionFile),
-		});
-	}
-
-	#onSubagentProgress(frame: Record<string, unknown>): void {
-		const p = frame.payload;
-		if (!isRec(p)) return;
-		const prog = isRec(p.progress) ? p.progress : p;
-		const id = str(prog.id) ?? str(p.id);
-		if (!id) return;
-		const currentTool = str(prog.currentTool);
-		this.#upsertAgent({
-			id,
-			parentId: dottedParent(id),
-			parentToolCallId: str(prog.parentToolCallId) ?? str(p.parentToolCallId),
-			name: id.slice(id.lastIndexOf('.') + 1),
-			role: str(p.agent) ?? str(prog.agent) ?? str(p.agentSource) ?? str(prog.agentSource),
-			task: str(prog.task) ?? str(prog.assignment),
-			status: mapAgentStatus(str(prog.status)),
-			activity: str(prog.lastIntent) ?? (currentTool ? `Running ${currentTool}` : undefined) ?? str(prog.description),
-			model: str(prog.resolvedModelIdentity) ?? str(prog.resolvedModel) ?? str(prog.modelOverride),
-			effort: str(prog.resolvedThinkingLevel) ?? str(prog.effort),
-			tokens: num(prog.tokens),
-			contextTokens: num(prog.contextTokens),
-			contextWindow: num(prog.contextWindow),
-			cost: num(prog.cost),
-			durationMs: num(prog.durationMs),
-			toolCount: num(prog.toolCount),
-			sessionFile: str(p.sessionFile) ?? str(prog.sessionFile),
-		});
-	}
-
 	/* ---- model / usage / misc ---- */
 
 	#onConfigUpdate(frame: Record<string, unknown>): void {
-		// Pi shape: { property, previous, value }. OMP shape: { model, thinkingLevel }.
+		// Pi config updates name the changed property and its new value.
 		const prop = str(frame.property);
 		if (prop === 'model') {
 			const m = normalizeModel(frame.value);
@@ -1424,11 +1281,6 @@ export class SessionModel {
 			this.view.effort = str(frame.value) ?? this.view.effort;
 			return;
 		}
-		if (prop) return;
-		const m = normalizeModel(frame.model);
-		if (m) this.view.model = m;
-		const tl = str(frame.thinkingLevel);
-		if (tl) this.view.effort = tl;
 	}
 
 	#onUsageEvent(frame: Record<string, unknown>): void {

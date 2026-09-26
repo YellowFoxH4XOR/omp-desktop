@@ -1,18 +1,18 @@
-# OMP Desktop
+# πDesk
 
-A local-first visual control center for [OMP](https://github.com/oh-my-pi/pi-coding-agent) and Pi coding-agent sessions.
+A local-first desktop app for [Pi](https://pi.dev) coding-agent sessions.
 
-OMP Desktop provides projects and thread management, streaming conversations, structured tool activity, permissions, subagent transcripts, and Git-backed diff review in a native macOS desktop app.
+πDesk provides project and thread management, streaming conversations, structured tool activity, extension prompts, and Git-backed diff review in a native macOS app. **Pi is the only supported coding agent.**
 
 ## Features
 
 - Native Tauri 2 shell with Svelte 5 and TypeScript
+- Private Pi installation with an opt-in installer and live terminal output
 - Local SQLite metadata for projects and threads
-- Structured OMP and Pi RPC adapters; no terminal scraping
-- Streaming assistant responses and normalized tool cards
-- Permission, input, selection, and plan-request UI
-- Live nested subagent hierarchy and transcript inspection
-- Model, effort, context, and token usage controls
+- Pi JSONL RPC integration; no terminal scraping
+- Streaming assistant responses and structured tool cards, including extension tools
+- Extension input, selection, confirmation, and editor requests
+- Model, effort, context, and token usage where supported by Pi
 - Git-backed unified and split diffs with syntax highlighting
 - File and hunk revert, word-level changes, and manual-edit refresh
 - Worktree isolation for concurrent modifying Git threads
@@ -24,97 +24,66 @@ OMP Desktop provides projects and thread management, streaming conversations, st
 - macOS with Xcode Command Line Tools
 - [Bun](https://bun.sh/) 1.4.2 (pinned in `.bun-version`)
 - Rust 1.98.1 (pinned in `rust-toolchain.toml`)
-- OMP or Pi installed, or use the guided installer from first launch
+- Node.js 22.19+ and npm for the private Pi installer
+
+## Private Pi setup
+
+πDesk does **not** use Pi from your PATH or your existing `~/.pi` directory. On launch it checks only its own installation. If Pi is missing, the setup screen offers **Install Pi**. No installation happens until you click it.
+
+The installer shows the exact local npm command, live stdout/stderr, and real check/install/verify stages. Errors stay visible and can be retried. npm installs `@earendil-works/pi-coding-agent` locally with scripts disabled—not with `-g`.
+
+```text
+~/.pidesk/
+  runtime/      πDesk's Pi package and dependencies
+  agent/        Private settings, auth, extensions, and sessions
+  worktrees/    Isolated Git worktrees
+```
+
+After installation, copy the **private Pi sign-in command** from setup or Settings into Terminal, then use `/login`. A bare `pi` command opens your separate terminal installation, not πDesk's profile. No credentials or extensions are copied from it. There is no in-app provider OAuth flow or built-in subagent transcript browser.
 
 ## Development
 
-Install the exact dependency versions in `bun.lock`:
-
 ```bash
 bun install --frozen-lockfile
-```
-
-Start the Tauri development app:
-
-```bash
 bun run tauri dev
 ```
 
-The Vite frontend runs on `http://127.0.0.1:1420`; the Tauri window manages the native lifecycle and Rust backend.
+The Vite frontend runs on `http://127.0.0.1:1420`; Tauri owns the native lifecycle and Rust backend.
 
 ## Validation
 
-Run frontend type and Svelte checks, followed by Rust formatting and compilation:
-
 ```bash
-bun run check
+bun run check                          # Svelte/TypeScript, Rust fmt and check
+bun run test                           # Vitest
+bunx playwright install chromium       # browser setup
+bun run test:e2e                        # mocked desktop journeys
+bun run test:rust                      # Rust unit and transport tests
+bun run build                          # frontend production build
+bun run validate                       # full CI parity, including macOS bundle
 ```
 
-Run all Vitest tests:
-
-```bash
-bun run test
-```
-
-Run the Playwright desktop journeys after installing Chromium once:
-
-```bash
-bunx playwright install chromium
-bun run test:e2e
-```
-
-Run Rust library tests:
-
-```bash
-bun run test:rust
-```
-
-Run the aggregate local validation (frozen install, checks, tests, and frontend build):
-
-```bash
-bun run validate
-```
-
-Rust formatting and compilation can also be run directly:
-
-```bash
-cd src-tauri
-cargo fmt -- --check
-cargo check --locked
-```
-
-Run optional live RPC smoke tests against installed OMP and Pi executables:
+Optional live RPC tests require an explicitly installed private Pi:
 
 ```bash
 cd src-tauri
 cargo test --test rpc_live -- --ignored
 ```
 
-These live tests may start real harness processes. Some tests can make a model request and consume the configured provider account.
+Live tests start real Pi processes; prompt tests may consume provider quota. They are not part of default validation.
 
 ## Production Build
-
-Build the frontend only:
-
-```bash
-bun run build
-```
-
-Build, ad-hoc sign, and verify the macOS application bundle:
 
 ```bash
 bun run bundle:macos
 ```
 
-The macOS command builds the app, re-signs the bundle with the local ad-hoc identity while preserving the bundler's signature flags and entitlements, and verifies it with `codesign --verify --strict`. The script also fails if re-signing would weaken any flag and reports when the bundle carries no hardened runtime (local ad-hoc builds do not).
-
-The local application bundle is written to:
+The app bundle is written to:
 
 ```text
-src-tauri/target/release/bundle/macos/OMP Desktop.app
+src-tauri/target/release/bundle/macos/πDesk.app
 ```
 
-`bundle:macos` produces a locally runnable ad-hoc-signed app. Ad-hoc signing does not satisfy Gatekeeper distribution requirements. Distributing the app to other Macs requires a Developer ID signature and Apple notarization.
+This command builds, ad-hoc signs, and verifies the bundle with `codesign --verify --strict`, preserving signature policy flags and entitlements. The result is for local use only: distribution requires a Developer ID signature and Apple notarization.
 
 ## Project Layout
 
@@ -123,34 +92,44 @@ src/
   App.svelte                    Application shell and navigation
   lib/
     api.ts                      Typed Tauri command/event bridge
-    session.svelte.ts           RPC event normalization and state
+    session.svelte.ts           Pi event normalization and state
     components/
-      agents/                   Agent hierarchy and transcripts
-      conversation/             Transcript, composer, requests, Markdown
+      conversation/             Transcript, composer, prompts, Markdown
       diff/                     Git status, file diff, revert actions
       tools/                    Structured tool renderers
-
+      setup/                    Private installer and sign-in guidance
 src-tauri/
   src/
     commands.rs                 Tauri command boundary
     dto.rs                      IPC data types
-    git.rs                      Git status, diff, and safe file operations
-    harness.rs                  Harness discovery and guided installation
-    rpc.rs                      JSONL transport, chunking, and correlation
-    sessions.rs                 OMP/Pi session discovery and replay
-    store.rs                    SQLite metadata
+    git.rs                      Git status, diff, safe file operations
+    harness.rs                  Managed Pi validation and opt-in installation
+    rpc.rs                      Bounded JSONL transport and correlation
+    sessions.rs                 Pi session discovery
+    store.rs                    SQLite metadata and legacy compatibility
     threads.rs                  Process lifecycle and thread orchestration
   capabilities/                 Tauri permission allowlists
-  tests/                        Live RPC smoke tests
+  tests/                        Transport and optional live Pi tests
 ```
 
 ## Local Data and Security
 
-- Repository contents stay on the local machine.
-- The app does not store provider credentials; authentication remains owned by OMP or Pi.
-- Git write operations are restricted to paths currently reported as changed by Git.
-- Project removal deletes app metadata only, not repository files, Git history, worktrees, or harness sessions.
-- App-owned isolated worktrees are stored under `~/.omp-desktop/worktrees/`.
+- Repository contents and app metadata stay local; there is no product telemetry. Pi's configured providers still receive requests through Pi.
+- πDesk's Pi owns its private sessions, credentials, extensions, and provider connections under `~/.pidesk/agent`.
+- Inherited Pi directory/package overrides and provider-key variables are not forwarded. Project `.pi` resources are skipped with `--no-approve`, and explicit private session directories override project session settings.
+- This is installation/configuration separation, not an OS sandbox: Pi still works on selected project files with your user account's permissions.
+- Git writes are restricted to changed paths and guarded by expected-content hashes.
+- Removing a project deletes app metadata only, not files, Git history, worktrees, or Pi sessions.
+- New isolated worktrees live under `~/.pidesk/worktrees/`; saved worktree paths remain usable.
+- Fresh installs use `pidesk.sqlite3` in the `dev.pidesk.desktop` app-data directory.
+
+### Existing installations
+
+Projects are preserved, but πDesk starts with fresh private threads. Existing external-Pi and OMP thread rows remain stored but hidden and cannot be resumed with the managed runtime. Their original session files, CLI installations, credentials, and extensions are not modified or uninstalled. New threads are explicitly marked as belonging to πDesk's runtime.
+
+When no new app database exists, πDesk can reuse the prior `dev.ompui.desktop/omp-desktop.sqlite3` metadata database in place to preserve projects, without copying live SQLite/WAL files. Session discovery only scans the private `~/.pidesk/agent/sessions` tree; external directory overrides are ignored.
+
+The new app identity may reset window placement and webview preferences. Legacy storage names remain only for compatibility, and the original copyright notice is preserved.
 
 ## License
 

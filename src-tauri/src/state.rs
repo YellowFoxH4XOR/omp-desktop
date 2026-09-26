@@ -17,7 +17,7 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(app: AppHandle, store: Arc<Store>) -> Self {
-        let registry = Arc::new(HarnessRegistry::new(store.clone()));
+        let registry = Arc::new(HarnessRegistry::new());
         let watcher = Arc::new(WatcherManager::new(app.clone()));
         let threads = ThreadManager::new(
             store.clone(),

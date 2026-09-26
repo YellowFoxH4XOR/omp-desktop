@@ -11,7 +11,7 @@ afterEach(async () => {
 });
 
 async function runValidation(platform: 'Darwin' | 'Linux') {
-  const bin = await mkdtemp(join(tmpdir(), 'omp-validate-'));
+  const bin = await mkdtemp(join(tmpdir(), 'pidesk-validate-'));
   tempDirs.push(bin);
   const log = join(bin, 'commands.log');
 

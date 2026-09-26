@@ -1,25 +1,21 @@
 <script lang="ts">
-  import type { AgentInfo } from '../../types';
   import CommandCard from './CommandCard.svelte';
   import EditCard from './EditCard.svelte';
   import GenericCard from './GenericCard.svelte';
   import ReadCard from './ReadCard.svelte';
   import SearchCard from './SearchCard.svelte';
-  import TaskCard from './TaskCard.svelte';
   import TodoCard from './TodoCard.svelte';
   import WebCard from './WebCard.svelte';
-  import { isXdTarget, type ToolItem } from './tool-utils';
+  import type { ToolItem } from './tool-utils';
 
   interface Props {
     item: ToolItem;
-    agents?: AgentInfo[];
     onShowChanges?: (path?: string) => void;
-    onShowAgents?: () => void;
   }
 
-  let { item, agents = [], onShowChanges, onShowAgents }: Props = $props();
+  let { item, onShowChanges }: Props = $props();
 
-  type Category = 'command' | 'read' | 'search' | 'edit' | 'write' | 'web' | 'task' | 'todo' | 'generic';
+  type Category = 'command' | 'read' | 'search' | 'edit' | 'write' | 'web' | 'todo' | 'generic';
 
   const CATEGORY_BY_NAME: Record<string, Category> = {
     bash: 'command',
@@ -83,11 +79,6 @@
     open_url: 'web',
     readurl: 'web',
     read_url: 'web',
-    task: 'task',
-    agent: 'task',
-    delegate: 'task',
-    spawnagent: 'task',
-    spawn_agent: 'task',
     todo: 'todo',
     todowrite: 'todo',
     todo_write: 'todo',
@@ -105,8 +96,6 @@
   const category = $derived.by((): Category => {
     const name = normalize(item.toolName);
     const mapped = CATEGORY_BY_NAME[name];
-    // OMP xd:// device writes are tool actions, not file writes.
-    if ((mapped === 'edit' || mapped === 'write') && isXdTarget(item.args)) return 'generic';
     return mapped ?? 'generic';
   });
 </script>
@@ -123,8 +112,6 @@
   <EditCard {item} write {onShowChanges} />
 {:else if category === 'web'}
   <WebCard {item} />
-{:else if category === 'task'}
-  <TaskCard {item} {agents} {onShowAgents} />
 {:else if category === 'todo'}
   <TodoCard {item} />
 {:else}

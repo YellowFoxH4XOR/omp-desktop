@@ -31,12 +31,6 @@ export function argUrl(args: Record<string, unknown>): string | undefined {
   return firstString(args, URL_KEYS);
 }
 
-/** True when a path-like argument targets an OMP xd:// tool device. */
-export function isXdTarget(args: Record<string, unknown>): boolean {
-  const target = argPath(args) ?? firstString(args, ['content', 'input']);
-  return typeof target === 'string' && target.startsWith('xd://');
-}
-
 function detailRecord(details: unknown): Record<string, unknown> | undefined {
   return details && typeof details === 'object' && !Array.isArray(details)
     ? (details as Record<string, unknown>)

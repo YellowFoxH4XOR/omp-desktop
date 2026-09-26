@@ -2,7 +2,7 @@
   import { onDestroy } from 'svelte';
   import { VList, type VListHandle } from 'virtua/svelte';
   import { ArrowDown, Brain, Info, Puzzle, Sparkles, TriangleAlert } from '@lucide/svelte';
-  import type { AgentInfo, ConversationItem } from '../../types';
+  import type { ConversationItem } from '../../types';
   import CommandCard from '../tools/CommandCard.svelte';
   import ToolCard from '../tools/ToolCard.svelte';
   import ToolShell from '../tools/ToolShell.svelte';
@@ -12,13 +12,11 @@
 
   interface Props {
     items: ConversationItem[];
-    agents?: AgentInfo[];
     status?: string;
     onShowChanges?: (path?: string) => void;
-    onShowAgents?: () => void;
   }
 
-  let { items, agents = [], status = 'idle', onShowChanges, onShowAgents }: Props = $props();
+  let { items, status = 'idle', onShowChanges }: Props = $props();
 
   let list = $state<VListHandle>();
   let wrap = $state<HTMLDivElement>();
@@ -192,7 +190,7 @@
                   {/snippet}
                 </ToolShell>
               {:else if item.kind === 'tool'}
-                <ToolCard {item} {agents} {onShowChanges} {onShowAgents} />
+                <ToolCard {item} {onShowChanges} />
               {:else if item.kind === 'advisor'}
                 <div class="advisor">
                   <div class="advisor-head">

@@ -1,10 +1,8 @@
-use crate::dto::{AgentInfo, HarnessKind};
-use crate::error::{AppError, AppResult};
 use crate::util;
 use parking_lot::Mutex;
-use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, Read, Seek, SeekFrom};
+use serde_json::Value;
+use std::collections::HashMap;
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
 const SESSION_CACHE_CAPACITY: usize = 512;
@@ -12,8 +10,6 @@ const SESSION_CACHE_BYTE_BUDGET: usize = 1024 * 1024;
 const MAX_SESSION_METADATA_FIELD_BYTES: usize = 4 * 1024;
 const MAX_SESSION_CWD_BYTES: usize = 8 * 1024;
 const MAX_METADATA_SCAN_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_TRANSCRIPT_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_TRANSCRIPT_RECORDS: usize = 50_000;
 const MAX_JSONL_RECORD_BYTES: usize = 8 * 1024 * 1024;
 
 fn bounded_text(value: &str, max_bytes: usize) -> String {
@@ -39,16 +35,13 @@ fn bounded_session(mut session: ScannedSession) -> ScannedSession {
 enum BoundedRecord {
     Eof,
     Line,
-    /// EOF with bytes that were never newline-terminated: the normal state
-    /// of a transcript a subagent is still appending to. Callers must skip
-    /// the fragment rather than parse it.
     Fragment,
     Oversized,
 }
 
-/// Read one newline-delimited record without allowing malformed or hostile
-/// files to grow the allocation beyond the protocol limit. An unterminated
-/// tail (no trailing newline at EOF) reports `Fragment`, never `Line`.
+/// Read one newline-delimited record without allowing a hostile session file
+/// to grow an allocation beyond Pi's frame limit. An unterminated tail is a
+/// normal in-progress write and is never parsed.
 fn read_bounded_record(
     reader: &mut impl BufRead,
     record: &mut Vec<u8>,
@@ -82,7 +75,6 @@ fn trimmed_record(record: &[u8]) -> &[u8] {
     record.strip_suffix(b"\r").unwrap_or(record)
 }
 
-/// Metadata recovered from one harness session file on disk.
 #[derive(Debug, Clone)]
 pub struct ScannedSession {
     pub session_file: String,
@@ -90,42 +82,50 @@ pub struct ScannedSession {
     pub cwd: String,
     pub title: String,
     pub created_at: String,
-    /// File mtime in unix seconds; used for recency ordering.
     pub modified_unix: u64,
 }
 
-/// Scan the harness session directory for `cwd` and return every session file
-/// that belongs to it, newest first.
-pub fn scan_sessions(kind: HarnessKind, cwd: &Path) -> Vec<ScannedSession> {
-    let dir = util::session_dir_for(kind, cwd);
-    // Both harnesses share one flat directory when PI_CODING_AGENT_SESSION_DIR
-    // overrides the layout; only then is the OMP title-slot discriminator
-    // required to keep their schema-compatible headers apart.
-    let shared_layout =
-        util::session_dir_for(HarnessKind::Omp, cwd) == util::session_dir_for(HarnessKind::Pi, cwd);
+/// Scan Pi's session directory for `cwd`, newest first.
+pub fn scan_sessions(cwd: &Path) -> Vec<ScannedSession> {
+    // No environment override or external layout is considered. Reject symlink
+    // escapes before reading any private session metadata.
+    for dir in [
+        util::pidesk_root(),
+        util::agent_dir(),
+        util::agent_dir().join("sessions"),
+    ] {
+        if util::check_owned_path(&dir, true).is_err() {
+            return Vec::new();
+        }
+    }
+    scan_session_directory(&util::session_dir_for(cwd), cwd)
+}
+
+fn scan_session_directory(dir: &Path, cwd: &Path) -> Vec<ScannedSession> {
     let mut out = Vec::new();
-    let Ok(read_dir) = std::fs::read_dir(&dir) else {
+    if util::check_owned_path(dir, true).is_err() {
+        return out;
+    }
+    let Ok(read_dir) = std::fs::read_dir(dir) else {
         return out;
     };
     for entry in read_dir.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+        if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl")
+            || util::check_owned_path(&path, false).is_err()
+        {
             continue;
         }
-        if let Some(s) = parse_session_file(kind, &path, shared_layout) {
-            // When PI_CODING_AGENT_SESSION_DIR flattens the layout, sessions
-            // from many cwds share one dir; keep only this project's.
-            if util::resolve_path(Path::new(&s.cwd)) != util::resolve_path(cwd) {
-                continue;
+        if let Some(session) = parse_session_file(&path) {
+            // Verify the header's cwd as well as the directory layout.
+            if util::resolve_path(Path::new(&session.cwd)) == util::resolve_path(cwd) {
+                out.push(session);
             }
-            out.push(s);
         }
     }
     out.sort_by(|a, b| b.modified_unix.cmp(&a.modified_unix));
     out
 }
-
-type CacheKey = (HarnessKind, PathBuf);
 
 struct CacheEntry {
     len: u64,
@@ -136,15 +136,15 @@ struct CacheEntry {
 }
 
 struct SessionCache {
-    entries: HashMap<CacheKey, CacheEntry>,
+    entries: HashMap<PathBuf, CacheEntry>,
     access_clock: u64,
     capacity: usize,
     byte_budget: usize,
     total_bytes: usize,
 }
 
-fn cache_entry_bytes(key: &CacheKey, session: &ScannedSession) -> usize {
-    key.1.as_os_str().len()
+fn cache_entry_bytes(path: &Path, session: &ScannedSession) -> usize {
+    path.as_os_str().len()
         + session.session_file.len()
         + session.session_id.len()
         + session.cwd.len()
@@ -175,12 +175,12 @@ impl SessionCache {
 
     fn get(
         &mut self,
-        key: &CacheKey,
+        path: &Path,
         len: u64,
         modified: std::time::SystemTime,
     ) -> Option<ScannedSession> {
         let access = self.next_access();
-        let entry = self.entries.get_mut(key)?;
+        let entry = self.entries.get_mut(path)?;
         if entry.len != len || entry.modified != modified {
             return None;
         }
@@ -190,18 +190,18 @@ impl SessionCache {
 
     fn insert(
         &mut self,
-        key: CacheKey,
+        path: PathBuf,
         len: u64,
         modified: std::time::SystemTime,
         session: ScannedSession,
     ) {
         let session = bounded_session(session);
-        let bytes = cache_entry_bytes(&key, &session);
+        let bytes = cache_entry_bytes(&path, &session);
         if bytes > self.byte_budget {
             return;
         }
         let access = self.next_access();
-        if let Some(previous) = self.entries.remove(&key) {
+        if let Some(previous) = self.entries.remove(&path) {
             self.total_bytes = self.total_bytes.saturating_sub(previous.bytes);
         }
         while self.entries.len() >= self.capacity
@@ -211,7 +211,7 @@ impl SessionCache {
                 .entries
                 .iter()
                 .min_by_key(|(_, entry)| entry.last_access)
-                .map(|(key, _)| key.clone())
+                .map(|(path, _)| path.clone())
             else {
                 break;
             };
@@ -221,7 +221,7 @@ impl SessionCache {
         }
         self.total_bytes = self.total_bytes.saturating_add(bytes);
         self.entries.insert(
-            key,
+            path,
             CacheEntry {
                 len,
                 modified,
@@ -236,22 +236,13 @@ impl SessionCache {
 static SESSION_CACHE: std::sync::LazyLock<Mutex<SessionCache>> =
     std::sync::LazyLock::new(|| Mutex::new(SessionCache::new(SESSION_CACHE_CAPACITY)));
 
-/// Parse the head of a session JSONL file.
-/// OMP: first line may be a `title` slot, then a `session` header.
-/// Pi: first line is the `session` header; `session_info` may follow.
-fn parse_session_file(
-    kind: HarnessKind,
-    path: &Path,
-    require_disambiguator: bool,
-) -> Option<ScannedSession> {
+/// Parse Pi's JSONL metadata. Pi sessions always start with a `session`
+/// record; later `session_info` records may rename them.
+fn parse_session_file(path: &Path) -> Option<ScannedSession> {
     let file = std::fs::File::open(path).ok()?;
     let metadata = file.metadata().ok()?;
     let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
-    let cache_key = (kind, path.to_path_buf());
-    if let Some(session) = SESSION_CACHE
-        .lock()
-        .get(&cache_key, metadata.len(), modified)
-    {
+    if let Some(session) = SESSION_CACHE.lock().get(path, metadata.len(), modified) {
         return Some(session);
     }
     let modified_unix = modified
@@ -263,54 +254,44 @@ fn parse_session_file(
     let mut created_at = String::new();
     let mut title = String::new();
     let mut first_user = None;
-    let mut omp_title_slot = false;
     let mut reader = std::io::BufReader::new(file);
     let mut line = Vec::new();
     let mut scanned_bytes = 0u64;
+    let mut first_record = true;
+
     loop {
         match read_bounded_record(&mut reader, &mut line, MAX_JSONL_RECORD_BYTES) {
             Ok(BoundedRecord::Line) => {}
-            Ok(BoundedRecord::Fragment) => continue,
-            Ok(BoundedRecord::Eof) => break,
-            Ok(BoundedRecord::Oversized) => return None,
-            Err(_) => return None,
+            Ok(BoundedRecord::Fragment | BoundedRecord::Eof) => break,
+            Ok(BoundedRecord::Oversized) | Err(_) => return None,
         }
         scanned_bytes = scanned_bytes.saturating_add(line.len() as u64);
-        // Pi may rename a session late, so metadata extraction has a hard
-        // aggregate budget rather than following an unbounded JSONL tail.
         if scanned_bytes > MAX_METADATA_SCAN_BYTES {
             return None;
         }
         let Ok(value) = serde_json::from_slice::<Value>(trimmed_record(&line)) else {
+            if first_record {
+                return None;
+            }
             continue;
         };
+        if first_record {
+            first_record = false;
+            if value.get("type").and_then(Value::as_str) != Some("session") {
+                return None;
+            }
+        }
         match value.get("type").and_then(Value::as_str) {
-            Some("session") => {
-                session_id = value
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                cwd = value
-                    .get("cwd")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
+            Some("session") if session_id.is_empty() => {
+                session_id = value.get("id").and_then(Value::as_str)?.to_string();
+                cwd = value.get("cwd").and_then(Value::as_str)?.to_string();
                 created_at = value
                     .get("timestamp")
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
             }
-            Some("title") => {
-                omp_title_slot = true;
-                if let Some(name) = value.get("title").and_then(Value::as_str) {
-                    if !name.trim().is_empty() {
-                        title = name.trim().to_string();
-                    }
-                }
-            }
-            Some("session_info") if kind == HarnessKind::Pi => {
+            Some("session_info") => {
                 for key in ["title", "name", "sessionName"] {
                     if let Some(name) = value.get(key).and_then(Value::as_str) {
                         if !name.trim().is_empty() {
@@ -322,8 +303,12 @@ fn parse_session_file(
             }
             Some("message") if first_user.is_none() => {
                 let message = value.get("message");
-                if message.and_then(|m| m.get("role")).and_then(Value::as_str) == Some("user") {
-                    let content = message.and_then(|m| m.get("content"));
+                if message
+                    .and_then(|message| message.get("role"))
+                    .and_then(Value::as_str)
+                    == Some("user")
+                {
+                    let content = message.and_then(|message| message.get("content"));
                     let text = content.and_then(Value::as_str).or_else(|| {
                         content.and_then(Value::as_array)?.iter().find_map(|part| {
                             (part.get("type").and_then(Value::as_str) == Some("text"))
@@ -338,21 +323,6 @@ fn parse_session_file(
             }
             _ => {}
         }
-        if kind == HarnessKind::Omp
-            && !session_id.is_empty()
-            && !cwd.is_empty()
-            && (!title.is_empty() || first_user.is_some())
-        {
-            break;
-        }
-    }
-    // OMP reserves a fixed-width title slot; Pi does not. That is the reliable
-    // discriminator between otherwise schema-compatible session headers, but
-    // it is only needed when both harnesses can write into one flat directory
-    // (`PI_CODING_AGENT_SESSION_DIR`). Legacy OMP sessions without the slot
-    // must still be listed from OMP's own session directory.
-    if require_disambiguator && (kind == HarnessKind::Omp) != omp_title_slot {
-        return None;
     }
     if session_id.is_empty() || cwd.is_empty() {
         return None;
@@ -368,353 +338,35 @@ fn parse_session_file(
         created_at,
         modified_unix,
     });
-    SESSION_CACHE
-        .lock()
-        .insert(cache_key, metadata.len(), modified, session.clone());
+    SESSION_CACHE.lock().insert(
+        path.to_path_buf(),
+        metadata.len(),
+        modified,
+        session.clone(),
+    );
     Some(session)
-}
-
-/// Bounded recursive discovery of agent transcripts: yields `(agent id, path)`.
-/// Depth-capped, entry-capped, `*.jsonl` only, skipping `__*`, invalid ids,
-/// and symlinks (never followed).
-const MAX_AGENT_DISCOVERY_DEPTH: usize = 3;
-const MAX_AGENT_DISCOVERY_ENTRIES: usize = 1024;
-
-fn discover_agent_transcripts(session_file: &str) -> Vec<(String, PathBuf)> {
-    let root = Path::new(session_file).with_extension("");
-    let mut out = Vec::new();
-    let mut stack = vec![(root, 0usize)];
-    let mut visited = 0usize;
-    while let Some((dir, depth)) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            visited += 1;
-            if visited > MAX_AGENT_DISCOVERY_ENTRIES || out.len() >= MAX_AGENT_DISCOVERY_ENTRIES {
-                return out;
-            }
-            let Ok(kind) = entry.file_type() else {
-                continue;
-            };
-            let path = entry.path();
-            if kind.is_dir() {
-                if depth < MAX_AGENT_DISCOVERY_DEPTH {
-                    stack.push((path, depth + 1));
-                }
-                continue;
-            }
-            if !kind.is_file() {
-                continue;
-            }
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
-            }
-            let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) else {
-                continue;
-            };
-            if id.starts_with("__") || !valid_agent_id(id) {
-                continue;
-            }
-            out.push((id.to_string(), path));
-        }
-    }
-    out
-}
-
-/// OMP stores subagent transcripts next to the main JSONL in its artifacts
-/// directory (`<session stem>/<agent-id>.jsonl`, with nested children under
-/// `<session stem>/<Parent>/<Parent>.<Child>.jsonl`). Exclude advisor internals.
-pub fn historical_agents(session_file: &str) -> Vec<AgentInfo> {
-    let mut agents = Vec::new();
-    for (id, path) in discover_agent_transcripts(session_file) {
-        let parent_id = id.rsplit_once('.').map(|(parent, _)| parent.to_string());
-        let status = agent_status_from_tail(&path);
-        agents.push(AgentInfo {
-            id: id.clone(),
-            parent_id,
-            parent_tool_call_id: None,
-            name: id.rsplit('.').next().unwrap_or(&id).to_string(),
-            role: None,
-            task: None,
-            status,
-            model: None,
-            effort: None,
-            activity: None,
-            tokens: None,
-            context_tokens: None,
-            context_window: None,
-            cost: None,
-            duration_ms: None,
-            tool_count: None,
-            session_file: Some(path.to_string_lossy().to_string()),
-            worktree_path: None,
-        });
-    }
-    agents.sort_by(|a, b| a.id.cmp(&b.id));
-    agents
-}
-
-fn valid_agent_id(id: &str) -> bool {
-    !id.is_empty()
-        && id != "."
-        && id != ".."
-        && id
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | '#'))
-}
-
-fn agent_status_from_tail(path: &Path) -> String {
-    use std::io::{Read, Seek, SeekFrom};
-    const TAIL_WINDOW: u64 = 1024 * 1024;
-    const FALLBACK_WINDOW: u64 = 8 * 1024 * 1024;
-    let Ok(mut file) = std::fs::File::open(path) else {
-        return "parked".into();
-    };
-    let Ok(len) = file.metadata().map(|meta| meta.len()) else {
-        return "parked".into();
-    };
-    // Larger bounded window first, then a bounded fallback for very long
-    // final records. Each pass starts on a record boundary so only complete
-    // records are parsed.
-    for window in [TAIL_WINDOW, FALLBACK_WINDOW] {
-        let offset = len.saturating_sub(window);
-        if file.seek(SeekFrom::Start(offset)).is_err() {
-            return "parked".into();
-        }
-        let mut bytes = Vec::new();
-        // Bounded: at most `window` bytes plus one partial head line.
-        if file.read_to_end(&mut bytes).is_err() {
-            return "parked".into();
-        }
-        let mut text = String::from_utf8_lossy(&bytes).into_owned();
-        if offset > 0 {
-            if let Some(index) = text.find('\n') {
-                text.drain(..=index);
-            } else {
-                continue;
-            }
-        }
-        for line in text.lines().rev() {
-            let Ok(entry) = serde_json::from_str::<Value>(line) else {
-                continue;
-            };
-            if entry.get("type").and_then(Value::as_str) != Some("message") {
-                continue;
-            }
-            let message = entry.get("message");
-            if message.and_then(|m| m.get("role")).and_then(Value::as_str) != Some("assistant") {
-                continue;
-            }
-            let reason = message
-                .and_then(|message| message.get("stopReason"))
-                .and_then(Value::as_str);
-            return match reason {
-                Some("stop") => "completed",
-                Some("error") => "failed",
-                Some("aborted") => "aborted",
-                _ => "parked",
-            }
-            .to_string();
-        }
-        if len <= window {
-            break;
-        }
-    }
-    "parked".into()
-}
-
-/// Reconstruct the active branch of a saved subagent transcript. The harness
-/// remains authoritative for execution; this read-only path works after its
-/// in-process RPC registry has been disposed.
-pub fn read_agent_messages(session_file: &str, agent_id: &str) -> AppResult<Vec<Value>> {
-    if !valid_agent_id(agent_id) || agent_id.starts_with("__") {
-        return Err(AppError::new("Invalid agent id."));
-    }
-    let dir = Path::new(session_file).with_extension("");
-    let path = discover_agent_transcripts(session_file)
-        .into_iter()
-        .find(|(id, _)| id == agent_id)
-        .map(|(_, path)| path)
-        .unwrap_or_else(|| dir.join(format!("{agent_id}.jsonl")));
-    let resolved_dir = std::fs::canonicalize(&dir)
-        .map_err(|_| AppError::new("Agent transcript directory is unavailable."))?;
-    let resolved_path = std::fs::canonicalize(&path)
-        .map_err(|_| AppError::new("Agent transcript is unavailable."))?;
-    if !resolved_path.starts_with(&resolved_dir) {
-        return Err(AppError::new(
-            "Agent transcript path escapes the session directory.",
-        ));
-    }
-    let file = std::fs::File::open(&resolved_path)
-        .map_err(|e| AppError::new(format!("Could not open agent transcript: {e}")))?;
-    let file_len = file
-        .metadata()
-        .map_err(|e| AppError::new(format!("Could not inspect agent transcript: {e}")))?
-        .len();
-    if file_len > MAX_TRANSCRIPT_BYTES {
-        return Err(AppError::new(
-            "Agent transcript is too large to reconstruct.",
-        ));
-    }
-
-    // Keep only parent links and byte ranges in the first pass. Values are
-    // parsed again only for the active branch, avoiding a second full copy of
-    // every JSONL record.
-    struct NodeRef {
-        parent: Option<String>,
-        offset: u64,
-        len: usize,
-        kind: RecordKind,
-    }
-    #[derive(Clone, Copy)]
-    enum RecordKind {
-        Message,
-        CustomMessage,
-        BranchSummary,
-        Compaction,
-        Other,
-    }
-    let mut nodes = HashMap::<String, NodeRef>::new();
-    let mut reader = std::io::BufReader::new(file);
-    let mut line = Vec::new();
-    let mut offset = 0u64;
-    let mut leaf = None;
-    let mut record_count = 0usize;
-    loop {
-        let record_offset = offset;
-        match read_bounded_record(&mut reader, &mut line, MAX_JSONL_RECORD_BYTES) {
-            Ok(BoundedRecord::Line) => {}
-            // A writer mid-append leaves an unterminated tail: skip it and
-            // keep the records that did land.
-            Ok(BoundedRecord::Fragment) => break,
-            Ok(BoundedRecord::Eof) => break,
-            Ok(BoundedRecord::Oversized) => {
-                return Err(AppError::new("Agent transcript record is too large."));
-            }
-            Err(e) => {
-                return Err(AppError::new(format!(
-                    "Could not read agent transcript: {e}"
-                )))
-            }
-        }
-        offset = offset.saturating_add(line.len() as u64);
-        record_count += 1;
-        if record_count > MAX_TRANSCRIPT_RECORDS || offset > MAX_TRANSCRIPT_BYTES {
-            return Err(AppError::new(
-                "Agent transcript is too large to reconstruct.",
-            ));
-        }
-        // One malformed record must not kill the whole replay: skip it and
-        // return the records that did parse. Filesystem/IO errors stay fatal.
-        let Ok(entry) = serde_json::from_slice::<Value>(trimmed_record(&line)) else {
-            continue;
-        };
-        let Some(id) = entry.get("id").and_then(Value::as_str) else {
-            continue;
-        };
-        if entry.get("type").and_then(Value::as_str) == Some("session") {
-            continue;
-        }
-        let kind = match entry.get("type").and_then(Value::as_str) {
-            Some("message") => RecordKind::Message,
-            Some("custom_message")
-                if entry.get("display").and_then(Value::as_bool) != Some(false) =>
-            {
-                RecordKind::CustomMessage
-            }
-            Some("branch_summary") => RecordKind::BranchSummary,
-            Some("compaction") => RecordKind::Compaction,
-            _ => RecordKind::Other,
-        };
-        nodes.insert(
-            id.to_string(),
-            NodeRef {
-                parent: entry
-                    .get("parentId")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                offset: record_offset,
-                len: line.len(),
-                kind,
-            },
-        );
-        leaf = Some(id.to_string());
-    }
-
-    let mut branch = Vec::new();
-    let mut seen = HashSet::new();
-    while let Some(id) = leaf {
-        if !seen.insert(id.clone()) {
-            return Err(AppError::new("Agent transcript contains a cyclic branch."));
-        }
-        let Some(node) = nodes.get(&id) else {
-            return Err(AppError::new("Agent transcript branch is incomplete."));
-        };
-        branch.push((node.offset, node.len, node.kind));
-        leaf = node.parent.clone();
-    }
-    branch.reverse();
-
-    let mut source = std::fs::File::open(&resolved_path)
-        .map_err(|e| AppError::new(format!("Could not reopen agent transcript: {e}")))?;
-    let mut record = Vec::new();
-    let mut messages = Vec::with_capacity(branch.len());
-    for (offset, len, kind) in branch {
-        if len > MAX_JSONL_RECORD_BYTES {
-            return Err(AppError::new("Agent transcript record is too large."));
-        }
-        source
-            .seek(SeekFrom::Start(offset))
-            .map_err(|e| AppError::new(format!("Could not seek agent transcript: {e}")))?;
-        record.resize(len, 0);
-        source
-            .read_exact(&mut record)
-            .map_err(|e| AppError::new(format!("Could not read agent transcript: {e}")))?;
-        let entry: Value = serde_json::from_slice(trimmed_record(&record)).map_err(|e| {
-            AppError::new(format!("Agent transcript contains an invalid record: {e}"))
-        })?;
-        let message = match kind {
-            RecordKind::Message => entry.get("message").cloned(),
-            RecordKind::CustomMessage => Some(json!({
-                "role":"custom",
-                "customType":entry.get("customType"),
-                "content":entry.get("content"),
-                "display":true,
-                "details":entry.get("details")
-            })),
-            RecordKind::BranchSummary => {
-                Some(json!({"role":"branchSummary","summary":entry.get("summary")}))
-            }
-            RecordKind::Compaction => {
-                Some(json!({"role":"compactionSummary","summary":entry.get("summary")}))
-            }
-            RecordKind::Other => None,
-        };
-        if let Some(message) = message {
-            messages.push(message);
-        }
-    }
-    Ok(messages)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn session_cache_is_lru_bounded() {
-        let mut cache = SessionCache::new(2);
-        let now = std::time::SystemTime::UNIX_EPOCH;
-        let session = |id: &str| ScannedSession {
+    fn session(id: &str) -> ScannedSession {
+        ScannedSession {
             session_file: id.to_string(),
             session_id: id.to_string(),
             cwd: "/tmp".to_string(),
             title: id.to_string(),
             created_at: String::new(),
             modified_unix: 0,
-        };
-        let key = |id: &str| (HarnessKind::Omp, PathBuf::from(id));
+        }
+    }
+
+    #[test]
+    fn session_cache_is_lru_bounded() {
+        let mut cache = SessionCache::new(2);
+        let now = std::time::SystemTime::UNIX_EPOCH;
+        let key = |id: &str| PathBuf::from(id);
         cache.insert(key("one"), 1, now, session("one"));
         cache.insert(key("two"), 1, now, session("two"));
         assert!(cache.get(&key("one"), 1, now).is_some());
@@ -723,23 +375,24 @@ mod tests {
         assert!(cache.get(&key("one"), 1, now).is_some());
         assert!(cache.get(&key("three"), 1, now).is_some());
     }
+
     #[test]
     fn session_metadata_is_truncated_before_return_and_cache_insert() {
-        let dir = std::env::temp_dir().join(format!("omp-huge-title-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("pidesk-huge-title-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("session.jsonl");
         let huge_title = "x".repeat(MAX_SESSION_METADATA_FIELD_BYTES * 2);
         std::fs::write(
             &path,
             format!(
-                "{{\"type\":\"title\",\"title\":\"{huge_title}\"}}\n{{\"type\":\"session\",\"id\":\"session-1\",\"cwd\":\"/tmp/repo\"}}\n"
+                "{{\"type\":\"session\",\"id\":\"session-1\",\"cwd\":\"/tmp/repo\"}}\n{{\"type\":\"session_info\",\"name\":\"{huge_title}\"}}\n"
             ),
         )
         .unwrap();
-        let session = parse_session_file(HarnessKind::Omp, &path, true).unwrap();
-        assert_eq!(session.title.len(), MAX_SESSION_METADATA_FIELD_BYTES);
+        let parsed = parse_session_file(&path).unwrap();
+        assert_eq!(parsed.title.len(), MAX_SESSION_METADATA_FIELD_BYTES);
         let cached = SESSION_CACHE.lock().get(
-            &(HarnessKind::Omp, path.clone()),
+            &path,
             std::fs::metadata(&path).unwrap().len(),
             std::fs::metadata(&path).unwrap().modified().unwrap(),
         );
@@ -751,28 +404,19 @@ mod tests {
     }
 
     #[test]
-    fn session_cache_evicts_when_byte_budget_is_reached() {
+    fn session_cache_evicts_at_byte_budget() {
         let now = std::time::SystemTime::UNIX_EPOCH;
-        let session = |id: &str| ScannedSession {
-            session_file: id.to_string(),
-            session_id: id.to_string(),
-            cwd: "/tmp".to_string(),
-            title: "title".to_string(),
-            created_at: String::new(),
-            modified_unix: 0,
-        };
-        let first_key = (HarnessKind::Omp, PathBuf::from("first"));
-        let second_key = (HarnessKind::Omp, PathBuf::from("second"));
+        let first = PathBuf::from("first");
+        let second = PathBuf::from("second");
         let mut cache = SessionCache::with_byte_budget(8, 1);
-        cache.insert(first_key.clone(), 1, now, session("first"));
+        cache.insert(first.clone(), 1, now, session("first"));
         assert!(cache.entries.is_empty());
-        cache.byte_budget = cache_entry_bytes(&second_key, &session("second"));
-        cache.insert(first_key.clone(), 1, now, session("first"));
-        cache.insert(second_key.clone(), 1, now, session("second"));
+        cache.byte_budget = cache_entry_bytes(&second, &session("second"));
+        cache.insert(first.clone(), 1, now, session("first"));
+        cache.insert(second.clone(), 1, now, session("second"));
         assert!(cache.total_bytes <= cache.byte_budget);
         assert_eq!(cache.entries.len(), 1);
-        assert!(cache.entries.contains_key(&second_key));
-        assert!(!cache.entries.contains_key(&first_key));
+        assert!(cache.entries.contains_key(&second));
     }
 
     #[test]
@@ -791,196 +435,53 @@ mod tests {
     }
 
     #[test]
-    fn session_titles_follow_each_harness_format() {
-        let dir = std::env::temp_dir().join(format!("omp-session-titles-{}", uuid::Uuid::new_v4()));
+    fn pi_title_uses_latest_name_or_first_prompt() {
+        let dir =
+            std::env::temp_dir().join(format!("pidesk-session-title-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let omp = dir.join("omp.jsonl");
-        std::fs::write(&omp, "{\"type\":\"title\",\"title\":\"Harness title\"}\n{\"type\":\"session\",\"id\":\"omp-1\",\"cwd\":\"/tmp/repo\",\"timestamp\":\"2026-09-23T00:00:00Z\"}\n{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"First prompt\"}}\n").unwrap();
-        assert_eq!(
-            parse_session_file(HarnessKind::Omp, &omp, true)
-                .unwrap()
-                .title,
-            "Harness title"
-        );
-
-        let pi = dir.join("pi.jsonl");
-        std::fs::write(&pi, "{\"type\":\"session\",\"id\":\"pi-1\",\"cwd\":\"/tmp/repo\",\"timestamp\":\"2026-09-23T00:00:00Z\"}\n{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"First prompt\"}}\n{\"type\":\"session_info\",\"name\":\"First name\"}\n{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"content\":[]}}\n{\"type\":\"session_info\",\"name\":\"Latest name\"}\n").unwrap();
-        assert_eq!(
-            parse_session_file(HarnessKind::Pi, &pi, true)
-                .unwrap()
-                .title,
-            "Latest name"
-        );
+        let named = dir.join("named.jsonl");
+        std::fs::write(&named, "{\"type\":\"session\",\"id\":\"pi-1\",\"cwd\":\"/tmp/repo\"}\n{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"First prompt\"}}\n{\"type\":\"session_info\",\"name\":\"First name\"}\n{\"type\":\"session_info\",\"name\":\"Latest name\"}\n").unwrap();
+        assert_eq!(parse_session_file(&named).unwrap().title, "Latest name");
 
         let untitled = dir.join("untitled.jsonl");
-        std::fs::write(&untitled, "{\"type\":\"session\",\"id\":\"pi-2\",\"cwd\":\"/tmp/repo\",\"timestamp\":\"2026-09-23T00:00:00Z\"}\n{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Investigate race condition\"}]}}\n").unwrap();
+        std::fs::write(&untitled, "{\"type\":\"session\",\"id\":\"pi-2\",\"cwd\":\"/tmp/repo\"}\n{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Investigate race condition\"}]}}\n").unwrap();
         assert_eq!(
-            parse_session_file(HarnessKind::Pi, &untitled, true)
-                .unwrap()
-                .title,
+            parse_session_file(&untitled).unwrap().title,
             "Investigate race condition"
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
-    fn flat_directory_uses_title_slot_to_classify_harness() {
-        let dir = std::env::temp_dir().join(format!("omp-flat-{}", uuid::Uuid::new_v4()));
+    fn discovery_skips_symlinked_session_files_and_directories() {
+        let dir = std::env::temp_dir().join(format!("pidesk-discovery-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let omp = dir.join("omp.jsonl");
-        std::fs::write(&omp, "{\"type\":\"title\",\"v\":1,\"title\":\"OMP\"}\n{\"type\":\"session\",\"version\":3,\"id\":\"omp\",\"timestamp\":\"2026-09-23T00:00:00Z\",\"cwd\":\"/tmp/repo\"}\n").unwrap();
-        let pi = dir.join("pi.jsonl");
-        std::fs::write(&pi, "{\"type\":\"session\",\"version\":3,\"id\":\"pi\",\"timestamp\":\"2026-09-23T00:00:00Z\",\"cwd\":\"/tmp/repo\"}\n").unwrap();
-        assert_eq!(
-            parse_session_file(HarnessKind::Omp, &omp, true)
-                .unwrap()
-                .session_id,
-            "omp"
-        );
-        assert!(parse_session_file(HarnessKind::Pi, &omp, true).is_none());
-        assert_eq!(
-            parse_session_file(HarnessKind::Pi, &pi, true)
-                .unwrap()
-                .session_id,
-            "pi"
-        );
-        assert!(parse_session_file(HarnessKind::Omp, &pi, true).is_none());
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    /// Legacy OMP sessions predate the fixed-width title slot. They must still
-    /// be listed from OMP's own session directory, while the shared-directory
-    /// discriminator keeps separating Pi's schema-compatible header.
-    #[test]
-    fn legacy_omp_session_without_title_slot_is_listed_outside_shared_layouts() {
-        let dir =
-            std::env::temp_dir().join(format!("omp-sessions-legacy-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let legacy = dir.join("legacy.jsonl");
+        let path = dir.join("private.jsonl");
         std::fs::write(
-            &legacy,
-            "{\"type\":\"session\",\"version\":3,\"id\":\"legacy\",\"timestamp\":\"2026-09-23T00:00:00Z\",\"cwd\":\"/tmp/repo\"}\n{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"Old prompt\"}}\n",
+            &path,
+            "{\"type\":\"session\",\"version\":3,\"id\":\"private\",\"cwd\":\"/tmp/project\"}\n",
         )
         .unwrap();
-        assert!(parse_session_file(HarnessKind::Omp, &legacy, true).is_none());
-        let session = parse_session_file(HarnessKind::Omp, &legacy, false).unwrap();
-        assert_eq!(session.session_id, "legacy");
-        assert_eq!(session.title, "Old prompt");
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn saved_nested_agent_transcript_survives_rpc_restart() {
-        let dir = std::env::temp_dir().join(format!("omp-agent-history-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let main = dir.join("session.jsonl");
-        std::fs::write(
-            &main,
-            "{\"type\":\"session\",\"id\":\"root\",\"cwd\":\"/tmp/repo\"}\n",
-        )
-        .unwrap();
-        let artifacts = main.with_extension("");
-        std::fs::create_dir_all(&artifacts).unwrap();
-        let child = artifacts.join("Backend.DatabaseExpert.jsonl");
-        std::fs::write(&child, "{\"type\":\"session\",\"id\":\"child\",\"cwd\":\"/tmp/repo\"}\n{\"type\":\"message\",\"id\":\"a\",\"parentId\":null,\"message\":{\"role\":\"user\",\"content\":\"Inspect database\"}}\n{\"type\":\"message\",\"id\":\"b\",\"parentId\":\"a\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Done\"}],\"stopReason\":\"stop\"}}\n").unwrap();
-        let agents = historical_agents(&main.to_string_lossy());
-        assert_eq!(agents.len(), 1);
-        assert_eq!(agents[0].id, "Backend.DatabaseExpert");
-        assert_eq!(agents[0].parent_id.as_deref(), Some("Backend"));
-        assert_eq!(agents[0].status, "completed");
-        let messages = read_agent_messages(&main.to_string_lossy(), &agents[0].id).unwrap();
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[1]["content"][0]["text"], "Done");
-        assert!(read_agent_messages(&main.to_string_lossy(), "../escape").is_err());
+        let cwd = Path::new("/tmp/project");
+        assert_eq!(scan_session_directory(&dir, cwd).len(), 1);
         #[cfg(unix)]
         {
-            let outside = dir.join("outside.jsonl");
-            std::fs::write(&outside, "{\"type\":\"message\",\"id\":\"x\"}\n").unwrap();
-            std::os::unix::fs::symlink(&outside, artifacts.join("Outsider.jsonl")).unwrap();
-            assert_eq!(historical_agents(&main.to_string_lossy()).len(), 1);
+            std::os::unix::fs::symlink(&path, dir.join("external.jsonl")).unwrap();
+            assert_eq!(scan_session_directory(&dir, cwd).len(), 1);
+            std::os::unix::fs::symlink(&dir, dir.join("linked")).unwrap();
+            assert!(scan_session_directory(&dir.join("linked"), cwd).is_empty());
         }
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// OMP 18.3.1 stores nested children one directory deeper as
-    /// `<artifacts>/<Parent>/<Parent>.<Child>.jsonl`; both discovery and
-    /// transcript lookup must resolve that layout after the RPC registry is
-    /// gone, or nested agents vanish from the panel on restart.
     #[test]
-    fn nested_child_transcript_is_discovered_and_readable() {
-        let dir = std::env::temp_dir().join(format!("omp-agent-nested-{}", uuid::Uuid::new_v4()));
+    fn non_pi_header_is_not_discovered() {
+        let dir =
+            std::env::temp_dir().join(format!("pidesk-session-header-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let main = dir.join("session.jsonl");
-        std::fs::write(
-            &main,
-            "{\"type\":\"session\",\"id\":\"root\",\"cwd\":\"/tmp/repo\"}\n",
-        )
-        .unwrap();
-        let artifacts = main.with_extension("");
-        let nested_dir = artifacts.join("Backend");
-        std::fs::create_dir_all(&nested_dir).unwrap();
-        std::fs::write(
-            nested_dir.join("Backend.DatabaseExpert.jsonl"),
-            "{\"type\":\"session\",\"id\":\"child\",\"cwd\":\"/tmp/repo\"}\n{\"type\":\"message\",\"id\":\"a\",\"parentId\":null,\"message\":{\"role\":\"user\",\"content\":\"Inspect database\"}}\n{\"type\":\"message\",\"id\":\"b\",\"parentId\":\"a\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Done\"}],\"stopReason\":\"stop\"}}\n",
-        )
-        .unwrap();
-        let agents = historical_agents(&main.to_string_lossy());
-        let nested = agents
-            .iter()
-            .find(|agent| agent.id == "Backend.DatabaseExpert")
-            .expect("nested child transcript must be discovered");
-        assert_eq!(nested.parent_id.as_deref(), Some("Backend"));
-        assert_eq!(nested.status, "completed");
-        let messages =
-            read_agent_messages(&main.to_string_lossy(), "Backend.DatabaseExpert").unwrap();
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[1]["content"][0]["text"], "Done");
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    /// A subagent is often read while it is still appending: a torn final
-    /// record or one corrupt line must not make the whole transcript
-    /// unavailable, matching the harness's own tolerant loaders.
-    #[test]
-    fn malformed_transcript_records_are_skipped() {
-        let dir = std::env::temp_dir().join(format!("omp-agent-torn-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let main = dir.join("session.jsonl");
-        std::fs::write(
-            &main,
-            "{\"type\":\"session\",\"id\":\"root\",\"cwd\":\"/tmp/repo\"}\n",
-        )
-        .unwrap();
-        let artifacts = main.with_extension("");
-        std::fs::create_dir_all(&artifacts).unwrap();
-        std::fs::write(
-            artifacts.join("Torn.jsonl"),
-            "{\"type\":\"session\",\"id\":\"torn\"}\nnot json at all\n{\"type\":\"message\",\"id\":\"a\",\"parentId\":null,\"message\":{\"role\":\"user\",\"content\":\"One\"}}\n{\"type\":\"message\",\"id\":\"b\",\"parentId\":\"a\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Two\"}],\"stopReason\":\"stop\"}}\n{\"type\":\"message\",\"id\":\"c\",\"pare",
-        )
-        .unwrap();
-        let messages = read_agent_messages(&main.to_string_lossy(), "Torn").unwrap();
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0]["content"], "One");
-        assert_eq!(messages[1]["content"][0]["text"], "Two");
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    /// Status recovery must not classify a finished agent as `parked` just
-    /// because its final assistant record starts before a fixed tail window.
-    #[test]
-    fn long_final_assistant_record_still_reports_completed() {
-        let dir = std::env::temp_dir().join(format!("omp-agent-status-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("Long.jsonl");
-        let filler = "x".repeat(200 * 1024);
-        std::fs::write(
-            &path,
-            format!(
-                "{{\"type\":\"session\",\"id\":\"long\"}}\n{{\"type\":\"message\",\"id\":\"a\",\"parentId\":null,\"message\":{{\"role\":\"user\",\"content\":\"{filler}\"}}}}\n{{\"type\":\"message\",\"id\":\"b\",\"parentId\":\"a\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"Done\"}}],\"stopReason\":\"stop\"}}}}\n"
-            ),
-        )
-        .unwrap();
-        assert_eq!(agent_status_from_tail(&path), "completed");
+        let path = dir.join("other.jsonl");
+        std::fs::write(&path, "{\"type\":\"title\",\"title\":\"Other\"}\n{\"type\":\"session\",\"id\":\"other\",\"cwd\":\"/tmp/repo\"}\n").unwrap();
+        assert!(parse_session_file(&path).is_none());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

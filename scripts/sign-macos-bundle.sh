@@ -6,7 +6,7 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
   exit 1
 fi
 
-app_path="${1:-src-tauri/target/release/bundle/macos/OMP Desktop.app}"
+app_path="${1:-src-tauri/target/release/bundle/macos/πDesk.app}"
 
 if [[ ! -d "$app_path" ]]; then
   echo "Application bundle not found: $app_path" >&2

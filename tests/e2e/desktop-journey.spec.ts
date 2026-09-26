@@ -2,9 +2,9 @@ import { expect, test, type Page } from '@playwright/test';
 
 const project = {
   id: 'project-1',
-  path: '/tmp/omp-desktop-e2e',
+  path: '/tmp/pidesk-e2e',
   displayName: 'desktop-e2e',
-  preferredHarness: 'omp',
+  preferredHarness: 'pi',
   isGit: true,
   createdAt: '2026-01-01T00:00:00Z',
   lastOpenedAt: '2026-01-01T00:00:00Z',
@@ -14,7 +14,7 @@ function thread(id: string, title: string, viewedAt: string) {
   return {
     id,
     projectId: project.id,
-    harness: 'omp',
+    harness: 'pi',
     sessionId: `session-${id}`,
     sessionFile: `/tmp/${id}.jsonl`,
     cwd: project.path,
@@ -28,6 +28,11 @@ function thread(id: string, title: string, viewedAt: string) {
 }
 
 interface Scenario {
+  piInstalled?: boolean;
+  systemPiOnly?: boolean;
+  manualInstall?: boolean;
+  missingInstallPlan?: boolean;
+  deferEvents?: boolean;
   titles?: [string, string];
   openDelay?: Record<string, number>;
   sendDelay?: number;
@@ -38,7 +43,7 @@ interface Scenario {
 
 async function installDesktopMock(page: Page, scenario: Scenario = {}) {
   const [firstTitle, secondTitle] = scenario.titles ?? ['Alpha', 'Beta'];
-  await page.addInitScript(({ project, threads, openDelay, sendDelay, rememberedThreadId, assistantText }) => {
+  await page.addInitScript(({ project, threads, openDelay, sendDelay, rememberedThreadId, assistantText, piInstalled, systemPiOnly, manualInstall, missingInstallPlan, deferEvents }) => {
     localStorage.setItem('lastProject', project.id);
     if (rememberedThreadId) localStorage.setItem('lastThread', rememberedThreadId);
     const callbacks = new Map<number, (event: unknown) => void>();
@@ -46,8 +51,16 @@ async function installDesktopMock(page: Page, scenario: Scenario = {}) {
     const calls: Array<{ command: string; args: Record<string, unknown> }> = [];
     let nextCallback = 0;
     let nextListener = 0;
+    let installed = piInstalled;
+    let finishInstall: ((error?: string) => void) | undefined;
+    let connectEvents: (() => void) | undefined;
     let changedFiles = [{ path: 'sample.txt', status: 'M', additions: 1, deletions: 1, binary: false }];
     const clone = <T>(value: T): T => structuredClone(value);
+    const emit = (payload: unknown) => {
+      for (const [id, listener] of listeners) {
+        if (listener.event === 'desktop-event') callbacks.get(listener.handler)?.({ event: listener.event, id, payload });
+      }
+    };
     const snapshot = (id: string) => {
       const row = threads.find(candidate => candidate.id === id);
       if (!row) throw new Error(`Unknown thread ${id}`);
@@ -57,8 +70,8 @@ async function installDesktopMock(page: Page, scenario: Scenario = {}) {
         state: { sessionId: row.sessionId, sessionFile: row.sessionFile, isStreaming: false },
         models: [], levels: [], agents: [],
         capabilities: {
-          agents: true, nestedAgents: true, agentSteering: false, agentKill: false,
-          agentRevive: false, planMode: false, permissions: true, modelSwitching: false,
+          agents: false, nestedAgents: false, agentSteering: false, agentKill: false,
+          agentRevive: false, planMode: false, permissions: false, modelSwitching: false,
           effortLevels: false, contextUsage: false, tokenUsage: false, worktrees: true,
         },
       };
@@ -81,13 +94,36 @@ async function installDesktopMock(page: Page, scenario: Scenario = {}) {
         if (command === 'plugin:event|listen') {
           const id = ++nextListener;
           listeners.set(id, { event: String(args.event), handler: Number(args.handler) });
+          if (deferEvents) return await new Promise<number>(resolve => { connectEvents = () => resolve(id); });
           return id;
         }
         if (command === 'plugin:event|unlisten') {
           listeners.delete(Number(args.eventId));
           return;
         }
-        if (command === 'detect_harnesses') return [{ kind: 'omp', path: '/usr/local/bin/omp', version: '18.2.11', source: 'path' }];
+        if (command === 'detect_harnesses') return installed ? [{ kind: 'pi', path: '/Users/test/.pidesk/runtime/node_modules/.bin/pi', version: '0.87.1', source: 'managed' }] : systemPiOnly ? [{ kind: 'pi', path: '/usr/local/bin/pi', version: '0.87.1', source: 'PATH' }] : [];
+        if (command === 'harness_install_commands') return missingInstallPlan ? [] : [{ kind: 'pi', command: 'npm install --prefix /Users/test/.pidesk/runtime --ignore-scripts --no-audit --no-fund @earendil-works/pi-coding-agent', installPath: '/Users/test/.pidesk/runtime', agentDir: '/Users/test/.pidesk/agent', loginCommand: 'env -i HOME="$HOME" PATH="$PATH" PI_CODING_AGENT_DIR=/Users/test/.pidesk/agent /Users/test/.pidesk/runtime/node_modules/.bin/pi --no-approve' }];
+        if (command === 'install_harness') {
+          emit({ type: 'install_stage', kind: 'pi', stage: 'preparing' });
+          emit({ type: 'install_progress', kind: 'pi', line: 'Checking Node.js and npm…' });
+          if (manualInstall) return await new Promise<void>((resolve, reject) => {
+            finishInstall = error => {
+              emit({ type: 'install_finished', kind: 'pi', success: !error, error });
+              if (error) reject(new Error(error));
+              else { installed = true; resolve(); }
+            };
+          });
+          installed = true;
+          emit({ type: 'install_stage', kind: 'pi', stage: 'verifying' });
+          emit({ type: 'install_progress', kind: 'pi', line: 'Private Pi verified.' });
+          emit({ type: 'install_finished', kind: 'pi', success: true });
+          return;
+        }
+        if (command === 'create_thread') {
+          const row = { ...threads[0], id: 'new-thread', title: 'New thread', harness: String(args.harness) };
+          threads.push(row);
+          return clone(row);
+        }
         if (command === 'list_projects') return [clone(project)];
         if (command === 'list_threads') return clone(threads);
         if (command === 'open_thread' || command === 'restart_thread') {
@@ -115,18 +151,25 @@ async function installDesktopMock(page: Page, scenario: Scenario = {}) {
             currentHash: 'expected-hash', binary: false, tooLarge: false };
         }
         if (command === 'git_revert_file') { changedFiles = []; return; }
-        if (command === 'stop_thread' || command === 'respond_ui' || command === 'abort_thread') return;
+        if (command === 'get_runtime_stats') {
+          const runtime = (window as any).__runtimeStats ?? { appBytes: 90 * 1024 * 1024, threads: [] };
+          const stopped: string[] = (window as any).__stoppedThreads ?? [];
+          return { ...runtime, threads: runtime.threads.filter((thread: { threadId: string }) => !stopped.includes(thread.threadId)) };
+        }
+        if (command === 'stop_thread') {
+          (window as any).__stoppedThreads = [...((window as any).__stoppedThreads ?? []), String(args.threadId)];
+          return;
+        }
+        if (command === 'respond_ui' || command === 'abort_thread') return;
         throw new Error(`Unexpected Tauri command: ${command}`);
       },
     };
     host.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener() {} };
     host.__mockDesktop = {
       calls,
-      emit(payload: unknown) {
-        for (const [id, listener] of listeners) {
-          if (listener.event === 'desktop-event') callbacks.get(listener.handler)?.({ event: listener.event, id, payload });
-        }
-      },
+      emit,
+      finishInstall(error?: string) { finishInstall?.(error); },
+      connectEvents() { connectEvents?.(); },
     };
   }, {
     project,
@@ -138,8 +181,118 @@ async function installDesktopMock(page: Page, scenario: Scenario = {}) {
     sendDelay: scenario.sendDelay ?? 0,
     rememberedThreadId: scenario.rememberedThreadId,
     assistantText: scenario.assistantText,
+    piInstalled: scenario.piInstalled ?? true,
+    systemPiOnly: scenario.systemPiOnly ?? false,
+    manualInstall: scenario.manualInstall ?? false,
+    missingInstallPlan: scenario.missingInstallPlan ?? false,
+    deferEvents: scenario.deferEvents ?? false,
   });
 }
+
+test('private Pi setup ignores system Pi and never auto-installs', async ({ page }, testInfo) => {
+  await installDesktopMock(page, { piInstalled: false, systemPiOnly: true });
+  await page.goto('/');
+  await expect(page).toHaveTitle('πDesk');
+  await expect(page.getByRole('heading', { name: 'A Pi of its own.' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Install Pi', exact: true })).toBeEnabled();
+  await expect(page.getByRole('button', { name: /Locate|Choose…/ })).toHaveCount(0);
+  await expect(page.getByText('/Users/test/.pidesk/runtime', { exact: true })).toBeVisible();
+  expect(await page.evaluate(() => (window as any).__mockDesktop.calls.some((call: any) => call.command === 'install_harness'))).toBe(false);
+  await page.screenshot({ path: testInfo.outputPath('private-pi-setup.png') });
+  await page.getByRole('button', { name: 'Install Pi', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Your Pi is ready.' })).toBeVisible();
+  await expect(page.getByRole('log', { name: 'Pi installation output' })).toContainText('Private Pi verified.');
+  await expect(page.getByRole('textbox', { name: 'Private Pi sign-in command' })).toHaveValue(/PI_CODING_AGENT_DIR=.*\.pidesk\/agent/);
+  expect(await page.evaluate(() => (window as any).__mockDesktop.calls.filter((call: any) => call.command === 'install_harness'))).toEqual([{ command: 'install_harness', args: { kind: 'pi' } }]);
+  await page.getByRole('button', { name: 'Continue to πDesk' }).click();
+  await expect(page.getByRole('heading', { name: 'What shall we work on?' })).toBeVisible();
+});
+
+test('Install waits for its live event subscription before enabling', async ({ page }) => {
+  await installDesktopMock(page, { piInstalled: false, deferEvents: true });
+  await page.goto('/');
+  await expect(page.getByRole('heading', { name: 'A Pi of its own.' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Install Pi', exact: true })).toBeDisabled();
+  await page.evaluate(() => (window as any).__mockDesktop.connectEvents());
+  await expect(page.getByRole('button', { name: 'Install Pi', exact: true })).toBeEnabled();
+  await page.getByRole('button', { name: 'Install Pi', exact: true }).click();
+  await expect(page.getByRole('log', { name: 'Pi installation output' })).toContainText('Checking Node.js and npm…');
+  await expect(page.getByRole('heading', { name: 'Your Pi is ready.' })).toBeVisible();
+});
+
+test('installer streams actual stages, retains errors, and supports retry', async ({ page }) => {
+  await installDesktopMock(page, { piInstalled: false, manualInstall: true });
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Install Pi', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Checking requirements…', exact: true })).toBeDisabled();
+  const log = page.getByRole('log', { name: 'Pi installation output' });
+  await expect(log).toContainText('Checking Node.js and npm…');
+  await page.evaluate(() => {
+    const mock = (window as any).__mockDesktop;
+    mock.emit({ type: 'install_stage', kind: 'pi', stage: 'installing' });
+    mock.emit({ type: 'install_progress', kind: 'pi', line: 'Fetching packages <script>not HTML</script>' });
+  });
+  await expect(page.getByRole('button', { name: 'Installing packages…', exact: true })).toBeDisabled();
+  await expect(log).toContainText('Fetching packages <script>not HTML</script>');
+  await expect(log.locator('script')).toHaveCount(0);
+  await page.evaluate(() => (window as any).__mockDesktop.finishInstall('Registry unavailable. Check your connection.'));
+  await expect(page.getByRole('alert')).toContainText('Registry unavailable.');
+  await expect(log).toContainText('Fetching packages');
+  await page.getByRole('button', { name: 'Retry installation' }).click();
+  await expect(page.getByRole('button', { name: 'Checking requirements…', exact: true })).toBeDisabled();
+  await expect(page.getByRole('alert')).toHaveCount(0);
+  await page.evaluate(() => {
+    const mock = (window as any).__mockDesktop;
+    mock.emit({ type: 'install_stage', kind: 'pi', stage: 'verifying' });
+    mock.emit({ type: 'install_progress', kind: 'pi', line: 'Checking private Pi version…' });
+  });
+  await expect(page.getByRole('button', { name: 'Verifying installation…', exact: true })).toBeDisabled();
+  await page.evaluate(() => (window as any).__mockDesktop.finishInstall());
+  await expect(page.getByRole('heading', { name: 'Your Pi is ready.' })).toBeVisible();
+  expect(await page.evaluate(() => (window as any).__mockDesktop.calls.filter((call: any) => call.command === 'install_harness'))).toHaveLength(2);
+});
+
+test('live installer output stays bounded during a noisy install', async ({ page }) => {
+  await installDesktopMock(page, { piInstalled: false, manualInstall: true });
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Install Pi', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Checking requirements…', exact: true })).toBeDisabled();
+  await page.evaluate(() => {
+    const mock = (window as any).__mockDesktop;
+    for (let i = 0; i < 300; i++) mock.emit({ type: 'install_progress', kind: 'pi', line: `package-${i} ` + 'x'.repeat(5000) });
+  });
+  const output = await page.getByRole('log', { name: 'Pi installation output' }).innerText();
+  expect(output).not.toContain('package-99 ');
+  expect(output).toContain('package-100 ');
+  expect(output).toContain('package-299 ');
+  expect(output.length).toBeLessThan(200 * 4100);
+  await page.evaluate(() => (window as any).__mockDesktop.finishInstall());
+  await expect(page.getByRole('heading', { name: 'Your Pi is ready.' })).toBeVisible();
+});
+
+test('missing private installer metadata fails closed instead of using a global fallback', async ({ page }) => {
+  await installDesktopMock(page, { piInstalled: false, missingInstallPlan: true });
+  await page.goto('/');
+  await expect(page.getByRole('alert')).toContainText('Private installer information is unavailable.');
+  await expect(page.getByRole('button', { name: 'Install Pi', exact: true })).toBeDisabled();
+  expect(await page.evaluate(() => (window as any).__mockDesktop.calls.some((call: any) => call.command === 'install_harness'))).toBe(false);
+});
+
+test('new threads and settings are Pi-only', async ({ page }) => {
+  await installDesktopMock(page);
+  await page.goto('/');
+  await expect(page.getByRole('heading', { name: 'What shall we work on?' })).toBeVisible();
+  await expect(page.getByRole('combobox', { name: 'Harness for new threads' })).toHaveCount(0);
+  await page.locator('.new-thread').click();
+  await expect(page.getByText('History new-thread')).toBeVisible();
+  expect(await page.evaluate(() => (window as any).__mockDesktop.calls.filter((call: any) => call.command === 'create_thread'))).toEqual([{ command: 'create_thread', args: { projectId: 'project-1', harness: 'pi', isolated: false } }]);
+  await expect(page.getByRole('button', { name: 'Toggle agents' })).toHaveCount(0);
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Private Pi installation' })).toBeVisible();
+  await expect(page.getByText('/Users/test/.pidesk/runtime/node_modules/.bin/pi', { exact: true })).toBeVisible();
+  await expect(page.getByText('OMP', { exact: true })).toHaveCount(0);
+  await expect(page.getByRole('textbox', { name: 'Private Pi sign-in command' })).toBeVisible();
+});
 
 test('assistant HTML cannot carry layout CSS, scripts, or remote images', async ({ page }) => {
   await installDesktopMock(page, {
@@ -171,7 +324,7 @@ test('assistant HTML cannot carry layout CSS, scripts, or remote images', async 
     scripts: 0,
     images: 0,
     javascriptHrefs: 0,
-    title: 'OMP Desktop',
+    title: 'πDesk',
   });
 });
 
@@ -258,4 +411,96 @@ test('benign ResizeObserver warnings stay silent and project removal lives in th
   await expect(page.getByRole('menuitem', { name: 'Remove from app' })).toBeVisible();
   await page.keyboard.press('Escape');
   await expect(page.getByRole('menuitem', { name: 'Remove from app' })).toHaveCount(0);
+});
+
+test('mermaid fences render as sanitized diagrams with a code toggle', async ({ page }) => {
+  await installDesktopMock(page, {
+    assistantText: [
+      'Architecture:',
+      '',
+      '```mermaid',
+      'flowchart TD',
+      '  Client[Client App] --> Gateway[API Gateway]',
+      '  Gateway --> Catalog[Catalog Service]',
+      '  click Client "javascript:document.title=\'XSS-M\'"',
+      '```',
+    ].join('\n'),
+  });
+  await page.goto('/');
+  await page.locator('.thread-link[title="Alpha"]').click();
+  const diagram = page.getByRole('img', { name: 'Mermaid diagram' });
+  await expect(diagram.locator('svg')).toBeVisible({ timeout: 15_000 });
+  await expect(diagram).toContainText('API Gateway');
+  const probe = await diagram.evaluate((node) => ({
+    scripts: node.querySelectorAll('script').length,
+    anchors: node.querySelectorAll('a').length,
+    foreign: node.querySelectorAll('foreignObject').length,
+    handlers: Array.from(node.querySelectorAll('*')).filter((el) => Array.from(el.attributes).some((a) => a.name.startsWith('on'))).length,
+  }));
+  expect(probe).toEqual({ scripts: 0, anchors: 0, foreign: 0, handlers: 0 });
+  await expect(page).toHaveTitle('πDesk');
+
+  await page.getByRole('button', { name: 'Code', exact: true }).click();
+  await expect(page.getByText('flowchart TD')).toBeVisible();
+  await expect(diagram).toHaveCount(0);
+});
+
+test('invalid mermaid falls back to code with a readable error', async ({ page }) => {
+  await installDesktopMock(page, { assistantText: '```mermaid\nflowchart TD\n  A -->\n```' });
+  await page.goto('/');
+  await page.locator('.thread-link[title="Alpha"]').click();
+  await expect(page.getByText(/Couldn’t render diagram/)).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByText('flowchart TD')).toBeVisible();
+  expect(await page.evaluate(() => document.querySelectorAll('body > [id^="dpidesk-mermaid"], body > [id^="pidesk-mermaid"]').length)).toBe(0);
+});
+
+test('the open project collapses and re-expands from its row', async ({ page }) => {
+  await installDesktopMock(page);
+  await page.goto('/');
+  await expect(page.getByRole('heading', { name: 'What shall we work on?' })).toBeVisible();
+  const toggle = page.getByRole('button', { name: 'Open desktop-e2e' });
+  await expect(toggle).toHaveAttribute('aria-expanded', 'true');
+  await expect(page.locator('.thread-link[title="Alpha"]')).toBeVisible();
+  await toggle.click();
+  await expect(toggle).toHaveAttribute('aria-expanded', 'false');
+  await expect(page.locator('.thread-link[title="Alpha"]')).toHaveCount(0);
+  await toggle.click();
+  await expect(toggle).toHaveAttribute('aria-expanded', 'true');
+  await expect(page.locator('.thread-link[title="Alpha"]')).toBeVisible();
+});
+
+test('runtime monitor shows per-project Pi memory and stops only idle threads', async ({ page }) => {
+  await installDesktopMock(page);
+  const mb = 1024 * 1024;
+  await page.addInitScript((mb) => {
+    (window as any).__runtimeStats = {
+      appBytes: 80 * mb,
+      threads: [
+        { threadId: 'a', projectId: 'project-1', title: 'Alpha', pid: 101, memoryBytes: 210 * mb, processCount: 3, busy: false, idleSeconds: 30 },
+        { threadId: 'b', projectId: 'project-1', title: 'Beta', pid: 102, memoryBytes: 150 * mb, processCount: 1, busy: false, idleSeconds: 600 },
+        { threadId: 'c', projectId: 'project-1', title: 'Gamma', pid: 103, memoryBytes: 140 * mb, processCount: 1, busy: true, idleSeconds: 0 },
+      ],
+    };
+  }, mb);
+  await page.goto('/');
+  await page.locator('.thread-link[title="Alpha"]').click();
+  await expect(page.getByText('History a')).toBeVisible();
+
+  const pill = page.getByRole('button', { name: /Pi runtime: 3 running, 500 MB/ });
+  await expect(pill).toBeVisible();
+  await pill.click();
+  const panel = page.getByRole('dialog', { name: 'Running Pi instances' });
+  await expect(panel.getByText('desktop-e2e')).toBeVisible();
+  await expect(panel.getByText('210 MB')).toBeVisible();
+  await expect(panel.getByText('Working')).toBeVisible();
+  await expect(panel.getByRole('button', { name: 'Stop Gamma' })).toBeDisabled();
+
+  // Alpha is open in the main pane and Gamma is busy: bulk stop only takes Beta.
+  await panel.getByRole('button', { name: 'Stop idle threads (1)' }).click();
+  await expect(panel.getByText('Beta')).toHaveCount(0);
+  const stopped = await page.evaluate(() => (window as any).__mockDesktop.calls.filter((call: { command: string }) => call.command === 'stop_thread').map((call: { args: { threadId: string } }) => call.args.threadId));
+  expect(stopped).toEqual(['b']);
+  await expect(panel.getByRole('button', { name: 'Stop Alpha' })).toBeEnabled();
+  await page.keyboard.press('Escape');
+  await expect(panel).toHaveCount(0);
 });

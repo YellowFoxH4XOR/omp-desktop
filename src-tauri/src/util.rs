@@ -67,87 +67,203 @@ pub fn resolve_path(p: &Path) -> PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|_| normalize_path(p))
 }
 
-/// OMP session directory name for a cwd:
-/// - under $HOME: `-` + relative path with separators replaced by `-`
-/// - under tmpdir: `-tmp` + relative path encoded the same way
-/// - anywhere else: `--` + absolute path (leading slash stripped) + `--`
-pub fn omp_session_dir_name(cwd: &Path) -> String {
-    let resolved = resolve_path(cwd);
-    let home = resolve_path(&home_dir());
-    if let Ok(rel) = resolved.strip_prefix(&home) {
-        return encode_dashed("-", rel);
-    }
-    let tmp = resolve_path(&std::env::temp_dir());
-    if let Ok(rel) = resolved.strip_prefix(&tmp) {
-        return encode_dashed("-tmp", rel);
-    }
-    format!(
-        "--{}--",
-        dash_encode(
-            &resolved
-                .to_string_lossy()
-                .replace('\\', "/")
-                .trim_start_matches('/')
-                .to_string()
-        )
-    )
-}
-
-fn encode_dashed(prefix: &str, rel: &Path) -> String {
-    let s = rel.to_string_lossy().replace(['/', '\\', ':'], "-");
-    if s.is_empty() {
-        prefix.to_string()
-    } else if prefix.ends_with('-') {
-        format!("{prefix}{s}")
-    } else {
-        format!("{prefix}-{s}")
-    }
-}
-
-fn dash_encode(s: &str) -> String {
-    s.replace(['/', '\\', ':'], "-")
-}
-
 /// Pi session directory name: always `--<abs path encoded>--`.
 pub fn pi_session_dir_name(cwd: &Path) -> String {
     let resolved = resolve_path(cwd);
     let s = resolved.to_string_lossy().replace('\\', "/");
-    format!("--{}--", dash_encode(s.trim_start_matches('/')))
+    format!(
+        "--{}--",
+        s.trim_start_matches('/').replace(['/', '\\', ':'], "-")
+    )
 }
 
-/// Use shell-profile overrides even when launched from Finder, whose
-/// environment usually omits the user's terminal configuration.
-fn harness_env(key: &str) -> Option<String> {
-    std::env::var(key)
-        .ok()
-        .filter(|value| !value.is_empty())
-        .or_else(|| login_shell_env().and_then(|env| env.get(key).cloned()))
+pub fn pidesk_root() -> PathBuf {
+    home_dir().join(".pidesk")
 }
 
-pub fn agent_dir(kind: crate::dto::HarnessKind) -> PathBuf {
-    if let Some(dir) = harness_env("PI_CODING_AGENT_DIR") {
-        return PathBuf::from(dir);
-    }
-    match kind {
-        crate::dto::HarnessKind::Omp => home_dir().join(".omp").join("agent"),
-        crate::dto::HarnessKind::Pi => home_dir().join(".pi").join("agent"),
-    }
+pub fn agent_dir() -> PathBuf {
+    pidesk_root().join("agent")
 }
 
-pub fn session_dir_for(kind: crate::dto::HarnessKind, cwd: &Path) -> PathBuf {
-    if let Some(dir) = harness_env("PI_CODING_AGENT_SESSION_DIR") {
-        return PathBuf::from(dir);
+pub fn session_dir_for(cwd: &Path) -> PathBuf {
+    agent_dir().join("sessions").join(pi_session_dir_name(cwd))
+}
+
+/// Keep OS/tool essentials, but never inherit provider credentials, Pi resource
+/// bindings, NODE_OPTIONS, or npm configuration from the launching Pi/shell.
+fn safe_process_env(key: &str) -> bool {
+    matches!(
+        key,
+        "HOME"
+            | "USER"
+            | "LOGNAME"
+            | "SHELL"
+            | "TMPDIR"
+            | "TMP"
+            | "TEMP"
+            | "LANG"
+            | "LC_ALL"
+            | "LC_CTYPE"
+            | "TERM"
+            | "SSH_AUTH_SOCK"
+            | "HTTP_PROXY"
+            | "HTTPS_PROXY"
+            | "ALL_PROXY"
+            | "NO_PROXY"
+            | "http_proxy"
+            | "https_proxy"
+            | "all_proxy"
+            | "no_proxy"
+    )
+}
+
+pub fn configure_private_command(command: &mut tokio::process::Command, root: &Path) {
+    command.env_clear();
+    for (key, value) in std::env::vars_os() {
+        if key.to_str().is_some_and(safe_process_env) {
+            command.env(key, value);
+        }
     }
-    let name = match kind {
-        crate::dto::HarnessKind::Omp => omp_session_dir_name(cwd),
-        crate::dto::HarnessKind::Pi => pi_session_dir_name(cwd),
+    let path = format!(
+        "{}:{}",
+        root.join("runtime/node_modules/.bin").display(),
+        merged_path()
+    );
+    command
+        .env("HOME", home_dir())
+        .env("PATH", path)
+        .env("PI_CODING_AGENT_DIR", root.join("agent"))
+        .env("PI_CODING_AGENT_SESSION_DIR", root.join("agent/sessions"))
+        .env("PI_SKIP_VERSION_CHECK", "1")
+        .env("PI_TELEMETRY", "0");
+}
+
+/// Create private directories one component at a time, never following a
+/// symlink out of πDesk's root. Called only by explicit install/thread actions.
+pub fn ensure_private_directory(root: &Path, path: &Path) -> crate::error::AppResult<()> {
+    use crate::error::AppError;
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| AppError::new("Invalid private directory."))?;
+    let mut current = root.to_path_buf();
+    for component in std::iter::once(None).chain(relative.components().map(Some)) {
+        if let Some(component) = component {
+            let std::path::Component::Normal(name) = component else {
+                return Err(AppError::new("Invalid private directory."));
+            };
+            current.push(name);
+        }
+        if !current
+            .try_exists()
+            .map_err(|e| AppError::new(format!("Cannot inspect private directory: {e}")))?
+        {
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            builder.create(&current).map_err(|e| {
+                AppError::new(format!(
+                    "Cannot create private directory {}: {e}",
+                    current.display()
+                ))
+            })?;
+        }
+        check_owned_path(&current, true)?;
+    }
+    Ok(())
+}
+
+pub fn check_owned_path(path: &Path, directory: bool) -> crate::error::AppResult<()> {
+    use crate::error::AppError;
+    let meta = std::fs::symlink_metadata(path)
+        .map_err(|e| AppError::new(format!("Cannot inspect {}: {e}", path.display())))?;
+    if meta.file_type().is_symlink()
+        || (directory && !meta.is_dir())
+        || (!directory && !meta.is_file())
+    {
+        return Err(AppError::new(format!(
+            "{} must be a real {} owned by πDesk's user, not a symlink.",
+            path.display(),
+            if directory { "directory" } else { "file" }
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o022 != 0 {
+            return Err(AppError::new(format!(
+                "{} must be owned by this user and not writable by others.",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Existing session files must remain within private storage after resolving
+/// symlinks. Never resume or register a path supplied by external Pi.
+pub fn private_session_file(path: &Path) -> crate::error::AppResult<PathBuf> {
+    private_session_path_in(&pidesk_root(), path, true)
+}
+
+/// Pi may report its future journal path before the first turn is persisted.
+pub fn private_session_target(path: &Path) -> crate::error::AppResult<PathBuf> {
+    private_session_path_in(&pidesk_root(), path, false)
+}
+
+fn private_session_path_in(
+    root: &Path,
+    path: &Path,
+    require_file: bool,
+) -> crate::error::AppResult<PathBuf> {
+    use crate::error::AppError;
+    let sessions = root.join("agent/sessions");
+    check_owned_path(root, true)?;
+    check_owned_path(&root.join("agent"), true)?;
+    check_owned_path(&sessions, true)?;
+    let base = std::fs::canonicalize(sessions)?;
+    if !path.is_absolute() {
+        return Err(AppError::new(
+            "This session does not belong to πDesk's private Pi.",
+        ));
+    }
+    let resolved = match std::fs::canonicalize(path) {
+        Ok(resolved) => {
+            check_owned_path(&resolved, false)?;
+            resolved
+        }
+        Err(error) if !require_file && error.kind() == std::io::ErrorKind::NotFound => {
+            // A dangling symlink is not a future journal file.
+            if std::fs::symlink_metadata(path).is_ok() {
+                return Err(AppError::new("Invalid private session path."));
+            }
+            let parent = path
+                .parent()
+                .ok_or_else(|| AppError::new("Invalid private session path."))?;
+            let name = path
+                .file_name()
+                .ok_or_else(|| AppError::new("Invalid private session path."))?;
+            std::fs::canonicalize(parent)?.join(name)
+        }
+        Err(_) => {
+            return Err(AppError::new(
+                "The private session file is missing. Restore it before reopening this thread.",
+            ))
+        }
     };
-    agent_dir(kind).join("sessions").join(name)
+    if !resolved.starts_with(base) {
+        return Err(AppError::new(
+            "This session does not belong to πDesk's private Pi.",
+        ));
+    }
+    Ok(resolved)
 }
 
 /// The login shell's exported environment is cached in memory, never logged
-/// or persisted. Finder-launched apps otherwise miss both tool paths and
-/// provider environment credentials configured in `.zshrc`/`.zprofile`.
+/// or persisted. Finder-launched apps need the tool PATH configured in shell
+/// profiles; private Pi does not inherit their credentials or Pi overrides.
 static LOGIN_ENV: std::sync::LazyLock<Option<std::collections::HashMap<String, String>>> =
     std::sync::LazyLock::new(read_login_shell_env);
 
@@ -192,9 +308,7 @@ fn shell_env(shell: &str, flags: &[&str]) -> Option<std::collections::HashMap<St
     let mut child = {
         let mut cmd = Command::new(shell);
         cmd.args(flags)
-            .arg(
-                "printf '\\0__OMP_DESKTOP_ENV_START__\\0'; env -0; printf '__OMP_DESKTOP_ENV_END__\\0'",
-            )
+            .arg("printf '\\0__PIDESK_ENV_START__\\0'; env -0; printf '__PIDESK_ENV_END__\\0'")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -278,8 +392,8 @@ fn shell_env(shell: &str, flags: &[&str]) -> Option<std::collections::HashMap<St
 }
 
 fn parse_shell_env(output: &[u8]) -> Option<std::collections::HashMap<String, String>> {
-    const START: &[u8] = b"\0__OMP_DESKTOP_ENV_START__\0";
-    const END: &[u8] = b"__OMP_DESKTOP_ENV_END__\0";
+    const START: &[u8] = b"\0__PIDESK_ENV_START__\0";
+    const END: &[u8] = b"__PIDESK_ENV_END__\0";
     let start = output
         .windows(START.len())
         .rposition(|part| part == START)?
@@ -372,15 +486,22 @@ pub fn parse_version(text: &str) -> Option<String> {
     None
 }
 /// Redact environment credentials before an error crosses into UI/log output.
-/// The harness still receives the original environment; this only scrubs
-/// diagnostic strings.
+/// Private Pi receives only an allowlisted environment; diagnostics are still
+/// scrubbed because tools and package managers can echo credentials.
 pub fn redact_secrets(text: &str) -> String {
     let mut result = text.to_string();
     let secret_key = |key: &str| {
         let upper = key.to_ascii_uppercase();
-        ["TOKEN", "API_KEY", "PASSWORD", "SECRET", "CREDENTIAL"]
-            .iter()
-            .any(|part| upper.contains(part))
+        [
+            "TOKEN",
+            "API_KEY",
+            "PASSWORD",
+            "SECRET",
+            "CREDENTIAL",
+            "PROXY",
+        ]
+        .iter()
+        .any(|part| upper.contains(part))
     };
     for (key, value) in std::env::vars_os() {
         let (Some(key), Some(value)) = (key.to_str(), value.to_str()) else {
@@ -395,6 +516,22 @@ pub fn redact_secrets(text: &str) -> String {
             if secret_key(key) && value.len() >= 8 && result.contains(value) {
                 result = result.replace(value, "[REDACTED]");
             }
+        }
+    }
+    // Proxy/package-manager errors can include URL userinfo even without a
+    // matching environment value. Keep the host but remove login details.
+    let mut from = 0;
+    while let Some(offset) = result[from..].find("://") {
+        let start = from + offset + 3;
+        let end = result[start..]
+            .find(|c: char| c.is_whitespace() || matches!(c, '/' | '?' | '#' | '\"' | '\''))
+            .map(|offset| start + offset)
+            .unwrap_or(result.len());
+        if let Some(at) = result[start..end].rfind('@') {
+            result.replace_range(start..start + at, "[REDACTED]");
+            from = start + "[REDACTED]@".len();
+        } else {
+            from = end;
         }
     }
     for prefix in ["Bearer ", "api_key=", "apiKey=", "token="] {
@@ -416,37 +553,6 @@ pub fn redact_secrets(text: &str) -> String {
     result
 }
 
-/// Streaming file digest (FNV-1a 64-bit, hex) used to detect replacement of
-/// a validated executable between validation and spawn. Not cryptographic;
-/// only needs to reliably notice a changed file.
-pub fn file_digest(path: &std::path::Path) -> crate::error::AppResult<String> {
-    use std::io::Read;
-    let file = std::fs::File::open(path).map_err(|e| {
-        crate::error::AppError::new(format!("Could not read {}: {e}", path.display()))
-    })?;
-    let mut reader = std::io::BufReader::new(file);
-    let mut hash: u64 = 0xcbf29ce484222325;
-    let mut buf = [0u8; 8192];
-    loop {
-        match reader.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                for byte in &buf[..n] {
-                    hash ^= u64::from(*byte);
-                    hash = hash.wrapping_mul(0x100000001b3);
-                }
-            }
-            Err(e) => {
-                return Err(crate::error::AppError::new(format!(
-                    "Could not read {}: {e}",
-                    path.display()
-                )));
-            }
-        }
-    }
-    Ok(format!("{hash:016x}"))
-}
-
 pub fn looks_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(8192).any(|b| *b == 0)
 }
@@ -457,7 +563,7 @@ mod tests {
 
     #[test]
     fn shell_environment_ignores_startup_banner() {
-        let bytes = b"welcome\n\0__OMP_DESKTOP_ENV_START__\0PATH=/custom/bin:/usr/bin\0OPENAI_API_KEY=test-token\0__OMP_DESKTOP_ENV_END__\0";
+        let bytes = b"welcome\n\0__PIDESK_ENV_START__\0PATH=/custom/bin:/usr/bin\0OPENAI_API_KEY=test-token\0__PIDESK_ENV_END__\0";
         let env = parse_shell_env(bytes).unwrap();
         assert_eq!(
             env.get("PATH").map(String::as_str),
@@ -471,8 +577,76 @@ mod tests {
     }
 
     #[test]
-    fn parses_omp_and_pi_version_formats() {
-        assert_eq!(parse_version("omp/18.2.11\n"), Some("18.2.11".into()));
+    fn private_commands_drop_inherited_pi_and_provider_configuration() {
+        let root = Path::new("/tmp/private-desk");
+        let mut command = tokio::process::Command::new("test");
+        command
+            .env("PI_CODING_AGENT_DIR", "/external")
+            .env("PI_SESSION_FILE", "/external/session.jsonl")
+            .env("OPENAI_API_KEY", "must-not-inherit")
+            .env("NODE_OPTIONS", "--require=/external/hook.js");
+        configure_private_command(&mut command, root);
+        let env: std::collections::HashMap<_, _> = command
+            .as_std()
+            .get_envs()
+            .filter_map(|(key, value)| {
+                value.map(|value| {
+                    (
+                        key.to_string_lossy().into_owned(),
+                        value.to_string_lossy().into_owned(),
+                    )
+                })
+            })
+            .collect();
+        assert_eq!(env["PI_CODING_AGENT_DIR"], "/tmp/private-desk/agent");
+        assert_eq!(
+            env["PI_CODING_AGENT_SESSION_DIR"],
+            "/tmp/private-desk/agent/sessions"
+        );
+        assert_eq!(env["PI_TELEMETRY"], "0");
+        for key in [
+            "PI_SESSION_FILE",
+            "OPENAI_API_KEY",
+            "NODE_OPTIONS",
+            "NODE_PATH",
+            "PI_PACKAGE_DIR",
+            "PI_SUBAGENT_PI_BINARY",
+        ] {
+            assert!(!env.contains_key(key));
+            assert!(!safe_process_env(key));
+        }
+        assert!(env["PATH"].starts_with("/tmp/private-desk/runtime/node_modules/.bin:"));
+    }
+
+    #[test]
+    fn private_session_paths_reject_external_and_symlinked_targets() {
+        let fixture = std::env::temp_dir().join(format!("pidesk-paths-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&fixture).unwrap();
+        let root = fixture.join("private");
+        let sessions = root.join("agent/sessions/project");
+        ensure_private_directory(&root, &sessions).unwrap();
+        let journal = sessions.join("session.jsonl");
+        assert!(private_session_path_in(&root, &journal, false).is_ok());
+        assert!(private_session_path_in(&root, &journal, true).is_err());
+        std::fs::write(&journal, "private").unwrap();
+        assert!(private_session_path_in(&root, &journal, true).is_ok());
+        let external = fixture.join("external.jsonl");
+        std::fs::write(&external, "untouched").unwrap();
+        assert!(private_session_path_in(&root, &external, false).is_err());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&external, sessions.join("escape.jsonl")).unwrap();
+            assert!(private_session_path_in(&root, &sessions.join("escape.jsonl"), true).is_err());
+            std::os::unix::fs::symlink(&fixture, root.join("linked")).unwrap();
+            assert!(ensure_private_directory(&root, &root.join("linked/new-dir")).is_err());
+            assert!(!fixture.join("new-dir").exists());
+        }
+        assert_eq!(std::fs::read_to_string(external).unwrap(), "untouched");
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
+    fn parses_pi_version_format() {
         assert_eq!(parse_version("0.86.1\n"), Some("0.86.1".into()));
         assert_eq!(parse_version("unrelated output"), None);
     }
@@ -482,5 +656,79 @@ mod tests {
         let text = "Authorization: Bearer example123 token=another456";
         let cleaned = redact_secrets(text);
         assert_eq!(cleaned, "Authorization: Bearer [REDACTED] token=[REDACTED]");
+        assert_eq!(
+            redact_secrets("Failed https://user:password@registry.example/path"),
+            "Failed https://[REDACTED]@registry.example/path"
+        );
+    }
+}
+
+/// Physical memory footprint (what Activity Monitor calls "Memory") of one
+/// process, or `None` when it has exited or cannot be inspected.
+#[cfg(target_os = "macos")]
+pub fn process_footprint(pid: i32) -> Option<u64> {
+    let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
+    let result = unsafe {
+        libc::proc_pid_rusage(
+            pid,
+            libc::RUSAGE_INFO_V2,
+            (&mut info as *mut libc::rusage_info_v2).cast::<libc::rusage_info_t>(),
+        )
+    };
+    (result == 0).then_some(info.ri_phys_footprint)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn process_footprint(_pid: i32) -> Option<u64> {
+    None
+}
+
+/// Total footprint and member count of a process group. Each Pi runs as its
+/// own group leader, so this covers Pi plus the tools it spawned (bash, node).
+#[cfg(target_os = "macos")]
+pub fn process_group_footprint(pgid: i32) -> Option<(u64, u32)> {
+    // `PROC_PGRP_ONLY` from <libproc.h>; libc does not export it.
+    const PROC_PGRP_ONLY: u32 = 2;
+    const MAX_GROUP_MEMBERS: usize = 1024;
+    let mut pids = vec![0 as libc::pid_t; MAX_GROUP_MEMBERS];
+    let bytes = unsafe {
+        libc::proc_listpids(
+            PROC_PGRP_ONLY,
+            pgid as u32,
+            pids.as_mut_ptr().cast(),
+            (pids.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int,
+        )
+    };
+    if bytes <= 0 {
+        return None;
+    }
+    let count = (bytes as usize / std::mem::size_of::<libc::pid_t>()).min(pids.len());
+    let (total, members) = pids[..count]
+        .iter()
+        .filter(|pid| **pid > 0)
+        .filter_map(|pid| process_footprint(*pid))
+        .fold((0u64, 0u32), |(total, members), bytes| {
+            (total.saturating_add(bytes), members + 1)
+        });
+    (members > 0).then_some((total, members))
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn process_group_footprint(_pgid: i32) -> Option<(u64, u32)> {
+    None
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod memory_tests {
+    use super::*;
+
+    #[test]
+    fn measures_own_process_and_group() {
+        let pid = std::process::id() as i32;
+        assert!(process_footprint(pid).is_some_and(|bytes| bytes > 0));
+        let pgid = unsafe { libc::getpgid(0) };
+        let (total, members) = process_group_footprint(pgid).expect("own group");
+        assert!(members >= 1 && total > 0);
+        assert!(process_footprint(i32::MAX).is_none());
     }
 }

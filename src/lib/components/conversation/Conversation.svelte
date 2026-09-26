@@ -9,17 +9,16 @@
     onSend: (message: string, mode: 'prompt' | 'steer' | 'follow_up') => void | Promise<void>;
     onAbort: () => void | Promise<void>;
     onShowChanges: (path?: string) => void;
-    onShowAgents: () => void;
     onRespond: (requestId: string, response: UiResponse) => void | Promise<void>;
     onSetModel?: (value: string) => void | Promise<void>;
     onSetEffort?: (level: string) => void | Promise<void>;
   }
 
-  let { view, onSend, onAbort, onShowChanges, onShowAgents, onRespond, onSetModel, onSetEffort }: Props = $props();
+  let { view, onSend, onAbort, onShowChanges, onRespond, onSetModel, onSetEffort }: Props = $props();
 </script>
 
 <section class="conversation" aria-label="Conversation">
-  <Transcript items={view.items} agents={view.agents} status={view.status} {onShowChanges} {onShowAgents} />
+  <Transcript items={view.items} status={view.status} {onShowChanges} />
 
   <div class="dock">
     {#if view.pendingRequests.length > 0}

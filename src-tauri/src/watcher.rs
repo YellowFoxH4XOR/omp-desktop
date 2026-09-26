@@ -70,7 +70,7 @@ impl WatcherManager {
             })
             .is_err()
         {
-            eprintln!("omp-desktop: watcher command channel is closed; {thread_id} is not watched");
+            eprintln!("pidesk: watcher command channel is closed; {thread_id} is not watched");
             return;
         }
         self.threads
@@ -115,7 +115,7 @@ fn forget_failed_watch(
         !(id == thread_id && current == cwd && *latest == generation)
     });
     eprintln!(
-        "omp-desktop: could not watch {}; change notifications are unavailable for {thread_id}",
+        "pidesk: could not watch {}; change notifications are unavailable for {thread_id}",
         cwd.display()
     );
 }
@@ -401,7 +401,7 @@ mod tests {
 
     #[test]
     fn staging_in_linked_worktree_emits_metadata_change() {
-        let root = std::env::temp_dir().join(format!("omp-watch-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("pidesk-watch-{}", uuid::Uuid::new_v4()));
         let source = root.join("source");
         let worktree = root.join("worktree");
         std::fs::create_dir_all(&source).unwrap();

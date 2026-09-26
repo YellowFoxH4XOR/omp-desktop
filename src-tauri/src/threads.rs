@@ -1,6 +1,6 @@
 use crate::dto::{
-    AgentInfo, BackendEvent, ContextUsage, HarnessCapabilities, HarnessKind, ModelInfo,
-    SessionSnapshot, SessionState, Thread, TokenCounts, Usage,
+    BackendEvent, ContextUsage, HarnessCapabilities, HarnessKind, ModelInfo, SessionSnapshot,
+    SessionState, Thread, TokenCounts, Usage,
 };
 use crate::error::{AppError, AppResult};
 use crate::git;
@@ -23,16 +23,11 @@ use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 /// Idle threads are suspended after this long without activity.
 const IDLE_SUSPEND: Duration = Duration::from_secs(15 * 60);
-/// OMP ready handshake timeout.
-const READY_TIMEOUT_SECS: u64 = 30;
 /// Pi readiness = first get_state response.
 const PI_READY_TIMEOUT_SECS: u64 = 45;
-/// Login flows can wait on user interaction.
-const LOGIN_TIMEOUT_SECS: u64 = 600;
 /// Hard cap prevents an unbounded number of live harness process trees.
 const MAX_LIVE_THREADS: usize = 16;
-/// Aggregate budgets for OMP message-history pagination.
-const MAX_HISTORY_PAGES: usize = 64;
+/// Aggregate budgets for Pi's monolithic message history.
 const MAX_HISTORY_MESSAGES: usize = 16_384;
 const MAX_HISTORY_BYTES: usize = 32 * 1024 * 1024;
 /// Pi can acknowledge a prompt before its turn emits `agent_start`. The
@@ -49,9 +44,8 @@ pub struct LiveThread {
     last_activity: Mutex<Instant>,
     streaming: AtomicBool,
     failed: AtomicBool,
-    active_subagents: Mutex<std::collections::HashSet<String>>,
-    /// Interactive extension_ui_request frames (select, confirm, input,
-    /// editor, permission) still waiting on an extension_ui_response, mapped
+    /// Interactive extension_ui_request frames (select, confirm, input, or
+    /// editor) still waiting on an extension_ui_response, mapped
     /// to the requested method so answers can be validated before sending.
     pending_ui_requests: Mutex<HashMap<String, String>>,
     /// Ids of fire-and-forget extension_ui_request frames (open_url, widgets)
@@ -72,12 +66,9 @@ impl LiveThread {
         self.activity.notify_one();
     }
 
-    /// Whether the process is doing work that must not be suspended:
-    /// streaming a turn, waiting on a UI response, or running subagents.
+    /// Whether the process is doing work that must not be suspended.
     fn is_busy(&self) -> bool {
-        self.streaming.load(Ordering::SeqCst)
-            || !self.pending_ui_requests.lock().is_empty()
-            || !self.active_subagents.lock().is_empty()
+        self.streaming.load(Ordering::SeqCst) || !self.pending_ui_requests.lock().is_empty()
     }
 
     /// Abort this process's idle watch (stop/restart/exit paths).
@@ -86,16 +77,6 @@ impl LiveThread {
             task.abort();
         }
     }
-}
-fn merge_agents(mut current: Vec<AgentInfo>, history: Vec<AgentInfo>) -> Vec<AgentInfo> {
-    let mut seen: std::collections::HashSet<String> =
-        current.iter().map(|agent| agent.id.clone()).collect();
-    for agent in history {
-        if seen.insert(agent.id.clone()) {
-            current.push(agent);
-        }
-    }
-    current
 }
 /// Serialization shared by prompts, stops, and idle suspension. The watcher's
 /// delayed task runs without a `ThreadManager` handle, so the map lives in
@@ -136,72 +117,11 @@ fn reap_shared_locks(thread_id: &str, locks: &Arc<ThreadLocks>) {
     }
 }
 
-/// Link saved top-level subagents back to their parent task call so the
-/// delegation card remains useful after resuming a session.
-fn attach_task_metadata(agents: &mut [AgentInfo], messages: &[Value]) {
-    let by_id: HashMap<String, usize> = agents
-        .iter()
-        .enumerate()
-        .map(|(index, agent)| (agent.id.clone(), index))
-        .collect();
-    for message in messages {
-        if message.get("role").and_then(Value::as_str) != Some("assistant") {
-            continue;
-        }
-        let Some(content) = message.get("content").and_then(Value::as_array) else {
-            continue;
-        };
-        for block in content {
-            if block.get("type").and_then(Value::as_str) != Some("toolCall")
-                || block.get("name").and_then(Value::as_str) != Some("task")
-            {
-                continue;
-            }
-            let call_id = block.get("id").and_then(Value::as_str);
-            let Some(tasks) = block
-                .get("arguments")
-                .and_then(|args| args.get("tasks"))
-                .and_then(Value::as_array)
-            else {
-                continue;
-            };
-            for task in tasks {
-                let Some(name) = task.get("name").and_then(Value::as_str) else {
-                    continue;
-                };
-                let Some(&index) = by_id.get(name) else {
-                    continue;
-                };
-                let agent = &mut agents[index];
-                if agent.parent_tool_call_id.is_none() {
-                    agent.parent_tool_call_id = call_id.map(str::to_owned);
-                }
-                if agent.role.is_none() {
-                    agent.role = task.get("agent").and_then(Value::as_str).map(str::to_owned);
-                }
-                if agent.task.is_none() {
-                    agent.task = task.get("task").and_then(Value::as_str).map(str::to_owned);
-                }
-            }
-        }
-    }
-}
-
 fn release_owner(owners: &Mutex<HashMap<String, String>>, cwd: &str, thread_id: &str) {
     let key = ThreadManager::checkout_key(cwd);
     let mut owners = owners.lock();
     if owners.get(&key).is_some_and(|owner| owner == thread_id) {
         owners.remove(&key);
-    }
-}
-
-fn prompt_invokes_agent(kind: HarnessKind, data: &Value) -> bool {
-    match kind {
-        HarnessKind::Omp => data
-            .get("agentInvoked")
-            .and_then(Value::as_bool)
-            .unwrap_or(true),
-        HarnessKind::Pi => true,
     }
 }
 
@@ -218,25 +138,67 @@ fn acquire_owner(owners: &Mutex<HashMap<String, String>>, cwd: &str, thread_id: 
     true
 }
 
-fn resume_arguments(
-    kind: HarnessKind,
-    session_id: &str,
-    session_file: &str,
-) -> AppResult<Vec<String>> {
+fn resume_arguments(session_id: &str, session_file: &str) -> AppResult<Vec<String>> {
     match (session_id, session_file) {
         ("", "") => Ok(Vec::new()),
         ("", _) | (_, "") => Err(AppError::new(
             "This thread's saved session mapping is incomplete. Restore its session file before reopening it.",
         )),
-        (_, mapped) if !Path::new(mapped).is_file() => Err(AppError::new(format!(
-            "The saved session file {} is missing or has moved. Restore it before reopening this thread.",
-            mapped
-        ))),
-        (_, mapped) => Ok(match kind {
-            HarnessKind::Omp => vec!["--resume".into(), mapped.to_string()],
-            HarnessKind::Pi => vec!["--session".into(), mapped.to_string()],
-        }),
+        (_, mapped) if Path::new(mapped).is_file() => Ok(vec![
+            "--session".into(),
+            util::private_session_file(Path::new(mapped))?
+                .to_string_lossy()
+                .into_owned(),
+        ]),
+        (id, mapped) => {
+            // Pi reports its journal path before the first turn is written, so a
+            // thread opened but never messaged has no file yet. `--session-id`
+            // looks the id up in the private session dir (finding a moved
+            // journal) and otherwise recreates the same session identity;
+            // `--session <missing path>` would mint a different id instead.
+            util::private_session_target(Path::new(mapped)).map_err(|_| {
+                AppError::new(format!(
+                    "The saved session file {mapped} is missing or has moved. Restore it before reopening this thread."
+                ))
+            })?;
+            if !is_valid_session_id(id) {
+                return Err(AppError::new(
+                    "This thread's saved session id is invalid and cannot be reopened.",
+                ));
+            }
+            Ok(vec!["--session-id".into(), id.to_string()])
+        }
     }
+}
+
+/// Tells the model what πDesk's transcript can render. Passed as a flag rather
+/// than written to `APPEND_SYSTEM.md`, which stays free for the user's own text.
+const RENDERING_GUIDE: &str = "You are running inside πDesk, a desktop app that renders your replies as GitHub-flavored Markdown. \
+When a diagram would help (architecture, flows, sequences, state machines, ER models), write it as a fenced ```mermaid code block; πDesk renders Mermaid as a real diagram. \
+Prefer Mermaid over ASCII or box-drawing art, keep node labels short, and use plain code fences only for actual code or terminal output.";
+
+fn spawn_arguments(session_dir: &Path) -> Vec<String> {
+    // sessionDir is read before project trust, so --no-approve alone does
+    // not isolate it. The explicit directory is authoritative for Pi.
+    vec![
+        "--mode".into(),
+        "rpc".into(),
+        "--no-approve".into(),
+        "--session-dir".into(),
+        session_dir.to_string_lossy().into_owned(),
+        "--append-system-prompt".into(),
+        RENDERING_GUIDE.into(),
+    ]
+}
+
+/// Pi accepts letters, digits, `.`, `_`, and `-`; a leading alphanumeric keeps
+/// the value from ever being parsed as a CLI flag.
+fn is_valid_session_id(id: &str) -> bool {
+    id.len() <= 128
+        && id.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 pub struct ThreadManager {
     store: Arc<Store>,
@@ -360,32 +322,29 @@ impl ThreadManager {
         let project = self.store.get_project(project_id)?;
         let project_path = PathBuf::from(&project.path);
         let mut rows = self.store.list_threads(project_id)?;
-        let mut seen_sessions: std::collections::HashSet<(HarnessKind, String)> = rows
-            .iter()
-            .filter(|row| !row.session_file.is_empty())
-            .map(|row| (row.harness, row.session_file.clone()))
+        let mut seen_sessions: std::collections::HashSet<String> = self
+            .store
+            .registered_session_files(project_id)?
+            .into_iter()
             .collect();
-        for kind in [HarnessKind::Omp, HarnessKind::Pi] {
-            for scanned in sessions::scan_sessions(kind, &project_path) {
-                let identity = (kind, scanned.session_file.clone());
-                if !seen_sessions.insert(identity) {
-                    continue;
-                }
-                let id = uuid::Uuid::new_v4().to_string();
-                let row = self.store.upsert_thread(
-                    &id,
-                    project_id,
-                    kind,
-                    &scanned.session_id,
-                    &scanned.session_file,
-                    &scanned.cwd,
-                    &scanned.title,
-                    "idle",
-                    None,
-                    Some(&scanned.created_at),
-                )?;
-                rows.push(row);
+        for scanned in sessions::scan_sessions(&project_path) {
+            if !seen_sessions.insert(scanned.session_file.clone()) {
+                continue;
             }
+            let id = uuid::Uuid::new_v4().to_string();
+            let row = self.store.upsert_thread(
+                &id,
+                project_id,
+                HarnessKind::Pi,
+                &scanned.session_id,
+                &scanned.session_file,
+                &scanned.cwd,
+                &scanned.title,
+                "idle",
+                None,
+                Some(&scanned.created_at),
+            )?;
+            rows.push(row);
         }
         // Reflect live status for running threads.
         let live = self.live.lock();
@@ -448,10 +407,7 @@ impl ThreadManager {
                     "Isolated threads need a Git repository; this project is not one.",
                 ));
             }
-            let dest = util::home_dir()
-                .join(".omp-desktop")
-                .join("worktrees")
-                .join(&id);
+            let dest = util::home_dir().join(".pidesk").join("worktrees").join(&id);
             git::create_worktree(&project_path, &dest)?;
             cwd = dest;
             worktree_path = Some(cwd.to_string_lossy().to_string());
@@ -549,23 +505,18 @@ impl ThreadManager {
             )));
         }
         let exe = self.registry.executable_path(kind).await?;
-        let mut args: Vec<String> = vec!["--mode".into(), "rpc".into()];
-        args.extend(resume_arguments(kind, &row.session_id, &row.session_file)?);
+        let root = util::pidesk_root();
+        let session_dir = util::session_dir_for(&cwd);
+        util::ensure_private_directory(&root, &session_dir)?;
+        let mut args = spawn_arguments(&session_dir);
+        args.extend(resume_arguments(&row.session_id, &row.session_file)?);
         let mut command = Command::new(&exe);
+        util::configure_private_command(&mut command, &root);
         #[cfg(unix)]
         command.process_group(0);
-        if let Some(shell_env) = util::login_shell_env() {
-            for (key, value) in shell_env {
-                if !matches!(key.as_str(), "PWD" | "SHLVL" | "_") && std::env::var_os(key).is_none()
-                {
-                    command.env(key, value);
-                }
-            }
-        }
         let mut child = command
             .args(&args)
             .current_dir(&cwd)
-            .env("PATH", util::merged_path())
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -587,10 +538,6 @@ impl ThreadManager {
         let live_map = self.live.clone();
         let watcher = self.watcher.clone();
         let checkout_owners = self.checkout_owners.clone();
-
-        // OMP readiness resolves on the `ready` frame.
-        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Value>();
-        let ready_tx = Mutex::new(Some(ready_tx));
 
         let generation = self.next_generation.fetch_add(1, Ordering::SeqCst);
         let tid_ev = tid.clone();
@@ -635,39 +582,15 @@ impl ThreadManager {
                         }
                     }
                     "agent_end" => {
-                        let pi = store_ev
-                            .get_thread(&tid_ev)
-                            .ok()
-                            .is_some_and(|row| row.harness == HarnessKind::Pi);
-                        // Pi can still compact or drain queued handlers after agent_end.
-                        if pi {
-                            if is_current() {
-                                l.note_activity();
-                            }
-                        } else if frame.get("isTerminal") != Some(&Value::Bool(false))
-                            && frame.get("willRetry") != Some(&Value::Bool(true))
-                        {
-                            l.streaming.store(false, Ordering::SeqCst);
-                            let status = if !l.active_subagents.lock().is_empty() {
-                                "active"
-                            } else if l.failed.load(Ordering::SeqCst) {
-                                "failed"
-                            } else {
-                                "completed"
-                            };
-                            if is_current() {
-                                let _ = store_ev.update_thread_status(&tid_ev, status);
-                            }
-                            if status != "active" && is_current() {
-                                release_owner(&checkout_owners_ev, &cwd_ev, &tid_ev);
-                            }
+                        // Pi can still compact or drain queued handlers after agent_end;
+                        // agent_settled is the terminal event.
+                        if is_current() {
+                            l.note_activity();
                         }
                     }
                     "agent_settled" => {
                         l.streaming.store(false, Ordering::SeqCst);
-                        let status = if !l.active_subagents.lock().is_empty() {
-                            "active"
-                        } else if l.failed.load(Ordering::SeqCst) {
+                        let status = if l.failed.load(Ordering::SeqCst) {
                             "failed"
                         } else {
                             "completed"
@@ -689,68 +612,9 @@ impl ThreadManager {
                             l.failed.store(true, Ordering::SeqCst);
                         }
                     }
-                    "response"
-                        if frame.get("success").and_then(Value::as_bool) == Some(false)
-                            && matches!(
-                                frame.get("command").and_then(Value::as_str),
-                                Some("prompt" | "abort_and_prompt" | "steer" | "follow_up")
-                            ) =>
-                    {
-                        l.streaming.store(false, Ordering::SeqCst);
-                        l.failed.store(true, Ordering::SeqCst);
-                        if is_current() {
-                            let _ = store_ev.update_thread_status(&tid_ev, "failed");
-                        }
-                        if is_current() {
-                            release_owner(&checkout_owners_ev, &cwd_ev, &tid_ev);
-                        }
-                    }
-                    "prompt_result"
-                        if frame.get("agentInvoked").and_then(Value::as_bool) == Some(false) =>
-                    {
-                        l.streaming.store(false, Ordering::SeqCst);
-                        l.failed.store(false, Ordering::SeqCst);
-                        if is_current() {
-                            let _ = store_ev.update_thread_status(&tid_ev, "completed");
-                        }
-                        if is_current() {
-                            release_owner(&checkout_owners_ev, &cwd_ev, &tid_ev);
-                        }
-                    }
-                    "subagent_lifecycle" => {
-                        if let Some(payload) = frame.get("payload") {
-                            if let Some(id) = payload.get("id").and_then(Value::as_str) {
-                                let mut active = l.active_subagents.lock();
-                                if payload.get("status").and_then(Value::as_str) == Some("started")
-                                {
-                                    active.insert(id.to_string());
-                                } else {
-                                    active.remove(id);
-                                }
-                            }
-                        }
-                        if !l.streaming.load(Ordering::SeqCst) {
-                            let status = if !l.active_subagents.lock().is_empty() {
-                                "active"
-                            } else if l.failed.load(Ordering::SeqCst) {
-                                "failed"
-                            } else {
-                                "completed"
-                            };
-                            if is_current() {
-                                let _ = store_ev.update_thread_status(&tid_ev, status);
-                            }
-                            if status != "active" && is_current() {
-                                release_owner(&checkout_owners_ev, &cwd_ev, &tid_ev);
-                            }
-                        }
-                    }
                     "extension_ui_request" => {
                         let method = frame.get("method").and_then(Value::as_str).unwrap_or("");
-                        if matches!(
-                            method,
-                            "select" | "confirm" | "input" | "editor" | "permission"
-                        ) {
+                        if matches!(method, "select" | "confirm" | "input" | "editor") {
                             if let Some(id) = frame.get("id").and_then(Value::as_str) {
                                 l.pending_ui_requests
                                     .lock()
@@ -771,7 +635,6 @@ impl ThreadManager {
                             }
                             if l.pending_ui_requests.lock().is_empty()
                                 && !l.streaming.load(Ordering::SeqCst)
-                                && l.active_subagents.lock().is_empty()
                             {
                                 if is_current() {
                                     let _ = store_ev.update_thread_status(&tid_ev, "completed");
@@ -838,25 +701,13 @@ impl ThreadManager {
                     },
                 );
             }),
-            on_ready: match kind {
-                HarnessKind::Omp => Some(Box::new(move |frame: Value| {
-                    if let Some(tx) = ready_tx.lock().take() {
-                        let _ = tx.send(frame);
-                    }
-                }) as Box<dyn Fn(Value) + Send + Sync>),
-                HarnessKind::Pi => None,
-            },
-        };
-        let frame_limit = match kind {
-            HarnessKind::Omp => crate::rpc::MAX_FRAME_BYTES,
-            HarnessKind::Pi => crate::rpc::MAX_PI_FRAME_BYTES,
         };
         let client = Arc::new(RpcClient::attach_with_frame_limit(
             child,
             stdout,
             stderr,
             handlers,
-            frame_limit,
+            crate::rpc::MAX_PI_FRAME_BYTES,
         ));
         let live = Arc::new(LiveThread {
             client: client.clone(),
@@ -864,7 +715,6 @@ impl ThreadManager {
             last_activity: Mutex::new(Instant::now()),
             streaming: AtomicBool::new(false),
             failed: AtomicBool::new(false),
-            active_subagents: Mutex::new(std::collections::HashSet::new()),
             pending_ui_requests: Mutex::new(HashMap::new()),
             ui_fire_and_forget: Mutex::new(std::collections::HashSet::new()),
             activity: Notify::new(),
@@ -875,76 +725,33 @@ impl ThreadManager {
         }
         // The watcher starts only after the readiness handshake succeeds.
 
-        // Handshake per harness.
-        match kind {
-            HarnessKind::Omp => {
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(READY_TIMEOUT_SECS),
-                    ready_rx,
-                )
-                .await
-                {
-                    Ok(Ok(_)) => {}
-                    _ => {
-                        let tail = client.stderr_tail().await;
-                        client.shutdown().await;
-                        Self::remove_generation(&self.live, &tid, generation);
-                        release_owner(&checkout_owners, &cwd_cleanup, &tid);
-                        return Err(AppError::new(format!(
-                            "OMP did not become ready.{}",
-                            if tail.trim().is_empty() {
-                                String::new()
-                            } else {
-                                format!(" {}", tail.trim())
-                            }
-                        )));
-                    }
-                }
-                // Negotiate protocol v2 (enables chunked frames).
-                let _ = client
-                    .call(
-                        "negotiate_protocol",
-                        Map::from_iter([("protocolVersion".into(), json!(2))]),
-                    )
-                    .await;
-                // Subscribe to subagent lifecycle/progress events.
-                let _ = client
-                    .call(
-                        "set_subagent_subscription",
-                        Map::from_iter([("level".into(), json!("progress"))]),
-                    )
-                    .await;
+        // Pi has no ready frame: get_state doubles as the readiness probe.
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(PI_READY_TIMEOUT_SECS),
+            client.call("get_state", Map::new()),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                client.shutdown().await;
+                Self::remove_generation(&self.live, &tid, generation);
+                release_owner(&checkout_owners, &cwd_cleanup, &tid);
+                return Err(error);
             }
-            HarnessKind::Pi => {
-                // No ready frame: get_state doubles as the readiness probe.
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(PI_READY_TIMEOUT_SECS),
-                    client.call("get_state", Map::new()),
-                )
-                .await
-                {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(e)) => {
-                        client.shutdown().await;
-                        Self::remove_generation(&self.live, &tid, generation);
-                        release_owner(&checkout_owners, &cwd_cleanup, &tid);
-                        return Err(e);
+            Err(_) => {
+                let tail = client.stderr_tail().await;
+                client.shutdown().await;
+                Self::remove_generation(&self.live, &tid, generation);
+                release_owner(&checkout_owners, &cwd_cleanup, &tid);
+                return Err(AppError::new(format!(
+                    "Pi did not become ready.{}",
+                    if tail.trim().is_empty() {
+                        String::new()
+                    } else {
+                        format!(" {}", tail.trim())
                     }
-                    Err(_) => {
-                        let tail = client.stderr_tail().await;
-                        client.shutdown().await;
-                        Self::remove_generation(&self.live, &tid, generation);
-                        release_owner(&checkout_owners, &cwd_cleanup, &tid);
-                        return Err(AppError::new(format!(
-                            "Pi did not become ready.{}",
-                            if tail.trim().is_empty() {
-                                String::new()
-                            } else {
-                                format!(" {}", tail.trim())
-                            }
-                        )));
-                    }
-                }
+                )));
             }
         }
         // Readiness is proven; only now may file events start flowing.
@@ -993,13 +800,19 @@ impl ThreadManager {
                 "The harness returned an invalid empty session identity.",
             ));
         }
+        if !session_file.is_empty() {
+            util::private_session_target(Path::new(session_file))?;
+        }
         if !row.session_id.is_empty() && !session_id.is_empty() && row.session_id != session_id {
             return Err(AppError::new(
                 "The harness resumed a different session than the one mapped to this thread.",
             ));
         }
+        // An unwritten journal gets a fresh timestamped path on every launch;
+        // only a journal that exists on disk pins the mapping.
         if !row.session_file.is_empty()
             && !session_file.is_empty()
+            && Path::new(&row.session_file).exists()
             && util::resolve_path(Path::new(&row.session_file))
                 != util::resolve_path(Path::new(session_file))
         {
@@ -1091,7 +904,7 @@ impl ThreadManager {
         let client = live.client.clone();
         let state = client.call("get_state", Map::new()).await?;
         self.adopt_state(&row, &state)?;
-        let messages = Self::fetch_messages(&client, row.harness).await?;
+        let messages = Self::fetch_messages(&client).await?;
         let models_result = client.call("get_available_models", Map::new()).await;
         let models = models_result
             .as_ref()
@@ -1115,26 +928,14 @@ impl ThreadManager {
             .filter_map(|value| value.as_str().map(String::from))
             .collect::<Vec<_>>();
         let stats = client.call("get_session_stats", Map::new()).await.ok();
-        let live_agents = self.fetch_agents(&client, row.harness).await;
         let row = self.store.get_thread(thread_id)?;
-        let mut agents = if row.harness == HarnessKind::Omp {
-            merge_agents(live_agents, sessions::historical_agents(&row.session_file))
-        } else {
-            live_agents
-        };
-        if row.harness == HarnessKind::Omp {
-            attach_task_metadata(&mut agents, &messages);
-        }
-        let harness = row.harness;
-        let mut capabilities = HarnessCapabilities::for_kind(harness);
-        if harness == HarnessKind::Pi {
-            capabilities.model_switching = models_result.is_ok();
-            capabilities.effort_levels = levels_result.is_ok();
-            capabilities.context_usage = stats
-                .as_ref()
-                .is_some_and(|stats| stats.get("contextUsage").is_some());
-            capabilities.token_usage = stats.is_some();
-        }
+        let mut capabilities = HarnessCapabilities::for_kind(HarnessKind::Pi);
+        capabilities.model_switching = models_result.is_ok();
+        capabilities.effort_levels = levels_result.is_ok();
+        capabilities.context_usage = stats
+            .as_ref()
+            .is_some_and(|stats| stats.get("contextUsage").is_some());
+        capabilities.token_usage = stats.is_some();
         Ok(SessionSnapshot {
             thread: row.into_dto(),
             messages,
@@ -1142,81 +943,17 @@ impl ThreadManager {
             models,
             levels,
             capabilities,
-            agents,
         })
     }
 
-    async fn fetch_messages(client: &Arc<RpcClient>, kind: HarnessKind) -> AppResult<Vec<Value>> {
-        match kind {
-            HarnessKind::Omp => {
-                let mut out = Vec::new();
-                let mut out_bytes: usize = 0;
-                let mut cursor: Option<String> = None;
-                let mut cursors = std::collections::HashSet::new();
-                loop {
-                    let mut args = Map::from_iter([("limit".into(), json!(256))]);
-                    if let Some(c) = &cursor {
-                        args.insert("cursor".into(), json!(c));
-                    }
-                    let data = match client.call("get_messages_page", args).await {
-                        Ok(data) => data,
-                        Err(_) => {
-                            // A busy or stale cursor invalidates every partial page.
-                            // Ask the harness for one best-effort snapshot instead.
-                            let snapshot = client.call("get_messages", Map::new()).await?;
-                            let messages = snapshot
-                                .get("messages")
-                                .and_then(Value::as_array)
-                                .ok_or_else(|| {
-                                    AppError::new("OMP returned invalid message history.")
-                                })?;
-                            Self::check_history_budgets(messages)?;
-                            return Ok(messages.clone());
-                        }
-                    };
-                    let messages = data
-                        .get("messages")
-                        .and_then(Value::as_array)
-                        .ok_or_else(|| AppError::new("OMP returned an invalid message page."))?;
-                    for message in messages {
-                        let encoded = serde_json::to_vec(message)
-                            .map_err(|_| AppError::new("OMP returned an invalid message page."))?;
-                        out_bytes = out_bytes.saturating_add(encoded.len());
-                        if out.len() + 1 > MAX_HISTORY_MESSAGES || out_bytes > MAX_HISTORY_BYTES {
-                            return Err(AppError::new(
-                                "OMP returned more message history than the app can hold. Ask the harness for a compacted view and try again.",
-                            ));
-                        }
-                        out.push(message.clone());
-                    }
-                    match data.get("nextCursor").and_then(Value::as_str) {
-                        Some(next) if !next.is_empty() => {
-                            if !cursors.insert(next.to_string()) {
-                                return Err(AppError::new(
-                                    "OMP repeated a message-history cursor.",
-                                ));
-                            }
-                            if cursors.len() >= MAX_HISTORY_PAGES {
-                                return Err(AppError::new(
-                                    "OMP returned more message-history pages than the app can follow.",
-                                ));
-                            }
-                            cursor = Some(next.to_string());
-                        }
-                        _ => return Ok(out),
-                    }
-                }
-            }
-            HarnessKind::Pi => {
-                let snapshot = client.call("get_messages", Map::new()).await?;
-                let messages = snapshot
-                    .get("messages")
-                    .and_then(Value::as_array)
-                    .ok_or_else(|| AppError::new("Pi returned invalid message history."))?;
-                Self::check_history_budgets(messages)?;
-                Ok(messages.clone())
-            }
-        }
+    async fn fetch_messages(client: &Arc<RpcClient>) -> AppResult<Vec<Value>> {
+        let snapshot = client.call("get_messages", Map::new()).await?;
+        let messages = snapshot
+            .get("messages")
+            .and_then(Value::as_array)
+            .ok_or_else(|| AppError::new("Pi returned invalid message history."))?;
+        Self::check_history_budgets(messages)?;
+        Ok(messages.clone())
     }
 
     fn check_history_budgets(messages: &[Value]) -> AppResult<()> {
@@ -1263,21 +1000,6 @@ impl ThreadManager {
             .collect()
     }
 
-    async fn fetch_agents(&self, client: &Arc<RpcClient>, kind: HarnessKind) -> Vec<AgentInfo> {
-        if kind != HarnessKind::Omp {
-            return Vec::new();
-        }
-        client
-            .call("get_subagents", Map::new())
-            .await
-            .ok()
-            .and_then(|d| d.get("subagents").and_then(Value::as_array).cloned())
-            .unwrap_or_default()
-            .iter()
-            .filter_map(value_to_agent)
-            .collect()
-    }
-
     // ------------------------------------------------------------------
     // Commands
     // ------------------------------------------------------------------
@@ -1309,98 +1031,73 @@ impl ThreadManager {
             _ => "prompt",
         };
         let args = Map::from_iter([("message".into(), json!(message))]);
-        let data = match client.call(command, args).await {
-            Ok(data) => data,
-            Err(error) => {
-                if !already_owned {
-                    self.release_checkout(&row.cwd, thread_id);
-                    self.set_status(thread_id, "failed");
-                }
-                return Err(error);
+        if let Err(error) = client.call(command, args).await {
+            if !already_owned {
+                self.release_checkout(&row.cwd, thread_id);
+                self.set_status(thread_id, "failed");
             }
-        };
+            return Err(error);
+        }
         let busy = self
             .live
             .lock()
             .get(thread_id)
             .is_some_and(|live| live.is_busy());
-        let invoked = match row.harness {
-            HarnessKind::Omp => prompt_invokes_agent(row.harness, &data),
-            // Pi can ack before its turn emits `agent_start`; the ack alone
-            // must not release the checkout while the turn is about to run.
-            HarnessKind::Pi => true,
-        };
-        if invoked {
-            self.set_status(thread_id, "active");
-            self.touch_activity(thread_id);
-            if row.harness == HarnessKind::Pi && !busy && !already_owned {
-                // Pi can ack before its turn emits `agent_start`; the ack alone
-                // must not release the checkout while the turn is about to
-                // run. Hold the reservation and give the turn a bounded window
-                // to declare itself in the background (agent_start sets
-                // streaming/busy; the event handlers release the reservation
-                // on prompt_result or failure). Only a deadline pass with no
-                // turn at all treats the ack as a no-op and releases here,
-                // serialized on the prompt lock so a racing turn wins.
-                let store = self.store.clone();
-                let owners = self.checkout_owners.clone();
-                let live_map = self.live.clone();
-                let tid = thread_id.to_string();
-                let cwd = row.cwd.clone();
-                let key = key.clone();
-                tauri::async_runtime::spawn(async move {
-                    let deadline = Instant::now() + Duration::from_secs(PI_PROMPT_SETTLE_SECS);
-                    while Instant::now() < deadline {
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                        let state = live_map.lock().get(&tid).map(|live| {
-                            (
-                                live.streaming.load(Ordering::SeqCst),
-                                live.failed.load(Ordering::SeqCst),
-                                live.is_busy(),
-                            )
-                        });
-                        let Some((streaming, failed, now_busy)) = state else {
-                            return;
-                        };
-                        if streaming || failed || now_busy {
-                            return;
-                        }
-                        if !owners.lock().get(&key).is_some_and(|owner| owner == &tid) {
-                            return;
-                        }
-                    }
-                    let locks = shared_locks(&tid);
-                    let _prompt = locks.prompt.lock().await;
-                    let Some(live) = live_map.lock().get(&tid).cloned() else {
+        self.set_status(thread_id, "active");
+        self.touch_activity(thread_id);
+        if !busy && !already_owned {
+            // Pi can acknowledge before agent_start. Hold the checkout for a
+            // bounded window; terminal event handlers release it earlier.
+            let store = self.store.clone();
+            let owners = self.checkout_owners.clone();
+            let live_map = self.live.clone();
+            let tid = thread_id.to_string();
+            let cwd = row.cwd.clone();
+            let key = key.clone();
+            tauri::async_runtime::spawn(async move {
+                let deadline = Instant::now() + Duration::from_secs(PI_PROMPT_SETTLE_SECS);
+                while Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    let state = live_map.lock().get(&tid).map(|live| {
+                        (
+                            live.streaming.load(Ordering::SeqCst),
+                            live.failed.load(Ordering::SeqCst),
+                            live.is_busy(),
+                        )
+                    });
+                    let Some((streaming, failed, now_busy)) = state else {
                         return;
                     };
-                    if live.streaming.load(Ordering::SeqCst)
-                        || live.failed.load(Ordering::SeqCst)
-                        || live.is_busy()
-                    {
+                    if streaming || failed || now_busy {
                         return;
                     }
                     if !owners.lock().get(&key).is_some_and(|owner| owner == &tid) {
                         return;
                     }
-                    if store
-                        .get_thread(&tid)
-                        .ok()
-                        .is_some_and(|row| row.status == "active")
-                    {
-                        live.streaming.store(false, Ordering::SeqCst);
-                        live.note_activity();
-                        let _ = store.update_thread_status(&tid, "completed");
-                        release_owner(&owners, &cwd, &tid);
-                    }
-                });
-            }
-            return Ok(());
+                }
+                let locks = shared_locks(&tid);
+                let _prompt = locks.prompt.lock().await;
+                let Some(live) = live_map.lock().get(&tid).cloned() else {
+                    return;
+                };
+                if live.streaming.load(Ordering::SeqCst)
+                    || live.failed.load(Ordering::SeqCst)
+                    || live.is_busy()
+                    || !owners.lock().get(&key).is_some_and(|owner| owner == &tid)
+                {
+                    return;
+                }
+                if store
+                    .get_thread(&tid)
+                    .ok()
+                    .is_some_and(|row| row.status == "active")
+                {
+                    live.note_activity();
+                    let _ = store.update_thread_status(&tid, "completed");
+                    release_owner(&owners, &cwd, &tid);
+                }
+            });
         }
-        self.set_streaming(thread_id, false);
-        self.set_status(thread_id, "completed");
-        self.release_checkout(&row.cwd, thread_id);
-        self.touch_activity(thread_id);
         Ok(())
     }
     pub async fn abort(&self, thread_id: &str) -> AppResult<()> {
@@ -1496,7 +1193,7 @@ impl ThreadManager {
         let cancelled = response.cancelled.unwrap_or(false);
         if !cancelled {
             let usable = match method.as_str() {
-                "select" | "input" | "editor" | "permission" => response
+                "select" | "input" | "editor" => response
                     .value
                     .as_ref()
                     .is_some_and(|value| !value.is_empty()),
@@ -1541,112 +1238,41 @@ impl ThreadManager {
         Ok(())
     }
 
-    pub async fn get_subagents(&self, thread_id: &str) -> AppResult<Vec<AgentInfo>> {
-        let row = self.store.get_thread(thread_id)?;
-        if row.harness != HarnessKind::Omp {
-            return Ok(Vec::new());
-        }
-        let history = sessions::historical_agents(&row.session_file);
-        let current = if let Some(client) = self.live_client(thread_id) {
-            self.fetch_agents(&client, row.harness).await
-        } else {
-            Vec::new()
-        };
-        Ok(merge_agents(current, history))
-    }
-
-    pub async fn get_subagent_messages(
-        &self,
-        thread_id: &str,
-        agent_id: &str,
-    ) -> AppResult<Vec<Value>> {
-        let row = self.store.get_thread(thread_id)?;
-        if row.harness != HarnessKind::Omp {
-            return Err(AppError::new(
-                "Subagent transcripts are not supported by this harness.",
-            ));
-        }
-        if !row.session_file.is_empty() {
-            // Transcripts can be tens of MiB; keep the parse off async workers.
-            let session_file = row.session_file.clone();
-            let agent = agent_id.to_string();
-            let read = tauri::async_runtime::spawn_blocking(move || {
-                sessions::read_agent_messages(&session_file, &agent)
-            })
-            .await;
-            if let Ok(Ok(messages)) = read {
-                return Ok(messages);
-            }
-        }
-        let client = self.client_for(thread_id).await?;
-        let data = client
-            .call(
-                "get_subagent_messages",
-                Map::from_iter([("subagentId".into(), json!(agent_id))]),
-            )
-            .await?;
-        Ok(data
-            .get("messages")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default())
-    }
-
-    pub async fn get_login_providers(
-        &self,
-        thread_id: &str,
-    ) -> AppResult<Vec<crate::dto::LoginProvider>> {
-        let row = self.store.get_thread(thread_id)?;
-        if row.harness != HarnessKind::Omp {
-            return Err(AppError::new(
-                "Provider login is not supported by this harness.",
-            ));
-        }
-        let client = self.client_for(thread_id).await?;
-        let data = client.call("get_login_providers", Map::new()).await?;
-        Ok(data
-            .get("providers")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default()
+    /// Memory and activity for every running Pi. Reads only kernel counters and
+    /// metadata; it never spawns processes or touches a thread's lifecycle.
+    pub fn runtime_stats(&self) -> crate::dto::RuntimeStats {
+        let live: Vec<(String, Arc<LiveThread>)> = self
+            .live
+            .lock()
             .iter()
-            .filter_map(|p| {
-                Some(crate::dto::LoginProvider {
-                    id: p.get("id").and_then(Value::as_str)?.to_string(),
-                    name: p
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string(),
-                    available: p.get("available").and_then(Value::as_bool).unwrap_or(false),
-                    authenticated: p
-                        .get("authenticated")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
+            .filter(|(_, process)| !process.client.is_exited())
+            .map(|(id, process)| (id.clone(), process.clone()))
+            .collect();
+        let mut threads: Vec<crate::dto::ThreadRuntime> = live
+            .into_iter()
+            .filter_map(|(thread_id, process)| {
+                let row = self.store.get_thread(&thread_id).ok()?;
+                let pid = process.client.process_group_id();
+                let (memory_bytes, process_count) = pid
+                    .and_then(util::process_group_footprint)
+                    .map_or((None, 0), |(bytes, count)| (Some(bytes), count));
+                Some(crate::dto::ThreadRuntime {
+                    thread_id,
+                    project_id: row.project_id,
+                    title: row.title,
+                    pid,
+                    memory_bytes,
+                    process_count,
+                    busy: process.is_busy(),
+                    idle_seconds: process.last_activity.lock().elapsed().as_secs(),
                 })
             })
-            .collect())
-    }
-
-    /// Start an OAuth login flow. `extension_ui_request` frames (open_url,
-    /// input) flow to the UI through the normal rpc event channel; the UI
-    /// answers via respond_ui. Never auto-opens URLs.
-    pub async fn login_provider(&self, thread_id: &str, provider_id: &str) -> AppResult<()> {
-        let row = self.store.get_thread(thread_id)?;
-        if row.harness != HarnessKind::Omp {
-            return Err(AppError::new(
-                "Provider login is not supported by this harness.",
-            ));
+            .collect();
+        threads.sort_by(|a, b| b.memory_bytes.cmp(&a.memory_bytes));
+        crate::dto::RuntimeStats {
+            app_bytes: util::process_footprint(std::process::id() as i32),
+            threads,
         }
-        let client = self.client_for(thread_id).await?;
-        client
-            .call_with_timeout(
-                "login",
-                Map::from_iter([("providerId".into(), json!(provider_id))]),
-                LOGIN_TIMEOUT_SECS,
-            )
-            .await?;
-        Ok(())
     }
 
     pub fn thread_cwd(&self, thread_id: &str) -> AppResult<PathBuf> {
@@ -1675,8 +1301,8 @@ impl ThreadManager {
         let task = tauri::async_runtime::spawn(async move {
             loop {
                 if watched.is_busy() {
-                    // Streaming, a pending dialog, or active subagents: wait
-                    // for the next state change instead of a timer.
+                    // Streaming or a pending dialog: wait for the next state
+                    // change instead of a timer.
                     watched.activity.notified().await;
                     continue;
                 }
@@ -1836,196 +1462,58 @@ fn build_usage(stats: &Value) -> Usage {
     }
 }
 
-fn value_to_agent(v: &Value) -> Option<AgentInfo> {
-    let id = v.get("id").and_then(Value::as_str)?.to_string();
-    let progress = v.get("progress");
-    let status_raw = v
-        .get("status")
-        .and_then(Value::as_str)
-        .or_else(|| progress.and_then(|p| p.get("status").and_then(Value::as_str)))
-        .unwrap_or("running");
-    let status = match status_raw {
-        "started" | "running" => "running",
-        "waiting" => "waiting",
-        "completed" | "done" | "finished" => "completed",
-        "failed" | "error" => "failed",
-        "aborted" | "killed" | "cancelled" => "aborted",
-        "parked" => "parked",
-        "pending" => "pending",
-        _ => "running",
-    }
-    .to_string();
-    let name = v
-        .get("name")
-        .and_then(Value::as_str)
-        .unwrap_or_else(|| id.rsplit('.').next().unwrap_or(&id))
-        .to_string();
-    let task = v
-        .get("assignment")
-        .and_then(Value::as_str)
-        .or_else(|| v.get("task").and_then(Value::as_str))
-        .or_else(|| v.get("description").and_then(Value::as_str))
-        .map(String::from);
-    let activity = progress
-        .and_then(|p| {
-            p.get("lastIntent")
-                .and_then(Value::as_str)
-                .or_else(|| p.get("activity").and_then(Value::as_str))
-                .or_else(|| p.get("message").and_then(Value::as_str))
-                .or_else(|| p.get("description").and_then(Value::as_str))
-        })
-        .map(String::from);
-    let tokens = progress.and_then(|p| {
-        p.get("tokens")
-            .and_then(Value::as_u64)
-            .or_else(|| p.get("totalTokens").and_then(Value::as_u64))
-    });
-    let context_tokens = progress.and_then(|p| {
-        p.get("contextTokens").and_then(Value::as_u64).or_else(|| {
-            p.get("contextUsage")
-                .and_then(|c| c.get("tokens").and_then(Value::as_u64))
-        })
-    });
-    let context_window = progress.and_then(|p| {
-        p.get("contextWindow").and_then(Value::as_u64).or_else(|| {
-            p.get("contextUsage")
-                .and_then(|c| c.get("contextWindow").and_then(Value::as_u64))
-        })
-    });
-    let parent_id = id
-        .rfind('.')
-        .map(|i| id[..i].to_string())
-        .filter(|s| !s.is_empty());
-    Some(AgentInfo {
-        id,
-        parent_id,
-        parent_tool_call_id: v
-            .get("parentToolCallId")
-            .and_then(Value::as_str)
-            .map(String::from),
-        name,
-        role: v
-            .get("agent")
-            .and_then(Value::as_str)
-            .or_else(|| v.get("agentSource").and_then(Value::as_str))
-            .map(String::from),
-        task,
-        status,
-        model: progress
-            .and_then(|p| {
-                p.get("resolvedModelIdentity")
-                    .and_then(Value::as_str)
-                    .or_else(|| p.get("resolvedModel").and_then(Value::as_str))
-                    .or_else(|| p.get("model").and_then(Value::as_str))
-            })
-            .map(String::from),
-        effort: progress
-            .and_then(|p| {
-                p.get("resolvedThinkingLevel")
-                    .and_then(Value::as_str)
-                    .or_else(|| p.get("effort").and_then(Value::as_str))
-            })
-            .map(String::from),
-        activity,
-        tokens,
-        context_tokens,
-        context_window,
-        cost: progress.and_then(|p| p.get("cost").and_then(Value::as_f64)),
-        duration_ms: progress.and_then(|p| {
-            p.get("durationMs")
-                .and_then(Value::as_u64)
-                .or_else(|| p.get("elapsedMs").and_then(Value::as_u64))
-        }),
-        tool_count: progress.and_then(|p| p.get("toolCount").and_then(Value::as_u64)),
-        session_file: v
-            .get("sessionFile")
-            .and_then(Value::as_str)
-            .map(String::from),
-        worktree_path: v
-            .get("worktreePath")
-            .and_then(Value::as_str)
-            .map(String::from),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn resumed_delegation_links_saved_agent_to_task_call() {
-        let mut agents =
-            vec![value_to_agent(&json!({"id":"Explorer","status":"completed"})).unwrap()];
-        let messages = vec![json!({"role":"assistant","content":[{
-            "type":"toolCall","id":"call-1","name":"task",
-            "arguments":{"tasks":[{"name":"Explorer","agent":"scout","task":"Inspect auth"}]}
-        }]})];
-        attach_task_metadata(&mut agents, &messages);
-        assert_eq!(agents[0].parent_tool_call_id.as_deref(), Some("call-1"));
-        assert_eq!(agents[0].role.as_deref(), Some("scout"));
-        assert_eq!(agents[0].task.as_deref(), Some("Inspect auth"));
-    }
-
-    #[test]
-    fn rpc_agent_snapshot_keeps_identity_and_current_activity() {
-        let snapshot = json!({
-            "id":"Backend.DatabaseExpert",
-            "agent":"scout",
-            "agentSource":"bundled",
-            "status":"running",
-            "progress":{
-                "id":"Backend.DatabaseExpert",
-                "status":"running",
-                "lastIntent":"Reading schema.rs",
-                "resolvedModelIdentity":"openai/gpt-small",
-                "resolvedThinkingLevel":"high",
-                "tokens":2048,
-                "contextTokens":3100,
-                "contextWindow":200000,
-                "toolCount":3
-            }
-        });
-        let agent = value_to_agent(&snapshot).unwrap();
-        assert_eq!(agent.name, "DatabaseExpert");
-        assert_eq!(agent.role.as_deref(), Some("scout"));
-        assert_eq!(agent.parent_id.as_deref(), Some("Backend"));
-        assert_eq!(agent.activity.as_deref(), Some("Reading schema.rs"));
-        assert_eq!(agent.model.as_deref(), Some("openai/gpt-small"));
-        assert_eq!(agent.effort.as_deref(), Some("high"));
-        assert_eq!(agent.tokens, Some(2048));
-    }
-
-    #[test]
     fn missing_mapped_session_fails_closed() {
-        let missing = std::env::temp_dir().join(format!("omp-missing-{}", uuid::Uuid::new_v4()));
-        assert!(
-            resume_arguments(HarnessKind::Omp, "session-1", &missing.to_string_lossy())
-                .unwrap_err()
-                .to_string()
-                .contains("missing or has moved")
-        );
-        assert!(resume_arguments(HarnessKind::Pi, "", "")
-            .unwrap()
-            .is_empty());
+        let missing = std::env::temp_dir().join(format!("pidesk-missing-{}", uuid::Uuid::new_v4()));
+        assert!(resume_arguments("session-1", &missing.to_string_lossy())
+            .unwrap_err()
+            .to_string()
+            .contains("missing or has moved"));
+        assert!(resume_arguments("", "").unwrap().is_empty());
     }
 
     #[test]
-    fn local_omp_prompt_is_completed_without_agent() {
-        assert!(!prompt_invokes_agent(
-            HarnessKind::Omp,
-            &json!({"agentInvoked": false})
-        ));
-        assert!(prompt_invokes_agent(
-            HarnessKind::Omp,
-            &json!({"agentInvoked": true})
-        ));
-        assert!(prompt_invokes_agent(HarnessKind::Pi, &Value::Null));
+    fn spawn_tells_pi_that_mermaid_renders() {
+        let args = spawn_arguments(Path::new("/tmp/sessions"));
+        let flag = args
+            .iter()
+            .position(|arg| arg == "--append-system-prompt")
+            .expect("rendering guide flag");
+        assert!(args[flag + 1].contains("```mermaid"));
+        // Pi reads an existing path's contents instead; the guide must stay literal text.
+        assert!(!Path::new(&args[flag + 1]).exists());
+        assert_eq!(
+            args[..5],
+            [
+                "--mode",
+                "rpc",
+                "--no-approve",
+                "--session-dir",
+                "/tmp/sessions"
+            ]
+        );
+    }
+
+    #[test]
+    fn session_ids_are_validated_before_reaching_the_cli() {
+        assert!(is_valid_session_id("01a0db99-77b6-7537-954a-8a394b96b5bc"));
+        assert!(is_valid_session_id("session_1.2"));
+        assert!(!is_valid_session_id(""));
+        assert!(!is_valid_session_id("--mode"));
+        assert!(!is_valid_session_id("-x"));
+        assert!(!is_valid_session_id("a b"));
+        assert!(!is_valid_session_id("../escape"));
+        assert!(!is_valid_session_id(&"a".repeat(129)));
     }
 
     #[test]
     fn checkout_reservation_race_has_one_owner() {
         let owners = Arc::new(Mutex::new(HashMap::new()));
-        let cwd = std::env::temp_dir().join(format!("omp-checkout-{}", uuid::Uuid::new_v4()));
+        let cwd = std::env::temp_dir().join(format!("pidesk-checkout-{}", uuid::Uuid::new_v4()));
         let barrier = Arc::new(std::sync::Barrier::new(2));
         let handles: Vec<_> = ["a", "b"]
             .into_iter()
@@ -2070,44 +1558,6 @@ mod tests {
         ));
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn stale_page_discards_prior_rows_before_fallback_snapshot() {
-        use std::process::Stdio;
-        let script = r#"IFS= read -r first
-printf '%s\n' '{"type":"response","id":"1","command":"get_messages_page","success":true,"data":{"messages":[{"role":"user","content":"old"}],"nextCursor":"cursor"}}'
-IFS= read -r second
-printf '%s\n' '{"type":"response","id":"2","command":"get_messages_page","success":false,"code":"stale_cursor","error":"Snapshot changed"}'
-IFS= read -r third
-printf '%s\n' '{"type":"response","id":"3","command":"get_messages","success":true,"data":{"messages":[{"role":"user","content":"fresh"}]}}'
-"#;
-        let mut child = Command::new("/bin/sh")
-            .arg("-c")
-            .arg(script)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-        let stdout = child.stdout.take().unwrap();
-        let stderr = child.stderr.take().unwrap();
-        let client = Arc::new(RpcClient::attach(
-            child,
-            stdout,
-            stderr,
-            RpcHandlers {
-                on_event: Box::new(|_| {}),
-                on_exit: Box::new(|_, _, _| {}),
-                on_ready: None,
-            },
-        ));
-        let messages = ThreadManager::fetch_messages(&client, HarnessKind::Omp)
-            .await
-            .unwrap();
-        assert_eq!(messages, vec![json!({"role":"user","content":"fresh"})]);
-    }
-
     // ---- idle suspension ----
 
     fn spawn_cat() -> Arc<RpcClient> {
@@ -2127,7 +1577,6 @@ printf '%s\n' '{"type":"response","id":"3","command":"get_messages","success":tr
             RpcHandlers {
                 on_event: Box::new(|_| {}),
                 on_exit: Box::new(|_, _, _| {}),
-                on_ready: None,
             },
         ))
     }
@@ -2139,7 +1588,6 @@ printf '%s\n' '{"type":"response","id":"3","command":"get_messages","success":tr
             last_activity: Mutex::new(Instant::now()),
             streaming: AtomicBool::new(false),
             failed: AtomicBool::new(false),
-            active_subagents: Mutex::new(std::collections::HashSet::new()),
             pending_ui_requests: Mutex::new(HashMap::new()),
             ui_fire_and_forget: Mutex::new(std::collections::HashSet::new()),
             activity: Notify::new(),
