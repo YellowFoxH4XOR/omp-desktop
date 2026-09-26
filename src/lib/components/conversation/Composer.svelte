@@ -132,14 +132,18 @@
     return [...starts, ...contains].slice(0, 10);
   });
 
-  // Focus the composer on mount and whenever a different thread is shown.
+  // Focus the composer on mount and whenever a different thread is shown,
+  // unless the user is typing somewhere else (e.g. renaming that thread).
   $effect(() => {
     threadId;
     submitGeneration += 1;
     submitting = false;
     text = '';
     cmdDismissed = false;
-    area?.focus();
+    const focused = document.activeElement;
+    const typingElsewhere = focused instanceof HTMLElement && focused !== area
+      && (focused.isContentEditable || (focused instanceof HTMLInputElement && !['button', 'checkbox', 'radio'].includes(focused.type)) || focused instanceof HTMLTextAreaElement);
+    if (!typingElsewhere) area?.focus();
   });
 
   // Auto-grow the textarea up to a cap.

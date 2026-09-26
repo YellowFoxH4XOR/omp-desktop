@@ -1370,6 +1370,21 @@ test('a new thread opens instantly while its Pi is still starting', async ({ pag
   await expect(page.getByText('History new-thread')).toBeVisible({ timeout: 5_000 });
 });
 
+test('double-click rename keeps focus even when the thread finishes opening afterwards', async ({ page }) => {
+  await installDesktopMock(page, { openDelay: { a: 600 } });
+  await page.goto('/');
+  await openProject(page);
+  await page.locator('.thread-link[title="Alpha"]').dblclick();
+  const input = page.getByRole('textbox', { name: 'Thread title' });
+  await expect(input).toBeFocused();
+  // The conversation loads while the rename box is open.
+  await expect(page.getByText('History a')).toBeVisible();
+  await expect(input).toBeFocused();
+  await input.fill('Renamed Alpha');
+  await input.press('Enter');
+  await expect(page.locator('.thread-link[title="Renamed Alpha"]')).toBeVisible();
+});
+
 test('hovering a thread prewarms its Pi, but passing over it does not', async ({ page }) => {
   await installDesktopMock(page);
   await page.goto('/');
@@ -1377,8 +1392,15 @@ test('hovering a thread prewarms its Pi, but passing over it does not', async ({
   const prewarms = () => page.evaluate(() => (window as any).__mockDesktop.calls.filter((call: { command: string }) => call.command === 'prewarm_thread').map((call: { args: { threadId: string } }) => call.args.threadId));
 
   // A quick pass over Alpha on the way to Beta must not start Alpha's Pi.
-  await page.locator('.thread-link[title="Alpha"]').hover();
-  await page.locator('.thread-link[title="Beta"]').hover();
+  // Move the mouse directly: hover() waits between steps, which on a slow
+  // machine can itself exceed the 120 ms dwell.
+  const center = async (title: string) => {
+    const box = (await page.locator(`.thread-link[title="${title}"]`).boundingBox())!;
+    return { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+  };
+  const [alpha, beta] = [await center('Alpha'), await center('Beta')];
+  await page.mouse.move(alpha.x, alpha.y);
+  await page.mouse.move(beta.x, beta.y);
   await page.waitForTimeout(400);
   expect(await prewarms()).toEqual(['b']);
 
