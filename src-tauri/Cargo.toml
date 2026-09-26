@@ -1,7 +1,7 @@
 [package]
 name = "pidesk"
 version = "0.1.0"
-description = "πDesk"
+description = "πDesk — a local desktop app for Pi coding-agent sessions"
 edition = "2021"
 
 [lib]

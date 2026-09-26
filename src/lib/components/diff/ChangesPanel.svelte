@@ -348,7 +348,7 @@
   onMount(() => {
     try {
       // Read the old preference once; subsequent changes use πDesk's key.
-      const saved = localStorage.getItem(MODE_KEY) ?? localStorage.getItem('omp.changes.diffMode');
+      const saved = localStorage.getItem(MODE_KEY);
       if (saved === 'unified' || saved === 'split') mode = saved;
     } catch {
       // best-effort

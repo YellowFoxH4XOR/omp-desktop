@@ -1,6 +1,6 @@
 # πDesk
 
-A local-first desktop app for [Pi](https://pi.dev) coding-agent sessions.
+A local-first desktop app for [Pi](https://github.com/earendil-works/pi) coding-agent sessions.
 
 πDesk provides project and thread management, streaming conversations, structured tool activity, extension prompts, and Git-backed diff review in a native macOS app. **Pi is the only supported coding agent.**
 
@@ -11,12 +11,14 @@ A local-first desktop app for [Pi](https://pi.dev) coding-agent sessions.
 - Local SQLite metadata for projects and threads
 - Pi JSONL RPC integration; no terminal scraping
 - Streaming assistant responses and structured tool cards, including extension tools
+- Rendered Markdown with syntax-highlighted code and Mermaid diagrams (Diagram/Code toggle)
 - Extension input, selection, confirmation, and editor requests
 - Model, effort, context, and token usage where supported by Pi
 - Git-backed unified and split diffs with syntax highlighting
 - File and hunk revert, word-level changes, and manual-edit refresh
 - Worktree isolation for concurrent modifying Git threads
 - Idle process suspension and crash recovery
+- Runtime monitor: memory per running Pi, grouped by project, with one-click stop for idle threads
 - Dark and light themes with keyboard navigation
 
 ## Requirements
@@ -98,6 +100,7 @@ src/
       diff/                     Git status, file diff, revert actions
       tools/                    Structured tool renderers
       setup/                    Private installer and sign-in guidance
+      runtime/                  Pi memory monitor and idle-thread controls
 src-tauri/
   src/
     commands.rs                 Tauri command boundary
@@ -129,7 +132,7 @@ Projects are preserved, but πDesk starts with fresh private threads. Existing e
 
 When no new app database exists, πDesk can reuse the prior `dev.ompui.desktop/omp-desktop.sqlite3` metadata database in place to preserve projects, without copying live SQLite/WAL files. Session discovery only scans the private `~/.pidesk/agent/sessions` tree; external directory overrides are ignored.
 
-The new app identity may reset window placement and webview preferences. Legacy storage names remain only for compatibility, and the original copyright notice is preserved.
+The new app identity may reset window placement and webview preferences. The `ompui`/`omp-desktop` names above remain only so existing installations can be found; everything else is named πDesk.
 
 ## License
 
