@@ -213,13 +213,21 @@ pub fn private_session_target(path: &Path) -> crate::error::AppResult<PathBuf> {
     private_session_path_in(&pidesk_root(), path, false)
 }
 
-fn private_session_path_in(
+pub(crate) fn private_session_path_in(
     root: &Path,
     path: &Path,
     require_file: bool,
 ) -> crate::error::AppResult<PathBuf> {
     use crate::error::AppError;
     let sessions = root.join("agent/sessions");
+    if path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir | std::path::Component::CurDir
+        )
+    }) {
+        return Err(AppError::new("Invalid private session path."));
+    }
     check_owned_path(root, true)?;
     check_owned_path(&root.join("agent"), true)?;
     check_owned_path(&sessions, true)?;
@@ -231,6 +239,7 @@ fn private_session_path_in(
     }
     let resolved = match std::fs::canonicalize(path) {
         Ok(resolved) => {
+            check_owned_path(path, false)?; // reject even an in-tree symlink
             check_owned_path(&resolved, false)?;
             resolved
         }
@@ -239,13 +248,33 @@ fn private_session_path_in(
             if std::fs::symlink_metadata(path).is_ok() {
                 return Err(AppError::new("Invalid private session path."));
             }
-            let parent = path
-                .parent()
-                .ok_or_else(|| AppError::new("Invalid private session path."))?;
-            let name = path
-                .file_name()
-                .ok_or_else(|| AppError::new("Invalid private session path."))?;
-            std::fs::canonicalize(parent)?.join(name)
+            // A retry after deleting an isolated thread's last journal may
+            // find its now-empty session directory already removed. Resolve
+            // the nearest existing ancestor so missing parents cannot turn
+            // an outside path (or symlink) into a permitted target.
+            let mut ancestor = path;
+            let mut suffix = Vec::new();
+            while !ancestor.exists() {
+                suffix.push(
+                    ancestor
+                        .file_name()
+                        .ok_or_else(|| AppError::new("Invalid private session path."))?
+                        .to_os_string(),
+                );
+                ancestor = ancestor
+                    .parent()
+                    .ok_or_else(|| AppError::new("Invalid private session path."))?;
+                if std::fs::symlink_metadata(ancestor)
+                    .is_ok_and(|meta| meta.file_type().is_symlink())
+                {
+                    return Err(AppError::new("Invalid private session path."));
+                }
+            }
+            let mut resolved = std::fs::canonicalize(ancestor)?;
+            for name in suffix.into_iter().rev() {
+                resolved.push(name);
+            }
+            resolved
         }
         Err(_) => {
             return Err(AppError::new(

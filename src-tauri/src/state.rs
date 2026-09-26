@@ -1,5 +1,6 @@
 use crate::harness::HarnessRegistry;
 use crate::store::Store;
+use crate::terminal::TerminalManager;
 use crate::threads::ThreadManager;
 use crate::watcher::WatcherManager;
 use std::sync::Arc;
@@ -12,6 +13,7 @@ pub struct AppState {
     #[allow(dead_code)] // held for lifetime; ThreadManager drives it
     pub watcher: Arc<WatcherManager>,
     pub threads: Arc<ThreadManager>,
+    pub terminals: Arc<TerminalManager>,
     pub app: AppHandle,
 }
 
@@ -30,6 +32,7 @@ impl AppState {
             registry,
             watcher,
             threads,
+            terminals: TerminalManager::new(),
             app,
         }
     }

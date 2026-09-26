@@ -39,11 +39,21 @@ interface Scenario {
   rememberedThreadId?: string;
   /** Raw assistant text, used to exercise the markdown sanitizer. */
   assistantText?: string;
+  /** Serve a two-provider model catalogue with model switching enabled. */
+  models?: boolean;
 }
+
+const MODEL_CATALOGUE = [
+  { provider: 'opencode-go', id: 'kimi-k2.6', name: 'Kimi K2.6', contextWindow: 262144, reasoning: true, images: true, cost: { input: 0.95, output: 4 } },
+  { provider: 'opencode-go', id: 'glm-5.1', name: 'GLM-5.1', contextWindow: 200000, reasoning: true, cost: { input: 1, output: 3.2 } },
+  { provider: 'opencode-go', id: 'deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash', contextWindow: 1048576, cost: { input: 0, output: 0 } },
+  { provider: 'openai-codex', id: 'gpt-5.3-codex-spark', name: 'GPT-5.3 Codex Spark', contextWindow: 128000, reasoning: true, cost: { input: 1.75, output: 14 } },
+];
 
 async function installDesktopMock(page: Page, scenario: Scenario = {}) {
   const [firstTitle, secondTitle] = scenario.titles ?? ['Alpha', 'Beta'];
-  await page.addInitScript(({ project, threads, openDelay, sendDelay, rememberedThreadId, assistantText, piInstalled, systemPiOnly, manualInstall, missingInstallPlan, deferEvents }) => {
+  await page.addInitScript(({ project, threads, openDelay, sendDelay, rememberedThreadId, assistantText, piInstalled, systemPiOnly, manualInstall, missingInstallPlan, deferEvents, catalogue }) => {
+    let defaults: { provider?: string; modelId?: string; thinkingLevel?: string } = catalogue.length ? { provider: 'opencode-go', modelId: 'kimi-k2.6' } : {};
     localStorage.setItem('lastProject', project.id);
     if (rememberedThreadId) localStorage.setItem('lastThread', rememberedThreadId);
     const callbacks = new Map<number, (event: unknown) => void>();
@@ -67,12 +77,13 @@ async function installDesktopMock(page: Page, scenario: Scenario = {}) {
       return {
         thread: clone(row),
         messages: [{ role: 'assistant', content: [{ type: 'text', text: assistantText ?? `History ${id}` }], timestamp: 1 }],
-        state: { sessionId: row.sessionId, sessionFile: row.sessionFile, isStreaming: false },
-        models: [], levels: [], agents: [],
+        state: { sessionId: row.sessionId, sessionFile: row.sessionFile, isStreaming: false,
+          ...(catalogue.length ? { model: catalogue.find(model => model.provider === defaults.provider && model.id === defaults.modelId) ?? catalogue[0], thinkingLevel: defaults.thinkingLevel ?? 'medium' } : {}) },
+        models: clone(catalogue), levels: catalogue.length ? ['off', 'medium', 'high'] : [], agents: [],
         capabilities: {
           agents: false, nestedAgents: false, agentSteering: false, agentKill: false,
-          agentRevive: false, planMode: false, permissions: false, modelSwitching: false,
-          effortLevels: false, contextUsage: false, tokenUsage: false, worktrees: true,
+          agentRevive: false, planMode: false, permissions: false, modelSwitching: catalogue.length > 0,
+          effortLevels: catalogue.length > 0, contextUsage: false, tokenUsage: false, worktrees: true,
         },
       };
     };
@@ -120,7 +131,8 @@ async function installDesktopMock(page: Page, scenario: Scenario = {}) {
           return;
         }
         if (command === 'create_thread') {
-          const row = { ...threads[0], id: 'new-thread', title: 'New thread', harness: String(args.harness) };
+          // A real new thread has no Pi session until Pi starts.
+          const row = { ...threads[0], id: 'new-thread', title: 'New thread', harness: String(args.harness), sessionId: '', sessionFile: '' };
           threads.push(row);
           return clone(row);
         }
@@ -133,6 +145,26 @@ async function installDesktopMock(page: Page, scenario: Scenario = {}) {
         }
         if (command === 'send_prompt') {
           await new Promise(resolve => setTimeout(resolve, sendDelay));
+          return;
+        }
+        if (command === 'set_thread_flags') {
+          const row = threads.find(candidate => candidate.id === args.threadId);
+          if (!row) throw new Error('Unknown thread');
+          if (args.pinned !== undefined) row.pinned = Boolean(args.pinned);
+          if (args.archived !== undefined) row.archived = Boolean(args.archived);
+          return clone(row);
+        }
+        if (command === 'thread_delete_preview') {
+          const row = threads.find(candidate => candidate.id === args.threadId);
+          if (!row) throw new Error('Unknown thread');
+          return { hasSession: Boolean(row.sessionFile), worktreePath: row.worktreePath,
+            changedFiles: row.worktreePath ? ((window as any).__dirtyWorktreeFiles ?? 0) : 0 };
+        }
+        if (command === 'delete_thread') {
+          const index = threads.findIndex(candidate => candidate.id === args.threadId);
+          if (index < 0) throw new Error('Unknown thread');
+          if (threads[index].worktreePath && (window as any).__dirtyWorktreeFiles && !args.discardChanges) throw new Error('Uncommitted files');
+          threads.splice(index, 1);
           return;
         }
         if (command === 'rename_thread') {
@@ -160,7 +192,21 @@ async function installDesktopMock(page: Page, scenario: Scenario = {}) {
           (window as any).__stoppedThreads = [...((window as any).__stoppedThreads ?? []), String(args.threadId)];
           return;
         }
-        if (command === 'respond_ui' || command === 'abort_thread') return;
+        if (command === 'get_model_defaults') return clone(defaults);
+        if (command === 'set_default_model') { defaults = { ...defaults, provider: String(args.provider), modelId: String(args.modelId) }; return clone(defaults); }
+        if (command === 'set_default_thinking_level') { defaults = { ...defaults, thinkingLevel: String(args.level) }; return clone(defaults); }
+        if (command === 'set_thread_model') {
+          const model = catalogue.find(candidate => candidate.provider === args.provider && candidate.id === args.modelId);
+          if (!model) throw new Error('Model not found');
+          return { sessionId: 'session', isStreaming: false, model: clone(model), thinkingLevel: 'medium' };
+        }
+        if (command === 'terminal_open') {
+          const channel = (args.output as { id: number }).id;
+          setTimeout(() => callbacks.get(channel)?.({ index: 0, message: new TextEncoder().encode('Pi shell ready\r\n').buffer }), 20);
+          return 'mock-terminal-1';
+        }
+        if (command === 'terminal_write' || command === 'terminal_ack' || command === 'terminal_resize' || command === 'terminal_close' || command === 'plugin:opener|reveal_item_in_dir') return;
+        if (command === 'respond_ui' || command === 'abort_thread' || command === 'prewarm_thread') return;
         throw new Error(`Unexpected Tauri command: ${command}`);
       },
     };
@@ -170,6 +216,11 @@ async function installDesktopMock(page: Page, scenario: Scenario = {}) {
       emit,
       finishInstall(error?: string) { finishInstall?.(error); },
       connectEvents() { connectEvents?.(); },
+      setWorktree(id: string, changedFiles: number) {
+        const row = threads.find(candidate => candidate.id === id);
+        if (row) row.worktreePath = `/Users/test/.pidesk/worktrees/${id}`;
+        (window as any).__dirtyWorktreeFiles = changedFiles;
+      },
     };
   }, {
     project,
@@ -186,6 +237,7 @@ async function installDesktopMock(page: Page, scenario: Scenario = {}) {
     manualInstall: scenario.manualInstall ?? false,
     missingInstallPlan: scenario.missingInstallPlan ?? false,
     deferEvents: scenario.deferEvents ?? false,
+    catalogue: scenario.models ? MODEL_CATALOGUE : [],
   });
 }
 
@@ -294,6 +346,47 @@ test('new threads and settings are Pi-only', async ({ page }) => {
   await expect(page.getByRole('textbox', { name: 'Private Pi sign-in command' })).toBeVisible();
 });
 
+test('Settings shows full private paths and opens and closes the Pi terminal', async ({ page }) => {
+  await installDesktopMock(page);
+  await page.context().grantPermissions(['clipboard-read', 'clipboard-write']);
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  const settings = page.getByRole('dialog', { name: 'Settings' });
+  await expect(settings.locator('.install-paths')).toContainText('/Users/test/.pidesk/runtime/node_modules/.bin/pi');
+  await expect(settings.locator('.install-paths')).toContainText('/Users/test/.pidesk/runtime');
+  await expect(settings.locator('.install-paths')).toContainText('/Users/test/.pidesk/agent');
+  await settings.getByRole('button', { name: 'Copy path' }).click();
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe('/Users/test/.pidesk/runtime/node_modules/.bin/pi');
+  await settings.getByRole('button', { name: 'Reveal in Finder' }).click();
+  await expect.poll(() => page.evaluate(() => (window as any).__mockDesktop.calls.some((call: { command: string }) => call.command === 'plugin:opener|reveal_item_in_dir'))).toBe(true);
+  await settings.locator('.install-actions').getByRole('button', { name: 'Open terminal' }).click();
+  const terminal = page.getByRole('dialog', { name: 'Pi terminal' });
+  await expect(terminal).toBeVisible();
+  await expect(terminal.locator('.xterm-screen')).toContainText('Pi shell ready');
+  // Rendered output is acknowledged back to the backend for flow control.
+  await expect.poll(() => page.evaluate(() => (window as any).__mockDesktop.calls.filter((call: { command: string }) => call.command === 'terminal_ack').reduce((sum: number, call: { args: { bytes: number } }) => sum + call.args.bytes, 0))).toBe(16);
+  // Typed input reaches the backend in order.
+  await terminal.locator('.xterm-helper-textarea').focus();
+  await page.keyboard.type('pi --version', { delay: 0 });
+  await expect.poll(() => page.evaluate(() => (window as any).__mockDesktop.calls.filter((call: { command: string }) => call.command === 'terminal_write').map((call: { args: { data: string } }) => call.args.data).join(''))).toBe('pi --version');
+  await terminal.getByRole('button', { name: 'Close terminal' }).click();
+  await expect(terminal).toHaveCount(0);
+  await expect.poll(() => page.evaluate(() => (window as any).__mockDesktop.calls.some((call: { command: string }) => call.command === 'terminal_close'))).toBe(true);
+});
+
+test('terminal opens from setup and the command switcher', async ({ page }) => {
+  await installDesktopMock(page, { piInstalled: false });
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Install Pi', exact: true }).click();
+  await page.getByRole('button', { name: 'Open terminal' }).click();
+  await expect(page.getByRole('dialog', { name: 'Pi terminal' })).toBeVisible();
+  await page.getByRole('button', { name: 'Close terminal' }).click();
+  await page.getByRole('button', { name: 'Continue to πDesk' }).click();
+  await page.keyboard.press('Meta+k');
+  await page.getByRole('button', { name: /Open Pi terminal/ }).click();
+  await expect(page.getByRole('dialog', { name: 'Pi terminal' })).toBeVisible();
+});
+
 test('assistant HTML cannot carry layout CSS, scripts, or remote images', async ({ page }) => {
   await installDesktopMock(page, {
     assistantText:
@@ -343,12 +436,75 @@ test('startup does not spawn a harness and newer thread selection wins', async (
   await expect(page.getByText('History a')).toHaveCount(0);
 });
 
-test('remembered thread is selected without starting its harness', async ({ page }) => {
+test('remembered thread reopens on launch', async ({ page }) => {
   await installDesktopMock(page, { rememberedThreadId: 'a' });
   await page.goto('/');
-  await expect(page.getByRole('heading', { name: 'What shall we work on?' })).toBeVisible();
   await expect(page.locator('.thread-row.active .thread-title')).toHaveText('Alpha');
-  expect(await page.evaluate(() => (window as any).__mockDesktop.calls.filter((call: { command: string }) => call.command === 'open_thread'))).toHaveLength(0);
+  await expect(page.getByText('History a')).toBeVisible();
+  expect(await page.evaluate(() => (window as any).__mockDesktop.calls.filter((call: { command: string }) => call.command === 'open_thread').map((call: { args: { threadId: string } }) => call.args.threadId))).toEqual(['a']);
+});
+
+test('thread popover closes after actions and rename saves or cancels in place', async ({ page }) => {
+  await installDesktopMock(page);
+  await page.goto('/');
+  await expect(page.getByRole('heading', { name: 'What shall we work on?' })).toBeVisible();
+  await page.getByRole('button', { name: 'Actions for Alpha' }).click();
+  await page.getByRole('menuitem', { name: 'Pin', exact: true }).click();
+  await expect(page.getByRole('menuitem', { name: 'Pin', exact: true })).toHaveCount(0);
+  await page.getByRole('button', { name: 'Actions for Alpha' }).click();
+  await page.getByRole('menuitem', { name: 'Unpin' }).click();
+  await page.locator('.thread-link[title="Alpha"]').click({ button: 'right' });
+  await expect(page.getByRole('menuitem', { name: 'Archive' })).toBeVisible();
+  await page.getByRole('menuitem', { name: 'Archive' }).click();
+  await expect(page.getByRole('menuitem', { name: 'Archive' })).toHaveCount(0);
+  await page.getByRole('button', { name: 'Show archived' }).click();
+  await page.getByRole('button', { name: 'Actions for Alpha' }).click();
+  await page.getByRole('menuitem', { name: 'Unarchive' }).click();
+  await page.getByRole('button', { name: 'Actions for Alpha' }).click();
+  await page.getByRole('menuitem', { name: 'Rename' }).click();
+  const input = page.getByRole('textbox', { name: 'Thread title' });
+  await input.fill('Renamed Alpha');
+  await input.press('Escape');
+  await expect(page.locator('.thread-link[title="Alpha"]')).toBeVisible();
+  await page.locator('.thread-link[title="Alpha"]').dblclick();
+  await input.fill('Renamed Alpha');
+  await input.press('Enter');
+  await expect(page.locator('.thread-link[title="Renamed Alpha"]')).toBeVisible();
+});
+
+test('deleting a thread confirms safely and selects the next thread', async ({ page }) => {
+  await installDesktopMock(page);
+  await page.goto('/');
+  await page.locator('.thread-link[title="Alpha"]').click();
+  await expect(page.getByText('History a')).toBeVisible();
+  await page.getByRole('button', { name: 'Actions for Alpha' }).click();
+  await page.getByRole('menuitem', { name: 'Delete thread…' }).click();
+  const dialog = page.getByRole('alertdialog', { name: 'Delete thread?' });
+  await expect(dialog).toContainText('Conversation history will be deleted');
+  await expect(dialog.getByRole('button', { name: 'Cancel' })).toBeFocused();
+  await page.keyboard.press('Enter');
+  await expect(dialog).toHaveCount(0);
+  await expect(page.locator('.thread-link[title="Alpha"]')).toBeVisible();
+  await page.getByRole('button', { name: 'Actions for Alpha' }).click();
+  await page.getByRole('menuitem', { name: 'Delete thread…' }).click();
+  await dialog.getByRole('button', { name: 'Delete thread', exact: true }).click();
+  await expect(page.locator('.thread-link[title="Alpha"]')).toHaveCount(0);
+  await expect(page.getByText('History b')).toBeVisible();
+  expect(await page.evaluate(() => localStorage.getItem('lastThread'))).toBe('b');
+});
+
+test('dirty isolated thread requires explicit discard', async ({ page }) => {
+  await installDesktopMock(page);
+  await page.goto('/');
+  await expect(page.getByRole('heading', { name: 'What shall we work on?' })).toBeVisible();
+  await page.evaluate(() => (window as any).__mockDesktop.setWorktree('a', 3));
+  await page.getByRole('button', { name: 'Actions for Alpha' }).click();
+  await page.getByRole('menuitem', { name: 'Delete thread…' }).click();
+  const dialog = page.getByRole('alertdialog', { name: 'Delete thread?' });
+  await expect(dialog).toContainText('3 uncommitted files will be discarded');
+  await dialog.getByRole('button', { name: 'Delete thread and discard changes' }).click();
+  await expect(page.locator('.thread-link[title="Alpha"]')).toHaveCount(0);
+  expect(await page.evaluate(() => (window as any).__mockDesktop.calls.find((call: { command: string }) => call.command === 'delete_thread')?.args)).toEqual({ threadId: 'a', discardChanges: true });
 });
 
 test('approval emitted while opening remains actionable', async ({ page }) => {
@@ -503,4 +659,93 @@ test('runtime monitor shows per-project Pi memory and stops only idle threads', 
   await expect(panel.getByRole('button', { name: 'Stop Alpha' })).toBeEnabled();
   await page.keyboard.press('Escape');
   await expect(panel).toHaveCount(0);
+});
+
+test('a new thread opens instantly while its Pi is still starting', async ({ page }) => {
+  await installDesktopMock(page, { openDelay: { 'new-thread': 2_000 } });
+  await page.goto('/');
+  await page.locator('.thread-link[title="Alpha"]').click();
+  await expect(page.getByText('History a')).toBeVisible();
+
+  const started = Date.now();
+  await page.locator('.new-thread').click();
+  // The composer for the new thread is usable before open_thread resolves.
+  await expect(page.locator('.top-thread')).toHaveText('New thread');
+  await expect(page.getByRole('combobox', { name: 'Message' })).toBeEnabled();
+  await expect(page.getByText('No messages yet')).toBeVisible();
+  expect(Date.now() - started).toBeLessThan(1_000);
+  await expect(page.getByRole('heading', { name: 'Opening thread' })).toHaveCount(0);
+  // When Pi is ready, its snapshot is merged into the same view.
+  await expect(page.getByText('History new-thread')).toBeVisible({ timeout: 5_000 });
+});
+
+test('hovering a thread prewarms its Pi, but passing over it does not', async ({ page }) => {
+  await installDesktopMock(page);
+  await page.goto('/');
+  await expect(page.getByRole('heading', { name: 'What shall we work on?' })).toBeVisible();
+  const prewarms = () => page.evaluate(() => (window as any).__mockDesktop.calls.filter((call: { command: string }) => call.command === 'prewarm_thread').map((call: { args: { threadId: string } }) => call.args.threadId));
+
+  // A quick pass over Alpha on the way to Beta must not start Alpha's Pi.
+  await page.locator('.thread-link[title="Alpha"]').hover();
+  await page.locator('.thread-link[title="Beta"]').hover();
+  await page.waitForTimeout(400);
+  expect(await prewarms()).toEqual(['b']);
+
+  // Hovering again within the cooldown does not spawn duplicates.
+  await page.mouse.move(0, 0);
+  await page.locator('.thread-link[title="Beta"]').hover();
+  await page.waitForTimeout(400);
+  expect(await prewarms()).toEqual(['b']);
+});
+
+test('model picker groups by provider, shows context, searches, and sets the default', async ({ page }) => {
+  await installDesktopMock(page, { models: true, openDelay: { 'new-thread': 2_000 } });
+  await page.goto('/');
+  await page.locator('.thread-link[title="Alpha"]').click();
+  await expect(page.getByText('History a')).toBeVisible();
+
+  const trigger = page.getByRole('button', { name: 'Select model' });
+  await expect(trigger).toContainText('Kimi K2.6');
+  await expect(trigger).toContainText('262K');
+
+  await trigger.click();
+  const panel = page.getByRole('dialog', { name: 'Choose a model' });
+  await expect(panel.getByRole('group', { name: 'OpenCode Go' })).toBeVisible();
+  await expect(panel.getByRole('group', { name: 'OpenAI Codex' })).toBeVisible();
+  // The current provider is listed first, and the current model is marked.
+  await expect(panel.locator('.group-head').first()).toContainText('OpenCode Go');
+  await expect(panel.getByRole('option', { name: /Kimi K2\.6/ })).toHaveAttribute('aria-selected', 'true');
+  await expect(panel.getByRole('option', { name: /DeepSeek V4\.1 Flash/ })).toContainText('1M');
+  await expect(panel.getByRole('option', { name: /DeepSeek V4\.1 Flash/ })).toContainText('Free');
+
+  // Search across providers, then pick with the keyboard.
+  await page.keyboard.type('codex spark');
+  await expect(panel.getByRole('option')).toHaveCount(1);
+  await page.keyboard.press('Enter');
+  await expect(panel).toHaveCount(0);
+  const setModel = await page.evaluate(() => (window as any).__mockDesktop.calls.filter((call: { command: string }) => call.command === 'set_thread_model').map((call: { args: unknown }) => call.args));
+  expect(setModel).toEqual([{ threadId: 'a', provider: 'openai-codex', modelId: 'gpt-5.3-codex-spark' }]);
+  await expect(trigger).toContainText('GPT-5.3 Codex Spark');
+  await expect(trigger).toContainText('128K');
+
+  // Star a model as the default for new threads.
+  await trigger.click();
+  await panel.getByRole('option', { name: /GLM-5\.1/ }).hover();
+  await panel.getByRole('button', { name: 'Make GLM-5.1 the default for new threads' }).click();
+  await expect(panel.getByRole('option', { name: /GLM-5\.1/ })).toContainText('Default');
+  await page.keyboard.press('Escape');
+  expect(await page.evaluate(() => (window as any).__mockDesktop.calls.filter((call: { command: string }) => call.command === 'set_default_model').map((call: { args: unknown }) => call.args))).toEqual([{ provider: 'opencode-go', modelId: 'glm-5.1' }]);
+
+  // Settings shows and edits the same defaults.
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  const settings = page.getByRole('dialog', { name: 'Settings' });
+  await expect(settings.getByRole('button', { name: 'Default model for new threads' })).toContainText('GLM-5.1');
+  await settings.getByRole('combobox', { name: 'Default effort for new threads' }).selectOption('high');
+  await expect.poll(() => page.evaluate(() => (window as any).__mockDesktop.calls.some((call: { command: string; args: { level?: string } }) => call.command === 'set_default_thinking_level' && call.args.level === 'high'))).toBe(true);
+  await settings.getByRole('button', { name: 'Close settings' }).click();
+
+  // A new thread starts on the default model immediately, before Pi is ready.
+  await page.locator('.new-thread').click();
+  await expect(page.locator('.top-thread')).toHaveText('New thread');
+  await expect(page.getByRole('button', { name: 'Select model' })).toContainText('GLM-5.1');
 });

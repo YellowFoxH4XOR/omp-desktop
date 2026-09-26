@@ -86,6 +86,15 @@ pub struct Thread {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ThreadDeletePreview {
+    pub has_session: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree_path: Option<String>,
+    pub changed_files: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ModelInfo {
     pub provider: String,
     pub id: String,
@@ -94,6 +103,30 @@ pub struct ModelInfo {
     pub context_window: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
+    /// Accepts image input.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub images: Option<bool>,
+    /// USD per million input/output tokens, when Pi reports pricing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost: Option<ModelCost>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCost {
+    pub input: f64,
+    pub output: f64,
+}
+
+/// Pi startup defaults applied to every new thread.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelDefaults {
+    pub provider: Option<String>,
+    pub model_id: Option<String>,
+    pub thinking_level: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

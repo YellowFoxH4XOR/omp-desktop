@@ -59,7 +59,7 @@ Everything routes through `src-tauri/src/commands.rs`, the `#[tauri::command]` I
 
 `src/lib/session.svelte.ts` (`SessionModel`) is the reactive core of one open thread: it flattens `get_messages` history into `ConversationItem` rows and reduces Pi live RPC deltas into one normalized `SessionView`, reconciling final messages without duplicate text. UI components never see raw harness frames, only this normalized shape. This is the file to read first when changing how conversation/tool-call state is derived or displayed.
 
-`src/App.svelte` is the application shell: project/thread list, session caching (`MAX_CACHED_SESSIONS`), and event wiring between `api.ts` and mounted `SessionModel`s.
+`src/App.svelte` is the application shell: project/thread list, session caching (`MAX_CACHED_SESSIONS`), and event wiring between `api.ts` and mounted `SessionModel`s. On launch it reopens the last thread (and starts its Pi); with no remembered thread, startup does not start a harness.
 
 `src/lib/components/setup/` owns the opt-in private installer, terminal-style log, real stage progress, error/retry/success UI, and separate sign-in guidance. Installer events must be subscribed before enabling Install; never invent a fallback global command or simulated percentage.
 

@@ -8,6 +8,7 @@
     "core:event:default",
     "core:window:allow-start-dragging",
     "opener:default",
+    { "identifier": "opener:allow-reveal-item-in-dir", "allow": [{ "path": "$HOME/.pidesk/**" }] },
     "dialog:default",
     "window-state:default"
   ]

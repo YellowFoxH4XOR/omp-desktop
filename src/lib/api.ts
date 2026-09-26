@@ -1,7 +1,7 @@
-import { invoke } from '@tauri-apps/api/core';
+import { invoke, type Channel } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { z } from 'zod';
-import type { BackendEvent, ChangesSummary, GitFile, HarnessInstallation, HarnessInstallCommand, HarnessKind, ModelInfo, Project, SessionSnapshot, SessionState, Thread, UiResponse, Usage, RuntimeStats } from './types';
+import type { BackendEvent, ChangesSummary, GitFile, HarnessInstallation, HarnessInstallCommand, HarnessKind, ModelInfo, Project, SessionSnapshot, SessionState, Thread, ThreadDeletePreview, UiResponse, Usage, RuntimeStats, ModelDefaults } from './types';
 
 export const api = {
   detectHarnesses: () => invoke<HarnessInstallation[]>('detect_harnesses'),
@@ -14,7 +14,13 @@ export const api = {
   createThread: (projectId: string, harness: HarnessKind, isolated = false) => invoke<Thread>('create_thread', { projectId, harness, isolated }),
   openThread: (threadId: string) => invoke<SessionSnapshot>('open_thread', { threadId }),
   stopThread: (threadId: string) => invoke<void>('stop_thread', { threadId }),
+  threadDeletePreview: (threadId: string) => invoke<ThreadDeletePreview>('thread_delete_preview', { threadId }),
+  deleteThread: (threadId: string, discardChanges: boolean) => invoke<void>('delete_thread', { threadId, discardChanges }),
   getRuntimeStats: () => invoke<RuntimeStats>('get_runtime_stats'),
+  getModelDefaults: () => invoke<ModelDefaults>('get_model_defaults'),
+  setDefaultModel: (provider: string, modelId: string) => invoke<ModelDefaults>('set_default_model', { provider, modelId }),
+  setDefaultThinkingLevel: (level: string) => invoke<ModelDefaults>('set_default_thinking_level', { level }),
+  prewarmThread: (threadId: string) => invoke<void>('prewarm_thread', { threadId }),
   restartThread: (threadId: string) => invoke<SessionSnapshot>('restart_thread', { threadId }),
   sendPrompt: (threadId: string, message: string, mode: 'prompt' | 'steer' | 'follow_up' = 'prompt') => invoke<void>('send_prompt', { threadId, message, mode }),
   abortThread: (threadId: string) => invoke<void>('abort_thread', { threadId }),
@@ -26,6 +32,11 @@ export const api = {
   renameThread: (threadId: string, title: string) => invoke<Thread>('rename_thread', { threadId, title }),
   setThreadFlags: (threadId: string, pinned?: boolean, archived?: boolean) => invoke<Thread>('set_thread_flags', { threadId, pinned, archived }),
   respondUi: (threadId: string, requestId: string, response: UiResponse) => invoke<void>('respond_ui', { threadId, requestId, response }),
+  terminalOpen: (cols: number, rows: number, cwd: string | undefined, output: Channel<ArrayBuffer>) => invoke<string>('terminal_open', { cols, rows, cwd, output }),
+  terminalWrite: (id: string, data: string) => invoke<void>('terminal_write', { id, data }),
+  terminalAck: (id: string, bytes: number) => invoke<void>('terminal_ack', { id, bytes }),
+  terminalResize: (id: string, cols: number, rows: number) => invoke<void>('terminal_resize', { id, cols, rows }),
+  terminalClose: (id: string) => invoke<void>('terminal_close', { id }),
   gitStatus: (threadId: string) => invoke<ChangesSummary>('git_status', { threadId }),
   gitFile: (threadId: string, path: string) => invoke<GitFile>('git_file', { threadId, path }),
   gitRevertFile: (threadId: string, path: string, expectedHash?: string | null) => invoke<void>('git_revert_file', { threadId, path, expectedHash: expectedHash ?? null }),

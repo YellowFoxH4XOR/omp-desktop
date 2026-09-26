@@ -1,6 +1,6 @@
 use crate::dto::{
     ChangesSummary, GitFile, HarnessInstallation, HarnessKind, ModelInfo, Project, SessionSnapshot,
-    SessionState, Thread, UiResponse, Usage,
+    SessionState, Thread, ThreadDeletePreview, UiResponse, Usage,
 };
 use crate::error::{cmd_err, AppError, CmdResult};
 use crate::git;
@@ -168,10 +168,65 @@ pub async fn open_thread(
     state.threads.snapshot(&thread_id).await.map_err(cmd_err)
 }
 
+/// Start a thread's Pi in the background (e.g. on hover) so the following
+/// open finds a warm process. Returns immediately; failures surface on open.
+#[tauri::command]
+pub async fn prewarm_thread(state: State<'_, AppState>, thread_id: String) -> CmdResult<()> {
+    let threads = state.threads.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = threads.ensure_running(&thread_id).await;
+    });
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_model_defaults() -> CmdResult<crate::dto::ModelDefaults> {
+    blocking(|| crate::pi_settings::read_defaults(&util::pidesk_root())).await
+}
+
+#[tauri::command]
+pub async fn set_default_model(
+    provider: String,
+    model_id: String,
+) -> CmdResult<crate::dto::ModelDefaults> {
+    blocking(move || {
+        crate::pi_settings::set_default_model(&util::pidesk_root(), &provider, &model_id)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn set_default_thinking_level(level: String) -> CmdResult<crate::dto::ModelDefaults> {
+    blocking(move || crate::pi_settings::set_default_thinking_level(&util::pidesk_root(), &level))
+        .await
+}
+
 #[tauri::command]
 pub async fn get_runtime_stats(state: State<'_, AppState>) -> CmdResult<crate::dto::RuntimeStats> {
     let threads = state.threads.clone();
     blocking(move || Ok(threads.runtime_stats())).await
+}
+
+#[tauri::command]
+pub async fn thread_delete_preview(
+    state: State<'_, AppState>,
+    thread_id: String,
+) -> CmdResult<ThreadDeletePreview> {
+    let threads = state.threads.clone();
+    blocking(move || threads.delete_preview(&thread_id)).await
+}
+
+#[tauri::command]
+pub async fn delete_thread(
+    state: State<'_, AppState>,
+    thread_id: String,
+    discard_changes: bool,
+) -> CmdResult<()> {
+    state
+        .threads
+        .delete_thread(&thread_id, discard_changes)
+        .await
+        .map_err(cmd_err)
 }
 
 #[tauri::command]
@@ -304,6 +359,73 @@ pub async fn respond_ui(
         .respond_ui(&thread_id, &request_id, response)
         .await
         .map_err(cmd_err)
+}
+
+// ---------------------------------------------------------------------
+// Embedded private Pi terminal
+// ---------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn terminal_open(
+    state: State<'_, AppState>,
+    cols: u16,
+    rows: u16,
+    cwd: Option<String>,
+    output: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
+) -> CmdResult<String> {
+    let home = util::home_dir();
+    let directory = if let Some(cwd) = cwd {
+        let requested = std::fs::canonicalize(&cwd)
+            .map_err(|_| "Project directory is unavailable.".to_string())?;
+        let projects = state.store.list_projects().map_err(cmd_err)?;
+        if !projects
+            .iter()
+            .any(|project| std::fs::canonicalize(&project.path).ok().as_ref() == Some(&requested))
+        {
+            return Err("Terminal directory must be a registered project.".into());
+        }
+        requested
+    } else {
+        home
+    };
+    state
+        .terminals
+        .open(cols, rows, &directory, output, &state.registry)
+        .await
+        .map_err(cmd_err)
+}
+
+/// Non-blocking: input is queued on the terminal's ordered writer thread.
+#[tauri::command]
+pub async fn terminal_write(state: State<'_, AppState>, id: String, data: String) -> CmdResult<()> {
+    state.terminals.write(&id, &data).map_err(cmd_err)
+}
+
+#[tauri::command]
+pub async fn terminal_ack(state: State<'_, AppState>, id: String, bytes: usize) -> CmdResult<()> {
+    state.terminals.ack(&id, bytes);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn terminal_resize(
+    state: State<'_, AppState>,
+    id: String,
+    cols: u16,
+    rows: u16,
+) -> CmdResult<()> {
+    let terminals = state.terminals.clone();
+    blocking(move || terminals.resize(&id, cols, rows)).await
+}
+
+#[tauri::command]
+pub async fn terminal_close(state: State<'_, AppState>, id: String) -> CmdResult<()> {
+    let terminals = state.terminals.clone();
+    blocking(move || {
+        terminals.close(&id);
+        Ok(())
+    })
+    .await
 }
 
 // ---------------------------------------------------------------------

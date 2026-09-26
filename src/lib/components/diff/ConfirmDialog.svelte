@@ -146,6 +146,7 @@
     text-align: left;
   }
   .confirm-detail {
+    white-space: pre-line;
     font-size: 12.5px;
     color: var(--muted);
     line-height: 1.55;

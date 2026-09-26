@@ -12,9 +12,11 @@
     onRespond: (requestId: string, response: UiResponse) => void | Promise<void>;
     onSetModel?: (value: string) => void | Promise<void>;
     onSetEffort?: (level: string) => void | Promise<void>;
+    defaultModelKey?: string | null;
+    onMakeDefault?: (model: import('../../types').ModelInfo) => void | Promise<void>;
   }
 
-  let { view, onSend, onAbort, onShowChanges, onRespond, onSetModel, onSetEffort }: Props = $props();
+  let { view, onSend, onAbort, onShowChanges, onRespond, onSetModel, onSetEffort, defaultModelKey = null, onMakeDefault }: Props = $props();
 </script>
 
 <section class="conversation" aria-label="Conversation">
@@ -42,6 +44,8 @@
       {onAbort}
       {onSetModel}
       {onSetEffort}
+      {defaultModelKey}
+      {onMakeDefault}
     />
   </div>
 </section>
