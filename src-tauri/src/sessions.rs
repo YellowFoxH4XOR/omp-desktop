@@ -70,6 +70,73 @@ fn read_bounded_record(
     }
 }
 
+/// Read bounded recent text for orchestration without starting a thread's
+/// process (which could load user extensions). Images and tool payloads are
+/// omitted here; this is a report, not a reconstructed session snapshot.
+pub fn recent_text(path: &Path) -> crate::error::AppResult<Vec<Value>> {
+    recent_text_at(&util::private_session_file(path)?)
+}
+
+fn recent_text_at(path: &Path) -> crate::error::AppResult<Vec<Value>> {
+    if std::fs::metadata(path)?.len() > MAX_METADATA_SCAN_BYTES {
+        return Err(crate::error::AppError::new("This session exceeds the 64 MiB inspection limit. Recent output is unavailable; do not treat an older prefix as current."));
+    }
+    let mut reader = std::io::BufReader::new(std::fs::File::open(path)?);
+    let mut record = Vec::new();
+    let mut messages = std::collections::VecDeque::new();
+    let mut scanned = 0usize;
+    loop {
+        match read_bounded_record(&mut reader, &mut record, MAX_JSONL_RECORD_BYTES)? {
+            BoundedRecord::Eof | BoundedRecord::Fragment => break,
+            BoundedRecord::Oversized => {
+                return Err(crate::error::AppError::new(
+                    "Session contains an oversized record; recent output is unavailable.",
+                ))
+            }
+            BoundedRecord::Line => {}
+        }
+        scanned += record.len();
+        if scanned > MAX_METADATA_SCAN_BYTES as usize {
+            return Err(crate::error::AppError::new(
+                "Session grew beyond the inspection limit; recent output is unavailable.",
+            ));
+        }
+        let Ok(entry) = serde_json::from_slice::<Value>(trimmed_record(&record)) else {
+            continue;
+        };
+        let Some(message) = entry.get("message") else {
+            continue;
+        };
+        let role = message.get("role").and_then(Value::as_str).unwrap_or("");
+        if !matches!(role, "user" | "assistant") {
+            continue;
+        }
+        let text = if let Some(text) = message.get("content").and_then(Value::as_str) {
+            text.to_string()
+        } else {
+            message
+                .get("content")
+                .and_then(Value::as_array)
+                .map(|parts| {
+                    parts
+                        .iter()
+                        .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+                        .filter_map(|part| part.get("text").and_then(Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default()
+        };
+        if !text.is_empty() {
+            messages.push_back(serde_json::json!({"role":role,"text":util::redact_secrets(&bounded_text(&text, 4096))}));
+            if messages.len() > 24 {
+                messages.pop_front();
+            }
+        }
+    }
+    Ok(messages.into_iter().collect())
+}
+
 fn trimmed_record(record: &[u8]) -> &[u8] {
     let record = record.strip_suffix(b"\n").unwrap_or(record);
     record.strip_suffix(b"\r").unwrap_or(record)
@@ -350,6 +417,21 @@ fn parse_session_file(path: &Path) -> Option<ScannedSession> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recent_text_rejects_oversized_records_instead_of_stale_prefixes() {
+        let path =
+            std::env::temp_dir().join(format!("pidesk-intern-record-{}", uuid::Uuid::new_v4()));
+        let mut bytes = b"{\"message\":{\"role\":\"assistant\",\"content\":\"old\"}}\n".to_vec();
+        bytes.extend(vec![b'x'; MAX_JSONL_RECORD_BYTES + 1]);
+        bytes.push(b'\n');
+        std::fs::write(&path, bytes).unwrap();
+        assert!(recent_text_at(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("oversized record"));
+        std::fs::remove_file(path).unwrap();
+    }
 
     fn session(id: &str) -> ScannedSession {
         ScannedSession {

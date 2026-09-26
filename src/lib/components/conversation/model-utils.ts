@@ -35,6 +35,18 @@ export function providerLabel(provider: string): string {
   );
 }
 
+/** A stable hue per provider for its monogram (known brands get their color). */
+const PROVIDER_HUES: Record<string, number> = {
+  anthropic: 24, openai: 160, 'openai-codex': 160, 'azure-openai-responses': 205, google: 215, 'google-vertex': 215, 'google-gemini-cli': 215,
+  'github-copilot': 265, openrouter: 250, 'opencode-go': 190, opencode: 190, xai: 0, groq: 15, mistral: 30, deepseek: 225, zai: 280,
+};
+export function providerHue(provider: string): number {
+  if (provider in PROVIDER_HUES) return PROVIDER_HUES[provider];
+  let hash = 0;
+  for (const char of provider) hash = (hash * 31 + char.charCodeAt(0)) % 360;
+  return hash;
+}
+
 export function modelKey(model: Pick<ModelInfo, 'provider' | 'id'>): string {
   return `${model.provider}/${model.id}`;
 }

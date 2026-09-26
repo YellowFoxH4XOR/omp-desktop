@@ -3,6 +3,7 @@
   import Composer from './Composer.svelte';
   import RequestCard from './RequestCard.svelte';
   import Transcript from './Transcript.svelte';
+  import { planOf, type PlanActions } from '../../plan';
 
   interface Props {
     view: SessionView;
@@ -14,18 +15,23 @@
     onSetEffort?: (level: string) => void | Promise<void>;
     defaultModelKey?: string | null;
     onMakeDefault?: (model: import('../../types').ModelInfo) => void | Promise<void>;
+    agentMode?: import('../../types').ThreadMode;
+    onSetMode?: (mode: import('../../types').ThreadMode) => void | Promise<void>;
+    /** A pending plan approval, answered from the composer strip. */
+    plan?: PlanActions;
   }
 
-  let { view, onSend, onAbort, onShowChanges, onRespond, onSetModel, onSetEffort, defaultModelKey = null, onMakeDefault }: Props = $props();
+  let { view, onSend, onAbort, onShowChanges, onRespond, onSetModel, onSetEffort, defaultModelKey = null, onMakeDefault, agentMode, onSetMode, plan }: Props = $props();
+  const otherRequests = $derived(plan ? view.pendingRequests.filter(request => planOf(request) === null) : view.pendingRequests);
 </script>
 
 <section class="conversation" aria-label="Conversation">
   <Transcript items={view.items} status={view.status} {onShowChanges} />
 
   <div class="dock">
-    {#if view.pendingRequests.length > 0}
+    {#if otherRequests.length > 0}
       <div class="requests" aria-live="polite">
-        {#each view.pendingRequests as request, requestIndex (requestIndex + ':' + request.id)}
+        {#each otherRequests as request, requestIndex (requestIndex + ':' + request.id)}
           <RequestCard {request} {onRespond} />
         {/each}
       </div>
@@ -46,6 +52,9 @@
       {onSetEffort}
       {defaultModelKey}
       {onMakeDefault}
+      {agentMode}
+      {onSetMode}
+      approval={plan}
     />
   </div>
 </section>

@@ -85,6 +85,46 @@ pub fn agent_dir() -> PathBuf {
     pidesk_root().join("agent")
 }
 
+/// Carries the user's real home into Pi so the agent's own shell commands
+/// (git, gh, cargo, ssh…) can use it again; see `pidesk-modes.mjs`.
+pub const REAL_HOME_ENV: &str = "PIDESK_REAL_HOME";
+
+/// `~` for every Pi πDesk starts. Extensions resolve their config, caches,
+/// and credential lookups from `$HOME` and XDG directories, so pointing both
+/// here keeps them inside ~/.pidesk instead of the user's machine-wide files.
+pub fn private_home(root: &Path) -> PathBuf {
+    root.join("home")
+}
+
+pub fn private_home_env(root: &Path) -> [(&'static str, PathBuf); 5] {
+    let home = private_home(root);
+    [
+        ("XDG_CONFIG_HOME", home.join(".config")),
+        ("XDG_DATA_HOME", home.join(".local/share")),
+        ("XDG_CACHE_HOME", home.join(".cache")),
+        ("XDG_STATE_HOME", home.join(".local/state")),
+        ("HOME", home),
+    ]
+}
+
+/// Create the private home before launching Pi (never during detection).
+/// macOS finds the login keychain through `$HOME/Library/Keychains`, so that
+/// one directory links back to the real one; nothing else is shared.
+pub fn prepare_private_home(root: &Path) -> crate::error::AppResult<()> {
+    for (_, directory) in private_home_env(root) {
+        ensure_private_directory(root, &directory)?;
+    }
+    let library = private_home(root).join("Library");
+    ensure_private_directory(root, &library)?;
+    let keychains = library.join("Keychains");
+    let real = home_dir().join("Library/Keychains");
+    if std::fs::symlink_metadata(&keychains).is_err() && real.is_dir() {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &keychains)?;
+    }
+    Ok(())
+}
+
 pub fn session_dir_for(cwd: &Path) -> PathBuf {
     agent_dir().join("sessions").join(pi_session_dir_name(cwd))
 }
@@ -129,8 +169,11 @@ pub fn configure_private_command(command: &mut tokio::process::Command, root: &P
         root.join("runtime/node_modules/.bin").display(),
         merged_path()
     );
+    for (key, value) in private_home_env(root) {
+        command.env(key, value);
+    }
     command
-        .env("HOME", home_dir())
+        .env(REAL_HOME_ENV, home_dir())
         .env("PATH", path)
         .env("PI_CODING_AGENT_DIR", root.join("agent"))
         .env("PI_CODING_AGENT_SESSION_DIR", root.join("agent/sessions"))
@@ -633,6 +676,11 @@ mod tests {
             "/tmp/private-desk/agent/sessions"
         );
         assert_eq!(env["PI_TELEMETRY"], "0");
+        // Extensions see a private home; the real one is only carried along.
+        assert_eq!(env["HOME"], "/tmp/private-desk/home");
+        assert_eq!(env["XDG_CONFIG_HOME"], "/tmp/private-desk/home/.config");
+        assert_eq!(env["XDG_CACHE_HOME"], "/tmp/private-desk/home/.cache");
+        assert_eq!(env[REAL_HOME_ENV], home_dir().to_string_lossy());
         for key in [
             "PI_SESSION_FILE",
             "OPENAI_API_KEY",

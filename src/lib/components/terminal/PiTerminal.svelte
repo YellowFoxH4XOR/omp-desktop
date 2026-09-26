@@ -17,7 +17,8 @@
     brightBlue: '#3b73f0', brightMagenta: '#8c5ce0', brightCyan: '#127f9e', brightWhite: '#1c1c1e',
   };
 
-  let { cwd }: { cwd?: string } = $props();
+  /** `run` is typed into the shell once it opens, as if the user typed it. */
+  let { cwd, run }: { cwd?: string; run?: string } = $props();
   let host: HTMLDivElement;
   let error = $state('');
 
@@ -96,6 +97,8 @@
       });
       fitTerminal();
       term.focus();
+      // The shell reads typeahead once its startup files finish.
+      if (run) writeChain = writeChain.then(() => api.terminalWrite(opened, `${run}\r`)).catch(() => undefined);
     })().catch(reason => { if (!disposed) error = `Could not open terminal: ${reason instanceof Error ? reason.message : String(reason)}`; });
     return () => {
       disposed = true;

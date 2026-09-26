@@ -71,6 +71,11 @@
       ? `Allow ${request.toolName}?`
       : request.title.split('\n')[0],
   );
+  // Other multi-line titles (such as a Plan → Auto approval) carry their body
+  // after the first line; show it instead of dropping it.
+  const titleBody = $derived(
+    request.method === 'permission' ? '' : request.title.split('\n').slice(1).join('\n').trim(),
+  );
   const kindLabel = $derived(
     request.method === 'permission' ? 'Permission needed' : request.method === 'open_url' ? 'Sign-in' : 'Input needed',
   );
@@ -92,6 +97,9 @@
     {/if}
   </div>
 
+  {#if titleBody}
+    <p class="message title-body">{titleBody}</p>
+  {/if}
   {#if request.message}
     <p class="message">{request.message}</p>
   {/if}
@@ -289,6 +297,11 @@
     color: var(--muted);
     white-space: pre-wrap;
     overflow-wrap: anywhere;
+  }
+  .title-body {
+    max-height: 240px;
+    overflow: auto;
+    color: var(--text);
   }
   .launch-note {
     margin: 6px 0 0;

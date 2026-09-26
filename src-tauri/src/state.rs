@@ -14,6 +14,7 @@ pub struct AppState {
     pub watcher: Arc<WatcherManager>,
     pub threads: Arc<ThreadManager>,
     pub terminals: Arc<TerminalManager>,
+    pub intern: Arc<crate::intern::InternManager>,
     pub app: AppHandle,
 }
 
@@ -33,6 +34,7 @@ impl AppState {
             watcher,
             threads,
             terminals: TerminalManager::new(),
+            intern: crate::intern::InternManager::new(),
             app,
         }
     }

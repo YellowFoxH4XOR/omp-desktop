@@ -484,7 +484,7 @@ export class SessionModel {
 			sessionFile: snapshot.state?.sessionFile ?? snapshot.thread?.sessionFile,
 			models: Array.isArray(snapshot.models) ? snapshot.models : [],
 			levels: Array.isArray(snapshot.levels) ? snapshot.levels : [],
-			commands: [],
+			commands: Array.isArray(snapshot.commands) ? snapshot.commands : [],
 		});
 
 		this.#sink = new ItemSink(this.view.items, this.#toolIndex);
@@ -1418,6 +1418,11 @@ export class SessionModel {
 	}
 
 	/* ---- helpers ---- */
+
+	/** Show a status line in the transcript (e.g. a slash command's result). */
+	notify(level: 'info' | 'warn' | 'error', text: string): void {
+		this.#notice(level, text);
+	}
 
 	#notice(level: string, text: string, details?: unknown): void {
 		if (!text) return;

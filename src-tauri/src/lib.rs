@@ -1,8 +1,12 @@
 mod commands;
 mod dto;
 mod error;
+mod extensions;
 mod git;
 mod harness;
+mod intern;
+mod intern_files;
+mod mcp;
 mod pi_settings;
 pub mod rpc;
 mod sessions;
@@ -38,6 +42,9 @@ pub fn run() {
             store.mark_all_threads_disconnected().map_err(|error| {
                 std::io::Error::other(format!("Could not restore thread status: {error}"))
             })?;
+            store.release_intern_workers().map_err(|error| {
+                std::io::Error::other(format!("Could not release Intern threads: {error}"))
+            })?;
             let state = state::AppState::new(app.handle().clone(), store);
             app.manage(state);
             Ok(())
@@ -50,6 +57,24 @@ pub fn run() {
             commands::add_project,
             commands::remove_project,
             commands::list_threads,
+            commands::list_recent_threads,
+            commands::set_thread_mode,
+            commands::compact_thread,
+            commands::list_thread_files,
+            commands::extensions_catalog,
+            commands::extensions_installed,
+            commands::extensions_check_updates,
+            commands::extensions_install,
+            commands::extensions_update,
+            commands::extensions_remove,
+            commands::mcp_overview,
+            commands::mcp_save_server,
+            commands::mcp_remove_server,
+            commands::mcp_set_enabled,
+            commands::mcp_set_approve_tools,
+            commands::mcp_save_raw,
+            commands::mcp_import,
+            commands::mcp_install_adapter,
             commands::create_thread,
             commands::open_thread,
             commands::stop_thread,
@@ -71,6 +96,12 @@ pub fn run() {
             commands::rename_thread,
             commands::set_thread_flags,
             commands::respond_ui,
+            commands::intern_snapshot,
+            commands::intern_prompt,
+            commands::intern_plans,
+            commands::intern_approve,
+            commands::intern_stop,
+            commands::intern_clear,
             commands::terminal_open,
             commands::terminal_write,
             commands::terminal_ack,
@@ -90,9 +121,12 @@ pub fn run() {
                     let threads = state.threads.clone();
                     state.terminals.shutdown();
                     let registry = state.registry.clone();
+                    let intern = state.intern.clone();
+                    intern.cancel_all();
                     let _ = tauri::async_runtime::block_on(async move {
                         registry.shutdown().await;
                         threads.shutdown_all().await;
+                        intern.settle().await;
                     });
                 }
             }

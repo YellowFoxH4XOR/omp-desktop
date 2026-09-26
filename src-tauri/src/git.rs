@@ -119,6 +119,134 @@ fn git_ok(cwd: &Path, args: &[&str]) -> AppResult<Vec<u8>> {
     Ok(out.stdout)
 }
 
+/// Most files an `@` mention list returns; beyond this it says it's partial.
+pub const MAX_LISTED_FILES: usize = 20_000;
+const MAX_LISTING_BYTES: usize = 4 * 1024 * 1024;
+const MAX_WALK_DEPTH: usize = 16;
+/// Folders a plain directory walk never descends into.
+const SKIPPED_DIRS: &[&str] = &[
+    ".git",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    ".next",
+    ".svelte-kit",
+    ".turbo",
+    ".cache",
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".idea",
+    ".gradle",
+    "Pods",
+    "DerivedData",
+    "coverage",
+];
+
+/// Files under `cwd` (all subfolders), relative to it, for `@` mentions. In a
+/// Git checkout this is tracked plus untracked-but-not-ignored files; outside
+/// one it is a bounded walk that skips build and dependency folders. Returns
+/// the list and whether it was cut off.
+pub fn list_files(cwd: &Path) -> AppResult<(Vec<String>, bool)> {
+    if is_repo(cwd) {
+        if let Ok(listing) = list_git_files(cwd) {
+            return Ok(listing);
+        }
+    }
+    let mut files = Vec::new();
+    let mut truncated = false;
+    walk(cwd, Path::new(""), 0, &mut files, &mut truncated);
+    files.sort();
+    Ok((files, truncated))
+}
+
+fn list_git_files(cwd: &Path) -> AppResult<(Vec<String>, bool)> {
+    use std::io::Read;
+    let mut child = git_command(cwd)
+        .args([
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--deduplicate",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| AppError::new(format!("Could not run git: {e}")))?;
+    let mut output = Vec::new();
+    child
+        .stdout
+        .take()
+        .ok_or_else(|| AppError::new("Could not read git output."))?
+        .take((MAX_LISTING_BYTES + 1) as u64)
+        .read_to_end(&mut output)?;
+    let mut truncated = output.len() > MAX_LISTING_BYTES;
+    if truncated {
+        let _ = child.kill();
+    }
+    let status = child.wait()?;
+    if !truncated && !status.success() {
+        return Err(AppError::new("git ls-files failed."));
+    }
+    output.truncate(MAX_LISTING_BYTES);
+    let mut files: Vec<String> = output
+        .split(|byte| *byte == 0)
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| std::str::from_utf8(part).ok())
+        .map(String::from)
+        .collect();
+    if truncated {
+        files.pop(); // The last entry may be cut mid-name.
+    }
+    files.sort();
+    if files.len() > MAX_LISTED_FILES {
+        files.truncate(MAX_LISTED_FILES);
+        truncated = true;
+    }
+    Ok((files, truncated))
+}
+
+fn walk(root: &Path, relative: &Path, depth: usize, files: &mut Vec<String>, truncated: &mut bool) {
+    if depth > MAX_WALK_DEPTH {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(root.join(relative)) else {
+        return;
+    };
+    let mut entries: Vec<_> = entries.flatten().collect();
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        if files.len() >= MAX_LISTED_FILES {
+            *truncated = true;
+            return;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        let path = relative.join(name);
+        if kind.is_dir() {
+            if !SKIPPED_DIRS.contains(&name) {
+                walk(root, &path, depth + 1, files, truncated);
+            }
+        } else if kind.is_file() {
+            files.push(path.to_string_lossy().into_owned());
+        }
+    }
+}
+
+/// Whether HEAD points at a commit (a new repository has none yet).
+pub fn has_commits(cwd: &Path) -> bool {
+    git(cwd, &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
 pub fn is_repo(cwd: &Path) -> bool {
     git(cwd, &["rev-parse", "--is-inside-work-tree"])
         .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "true")
@@ -1340,6 +1468,38 @@ pub fn write_if_unchanged(
     write_checked_unix(&root, &abs, expected_hash, content)
 }
 
+/// Intern consumes an approved repository capability, not a mutable `-C`
+/// pathname. Project hooks are disabled for this app-controlled operation.
+pub fn create_worktree_bound(
+    repo: &crate::intern_files::BoundDirectory,
+    dest: &Path,
+) -> AppResult<()> {
+    util::ensure_private_directory(&util::pidesk_root(), &util::pidesk_root().join("worktrees"))?;
+    let mut command = git_command(Path::new("."));
+    let _directory = repo.configure_command(&mut command)?;
+    let output = command
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "worktree",
+            "add",
+            "--detach",
+        ])
+        .arg(dest)
+        .arg("HEAD")
+        .stdin(std::process::Stdio::null())
+        .output()?;
+    if !output.status.success() {
+        return Err(AppError::new(
+            "Could not create the approved isolated worktree.",
+        ));
+    }
+    repo.verify()?;
+    Ok(())
+}
+
 /// Create an app-owned detached worktree for isolated threads.
 pub fn create_worktree(repo: &Path, dest: &Path) -> AppResult<()> {
     if let Some(parent) = dest.parent() {
@@ -1460,6 +1620,72 @@ fn remove_worktree_checked(repo: &Path, path: &Path, force: bool) -> AppResult<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_repository_has_no_commits_until_the_first_one() {
+        let root = std::env::temp_dir().join(format!("pidesk-commits-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(!has_commits(&root));
+        git(&root, &["init", "-q"]).unwrap();
+        assert!(!has_commits(&root));
+        std::fs::write(root.join("a.txt"), "a").unwrap();
+        git(&root, &["add", "a.txt"]).unwrap();
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qm",
+                "first",
+            ],
+        )
+        .unwrap();
+        assert!(has_commits(&root));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn file_listing_covers_subfolders_and_skips_dependencies() {
+        let root = std::env::temp_dir().join(format!("pidesk-files-{}", uuid::Uuid::new_v4()));
+        for path in ["src/lib", "node_modules/pkg", "docs/deep/deeper"] {
+            std::fs::create_dir_all(root.join(path)).unwrap();
+        }
+        for file in [
+            "README.md",
+            "src/main.ts",
+            "src/lib/util.ts",
+            "node_modules/pkg/index.js",
+            "docs/deep/deeper/notes.md",
+        ] {
+            std::fs::write(root.join(file), "x").unwrap();
+        }
+        let (files, truncated) = list_files(&root).unwrap();
+        assert!(!truncated);
+        assert_eq!(
+            files,
+            vec![
+                "README.md",
+                "docs/deep/deeper/notes.md",
+                "src/lib/util.ts",
+                "src/main.ts"
+            ]
+        );
+        // In a Git checkout, ignored files are left out and new files included.
+        git(&root, &["init", "-q"]).unwrap();
+        std::fs::write(root.join(".gitignore"), "docs/\nnode_modules/\n").unwrap();
+        let (files, _) = list_files(&root).unwrap();
+        assert_eq!(
+            files,
+            vec![".gitignore", "README.md", "src/lib/util.ts", "src/main.ts"]
+        );
+        // A subfolder lists only its own tree, relative to itself.
+        let (files, _) = list_files(&root.join("src")).unwrap();
+        assert_eq!(files, vec!["lib/util.ts", "main.ts"]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     use std::io::Write;
 

@@ -12,7 +12,7 @@
     "check:rust": "cd src-tauri && cargo fmt -- --check && cargo check --locked",
     "check:watch": "svelte-check --tsconfig ./tsconfig.json --watch",
     "tauri": "tauri",
-    "test": "vitest run --exclude 'tests/e2e/**'",
+    "test": "vitest run --exclude 'tests/e2e/**' && node --test src-tauri/src/intern-extension.check.mjs src-tauri/src/pidesk-modes.check.mjs",
     "test:watch": "vitest --exclude 'tests/e2e/**'",
     "test:e2e": "playwright test tests/e2e",
     "test:rust": "cd src-tauri && cargo test --locked",

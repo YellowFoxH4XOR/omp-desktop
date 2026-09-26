@@ -7,7 +7,7 @@ const snapshot: SessionSnapshot = {
     id: 'thread-1', projectId: 'project-1', harness: 'pi', sessionId: 'session-1',
     sessionFile: '/tmp/session.jsonl', cwd: '/tmp/project', title: 'Fixture',
     pinned: false, archived: false, status: 'idle',
-    createdAt: '2026-09-23T00:00:00Z', lastViewedAt: '2026-09-23T00:00:00Z'
+    createdAt: '2026-09-23T00:00:00Z', lastViewedAt: '2026-09-23T00:00:00Z', mode: 'auto'
   },
   messages: [],
   state: { sessionId: 'session-1', isStreaming: false },

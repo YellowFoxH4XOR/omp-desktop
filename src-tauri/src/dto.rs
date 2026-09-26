@@ -82,6 +82,7 @@ pub struct Thread {
     pub last_viewed_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worktree_path: Option<String>,
+    pub mode: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -221,6 +222,27 @@ pub struct SessionSnapshot {
     pub models: Vec<ModelInfo>,
     pub levels: Vec<String>,
     pub capabilities: HarnessCapabilities,
+    /// Pi's runnable `/` commands: extension commands, skills, prompt templates.
+    pub commands: Vec<CommandInfo>,
+}
+
+/// Files under a thread's working folder, for `@` mentions.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileList {
+    pub files: Vec<String>,
+    /// More files exist than were listed.
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandInfo {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// `extension`, `skill`, or `prompt`.
+    pub source: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -275,6 +297,7 @@ pub struct GitFile {
     rename_all_fields = "camelCase"
 )]
 pub enum BackendEvent {
+    InternChanged,
     Rpc {
         thread_id: String,
         frame: Value,
