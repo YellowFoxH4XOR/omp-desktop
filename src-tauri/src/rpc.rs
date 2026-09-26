@@ -1,6 +1,5 @@
 use crate::error::{AppError, AppResult};
 use crate::util;
-use base64::Engine;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -9,10 +8,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
 use tokio::sync::{oneshot, watch, Mutex};
 
-pub const MAX_FRAME_BYTES: usize = 1_048_576; // 1 MiB per OMP wire frame
-pub const MAX_PI_FRAME_BYTES: usize = 8 * 1024 * 1024; // bounded Pi monolithic history frame
-const MAX_REASSEMBLED_BYTES: usize = 67_108_864; // 64 MiB reassembled
-const CHUNK_PAYLOAD_BYTES: usize = 262_144; // 256 KiB per chunk payload
+pub const MAX_PI_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const STDERR_TAIL_BYTES: usize = 16 * 1024;
 const DEFAULT_CMD_TIMEOUT_SECS: u64 = 60;
 const STDIN_IO_TIMEOUT_SECS: u64 = 10;
@@ -143,16 +139,6 @@ struct Pending {
     tx: oneshot::Sender<Result<Value, String>>,
 }
 
-/// Reassembly state for one `rpc_chunk` stream (OMP protocol v2).
-struct ChunkState {
-    chunk_id: String,
-    count: usize,
-    byte_length: usize,
-    next_index: usize,
-    received: usize,
-    chunks: Vec<Vec<u8>>,
-}
-
 /// Shared handle to a running harness RPC process.
 /// Owns the child; a reader task forwards events and resolves responses.
 pub struct RpcClient {
@@ -187,14 +173,11 @@ struct LeaderExit {
 
 /// Callbacks the process supervisor supplies.
 pub struct RpcHandlers {
-    /// Every non-response frame, already normalized (chunked frames are
-    /// reassembled; oversized/redundant fields stripped by the caller).
+    /// Every non-response frame, after high-volume fields are bounded.
     pub on_event: Box<dyn Fn(Value) + Send + Sync>,
     /// Fired once when the process exits or the stdout stream ends.
     /// Args: exit code, stderr tail, whether the exit was expected.
     pub on_exit: Box<dyn Fn(Option<i32>, String, bool) + Send + Sync>,
-    /// OMP only: resolves when the `ready` frame arrives.
-    pub on_ready: Option<Box<dyn Fn(Value) + Send + Sync>>,
 }
 
 impl RpcClient {
@@ -205,11 +188,10 @@ impl RpcClient {
         stderr: ChildStderr,
         handlers: RpcHandlers,
     ) -> Self {
-        Self::attach_with_frame_limit(child, stdout, stderr, handlers, MAX_FRAME_BYTES)
+        Self::attach_with_frame_limit(child, stdout, stderr, handlers, MAX_PI_FRAME_BYTES)
     }
 
-    /// Attach with a harness-specific unchunked line ceiling. Pi returns one
-    /// monolithic history frame, while OMP uses chunked v2 frames.
+    /// Attach with an explicit line ceiling (used by bounded transport tests).
     pub fn attach_with_frame_limit(
         mut child: Child,
         stdout: ChildStdout,
@@ -307,7 +289,6 @@ impl RpcClient {
             let inner = inner.clone();
             let mut leader_rx = inner.leader_exit_tx.subscribe();
             tokio::spawn(async move {
-                let mut chunk_state: Option<ChunkState> = None;
                 let mut stdout = BufReader::new(stdout);
                 let mut leader_exit: Option<LeaderExit> = None;
                 let mut drain_deadline: Option<tokio::time::Instant> = None;
@@ -345,38 +326,17 @@ impl RpcClient {
                             let Ok(frame) = serde_json::from_slice::<Value>(&line) else {
                                 continue; // non-JSON noise on stdout
                             };
-                            let frame = match push_chunk(&mut chunk_state, frame) {
-                                Ok(Some(frame)) => frame,
-                                Ok(None) => continue,
-                                Err(error) => {
-                                    let tail = inner.stderr_tail.lock().await.clone();
-                                    let msg = util::redact_secrets(&if tail.is_empty() {
-                                        format!("RPC protocol error: {error}")
-                                    } else {
-                                        format!("RPC protocol error: {error}. Stderr: {tail}")
-                                    });
-                                    mark_exited(&inner, on_exit.clone(), None, msg).await;
-                                    let mut child = inner.child.lock().await;
-                                    terminate_child(&mut child, inner.process_group_id).await;
-                                    return;
-                                }
-                            };
-                            let ftype = frame.get("type").and_then(Value::as_str).unwrap_or("");
-                            match ftype {
-                                "response" => {
-                                    if let Some(late_error) = resolve_response(&inner, frame).await
-                                    {
-                                        (handlers.on_event)(late_error);
-                                    }
-                                }
-                                "ready" => {
-                                    if let Some(cb) = &handlers.on_ready {
-                                        cb(frame);
-                                    } else {
-                                        (handlers.on_event)(frame);
-                                    }
-                                }
-                                _ => (handlers.on_event)(frame),
+                            if !frame.is_object() {
+                                let msg = "RPC protocol error: frame must be an object";
+                                mark_exited(&inner, on_exit.clone(), None, msg.into()).await;
+                                let mut child = inner.child.lock().await;
+                                terminate_child(&mut child, inner.process_group_id).await;
+                                return;
+                            }
+                            if frame.get("type").and_then(Value::as_str) == Some("response") {
+                                resolve_response(&inner, frame).await;
+                            } else {
+                                (handlers.on_event)(frame);
                             }
                         }
                         Ok(None) => {
@@ -412,6 +372,11 @@ impl RpcClient {
     /// Whether the exit was initiated by us (stop/suspend/restart).
     pub fn expected_exit(&self) -> bool {
         self.inner.expected_exit.load(Ordering::SeqCst)
+    }
+
+    /// The Pi process group leader (Pi's pid), used for resource accounting.
+    pub fn process_group_id(&self) -> Option<i32> {
+        self.inner.process_group_id
     }
 
     pub fn is_exited(&self) -> bool {
@@ -595,7 +560,7 @@ fn kill_process_group(process_group_id: Option<i32>) {
     let _ = process_group_id;
 }
 
-async fn resolve_response(inner: &Arc<RpcInner>, mut frame: Value) -> Option<Value> {
+async fn resolve_response(inner: &Arc<RpcInner>, frame: Value) {
     let id = frame
         .get("id")
         .and_then(|v| {
@@ -626,20 +591,6 @@ async fn resolve_response(inner: &Arc<RpcInner>, mut frame: Value) -> Option<Val
             );
             let _ = p.tx.send(Err(err));
         }
-        return None;
-    }
-    // OMP acknowledges prompt immediately, then can send a second failure
-    // using that same id if async scheduling fails. The first response has
-    // already resolved its caller; do not discard the consequential error.
-    if frame.get("success").and_then(Value::as_bool) == Some(false) {
-        if let Some(error) = frame.get_mut("error") {
-            if let Some(text) = error.as_str() {
-                *error = Value::String(util::redact_secrets(text));
-            }
-        }
-        Some(frame)
-    } else {
-        None
     }
 }
 
@@ -662,112 +613,6 @@ async fn mark_exited(
     fail_all(inner, "Harness process ended").await;
     let expected = inner.expected_exit.load(Ordering::SeqCst);
     on_exit(code, util::redact_secrets(&stderr), expected);
-}
-
-/// Feed one parsed frame into the reassembler. Returns `Ok(Some(frame))` for a
-/// complete frame, `Ok(None)` when more chunks are needed, `Err` on violation.
-fn push_chunk(state: &mut Option<ChunkState>, frame: Value) -> Result<Option<Value>, String> {
-    let is_chunk = frame.get("type").and_then(Value::as_str) == Some("rpc_chunk");
-    if !is_chunk {
-        if state.is_some() {
-            return Err("rpc chunk sequence interrupted".into());
-        }
-        if !frame.is_object() {
-            return Err("rpc frame must be an object".into());
-        }
-        return Ok(Some(frame));
-    }
-    let chunk_id = frame
-        .get("chunkId")
-        .and_then(Value::as_str)
-        .ok_or("invalid rpc chunk metadata")?;
-    if chunk_id.is_empty() || chunk_id.len() > 128 {
-        return Err("invalid rpc chunk metadata".into());
-    }
-    let index = frame
-        .get("index")
-        .and_then(Value::as_u64)
-        .ok_or("invalid rpc chunk metadata")? as usize;
-    let count = frame
-        .get("count")
-        .and_then(Value::as_u64)
-        .ok_or("invalid rpc chunk metadata")? as usize;
-    let byte_length = frame
-        .get("byteLength")
-        .and_then(Value::as_u64)
-        .ok_or("invalid rpc chunk metadata")? as usize;
-    let max_chunks = MAX_REASSEMBLED_BYTES.div_ceil(CHUNK_PAYLOAD_BYTES);
-    if count < 2
-        || count > max_chunks
-        || index >= count
-        || byte_length < MAX_FRAME_BYTES
-        || byte_length > MAX_REASSEMBLED_BYTES
-    {
-        return Err("invalid rpc chunk metadata".into());
-    }
-    let data_b64 = frame
-        .get("data")
-        .and_then(Value::as_str)
-        .ok_or("invalid rpc chunk data")?;
-    let engine = base64::engine::general_purpose::STANDARD;
-    let data = engine
-        .decode(data_b64)
-        .map_err(|_| "invalid rpc chunk data")?;
-    if engine.encode(&data) != data_b64 {
-        return Err("invalid rpc chunk data".into());
-    }
-    if data.len() > CHUNK_PAYLOAD_BYTES {
-        return Err("rpc chunk payload exceeds the transport limit".into());
-    }
-    match state.as_mut() {
-        None => {
-            if index != 0 {
-                return Err("rpc chunk sequence must start at index 0".into());
-            }
-            *state = Some(ChunkState {
-                chunk_id: chunk_id.to_string(),
-                count,
-                byte_length,
-                next_index: 1,
-                received: data.len(),
-                chunks: vec![data],
-            });
-        }
-        Some(st) => {
-            if st.chunk_id != chunk_id
-                || st.count != count
-                || st.byte_length != byte_length
-                || st.next_index != index
-            {
-                return Err("rpc chunk sequence mismatch".into());
-            }
-            st.received += data.len();
-            st.chunks.push(data);
-            st.next_index += 1;
-            if st.received > st.byte_length {
-                return Err("rpc chunk sequence exceeds declared length".into());
-            }
-        }
-    }
-    let st = state.as_ref().expect("chunk state");
-    if st.next_index < st.count {
-        return Ok(None);
-    }
-    if st.received != st.byte_length {
-        return Err("rpc chunk sequence length mismatch".into());
-    }
-    let st = state.take().expect("chunk state");
-    let mut buf = Vec::with_capacity(st.byte_length);
-    for c in st.chunks {
-        buf.extend_from_slice(&c);
-    }
-    let text = String::from_utf8(buf).map_err(|_| "rpc chunk payload is not valid UTF-8")?;
-    let value: Value =
-        serde_json::from_str(&text).map_err(|_| "rpc chunk payload is not valid JSON")?;
-    if !value.is_object() {
-        return Err("rpc frame must be an object".into());
-    }
-    Ok(Some(value))
 }
 
 /// Project high-volume harness frames to the data the UI actually consumes:
@@ -948,124 +793,11 @@ mod tests {
         assert_eq!(text, "é");
     }
 
-    #[test]
-    fn chunk_reassembly_roundtrip() {
-        // Payload > 1 MiB so a real multi-chunk sequence is exercised.
-        let payload = json!({"type": "response", "id": "7", "success": true, "data": {"x": "y".repeat(2_000_000)}});
-        let bytes = serde_json::to_vec(&payload).unwrap();
-        let engine = base64::engine::general_purpose::STANDARD;
-        let count = bytes.len().div_ceil(CHUNK_PAYLOAD_BYTES);
-        let mut state = None;
-        let mut out = None;
-        for i in 0..count {
-            let end = ((i + 1) * CHUNK_PAYLOAD_BYTES).min(bytes.len());
-            let chunk = json!({"type": "rpc_chunk", "chunkId": "rpc-1", "index": i, "count": count, "byteLength": bytes.len(), "data": engine.encode(&bytes[i * CHUNK_PAYLOAD_BYTES..end])});
-            out = push_chunk(&mut state, chunk).unwrap();
-        }
-        assert_eq!(out.unwrap(), payload);
-    }
-
-    #[test]
-    fn chunk_sequence_violations() {
-        let engine = base64::engine::general_purpose::STANDARD;
-        let mut state = None;
-        // Must start at index 0.
-        let bad = json!({"type": "rpc_chunk", "chunkId": "c", "index": 1, "count": 2, "byteLength": MAX_FRAME_BYTES + 2, "data": engine.encode(b"ab")});
-        assert!(push_chunk(&mut state, bad).is_err());
-        // Total byteLength below one frame is not a valid chunked payload.
-        let small = json!({"type": "rpc_chunk", "chunkId": "c", "index": 0, "count": 2, "byteLength": 10, "data": engine.encode(b"ab")});
-        assert!(push_chunk(&mut state, small).is_err());
-        // Non-chunk frame mid-sequence is an interruption.
-        let first = json!({"type": "rpc_chunk", "chunkId": "c", "index": 0, "count": 2, "byteLength": MAX_FRAME_BYTES + 2, "data": engine.encode(b"ab")});
-        assert!(push_chunk(&mut state, first).unwrap().is_none());
-        assert!(push_chunk(&mut state, json!({"type": "other"})).is_err());
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn malformed_chunk_terminates_harness_and_fails_closed() {
-        use std::process::Stdio;
-        let mut child = tokio::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg("printf '%s\\n' '{\"type\":\"rpc_chunk\",\"chunkId\":\"bad\",\"index\":0,\"count\":2,\"byteLength\":4,\"data\":\"YWJjZA==\"}'; exec sleep 30")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-        let stdout = child.stdout.take().unwrap();
-        let stderr = child.stderr.take().unwrap();
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let done = std::sync::Arc::new(parking_lot::Mutex::new(Some(tx)));
-        let client = RpcClient::attach(
-            child,
-            stdout,
-            stderr,
-            RpcHandlers {
-                on_event: Box::new(|_| {}),
-                on_exit: Box::new(move |code, error, expected| {
-                    if let Some(tx) = done.lock().take() {
-                        let _ = tx.send((code, error, expected));
-                    }
-                }),
-                on_ready: None,
-            },
-        );
-        let (_, error, expected) = tokio::time::timeout(std::time::Duration::from_secs(8), rx)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(!expected);
-        assert!(error.contains("RPC protocol error"));
-        assert!(client.is_exited());
-        assert!(client.call("get_state", Map::new()).await.is_err());
-    }
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn forwards_prompt_failure_after_immediate_ack() {
-        use std::process::Stdio;
-        let mut child = tokio::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg("IFS= read -r line; printf '%s\\n' '{\"type\":\"response\",\"id\":\"1\",\"command\":\"prompt\",\"success\":true}' '{\"type\":\"response\",\"id\":\"1\",\"command\":\"prompt\",\"success\":false,\"error\":\"Model could not start\"}'")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn().unwrap();
-        let stdout = child.stdout.take().unwrap();
-        let stderr = child.stderr.take().unwrap();
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let late_error = Arc::new(parking_lot::Mutex::new(Some(tx)));
-        let client = RpcClient::attach(
-            child,
-            stdout,
-            stderr,
-            RpcHandlers {
-                on_event: Box::new(move |frame| {
-                    if frame.get("type").and_then(Value::as_str) == Some("response") {
-                        if let Some(tx) = late_error.lock().take() {
-                            let _ = tx.send(frame);
-                        }
-                    }
-                }),
-                on_exit: Box::new(|_, _, _| {}),
-                on_ready: None,
-            },
-        );
-        assert!(client.call("prompt", Map::new()).await.is_ok());
-        let late = tokio::time::timeout(std::time::Duration::from_secs(2), rx)
-            .await
-            .expect("late RPC error must be forwarded")
-            .unwrap();
-        assert_eq!(late["error"], "Model could not start");
-    }
-
     #[cfg(unix)]
     #[tokio::test]
     async fn process_group_shutdown_reaps_descendant() {
         use std::process::Stdio;
-        let pid_file = std::env::temp_dir().join(format!("omp-pgid-{}", uuid::Uuid::new_v4()));
+        let pid_file = std::env::temp_dir().join(format!("pidesk-pgid-{}", uuid::Uuid::new_v4()));
         let script = format!("sleep 30 & echo $! > {}; wait", pid_file.display());
         let mut child = tokio::process::Command::new("/bin/sh")
             .process_group(0)
@@ -1086,7 +818,6 @@ mod tests {
             RpcHandlers {
                 on_event: Box::new(|_| {}),
                 on_exit: Box::new(|_, _, _| {}),
-                on_ready: None,
             },
         );
         let descendant: i32 = loop {

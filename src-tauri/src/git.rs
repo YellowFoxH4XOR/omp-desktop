@@ -465,7 +465,7 @@ fn write_checked_unix(
     }
 
     let temp_name = format!(
-        ".omp-review-{}-{}.tmp",
+        ".pidesk-review-{}-{}.tmp",
         std::process::id(),
         uuid::Uuid::new_v4()
     );
@@ -1376,7 +1376,7 @@ mod tests {
     #[test]
     fn absent_file_creation_preserves_concurrent_destination_and_cleans_temp() {
         let root =
-            std::env::temp_dir().join(format!("omp-git-create-race-{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("pidesk-git-create-race-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let parent = std::fs::File::open(&root).unwrap();
         let temp = c_path(Path::new("pending.tmp")).unwrap();
@@ -1405,7 +1405,7 @@ mod tests {
     #[test]
     fn changed_file_git_output_is_hard_capped() {
         let root =
-            std::env::temp_dir().join(format!("omp-git-output-cap-{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("pidesk-git-output-cap-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         assert!(Command::new("git")
             .args(["-C", root.to_str().unwrap(), "init", "-q"])
@@ -1485,7 +1485,7 @@ mod tests {
     /// Path validation rejects escapes and accepts normal relative paths.
     #[test]
     fn repo_path_validation() {
-        let dir = std::env::temp_dir().join(format!("omp-git-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("pidesk-git-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         assert!(validate_repo_path_at(&dir, "src/a.rs").is_ok());
         assert!(validate_repo_path_at(&dir, "../escape.rs").is_err());
@@ -1496,7 +1496,8 @@ mod tests {
     #[test]
     fn final_symlink_entry_is_safe_but_intermediate_escape_is_not() {
         use std::os::unix::fs::symlink;
-        let dir = std::env::temp_dir().join(format!("omp-git-link-guard-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("pidesk-git-link-guard-{}", uuid::Uuid::new_v4()));
         let outside = dir.with_extension("outside");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(&outside, "private\n").unwrap();
@@ -1519,7 +1520,7 @@ mod tests {
     /// untracked files. The review panel must count their current lines.
     #[test]
     fn unborn_head_lists_staged_and_untracked() {
-        let dir = std::env::temp_dir().join(format!("omp-git-unborn-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("pidesk-git-unborn-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         assert!(Command::new("git")
             .arg("-C")
@@ -1565,7 +1566,7 @@ mod tests {
 
     #[test]
     fn manual_edit_and_reverts_follow_current_git_state() {
-        let dir = std::env::temp_dir().join(format!("omp-git-review-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("pidesk-git-review-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("example.txt");
         assert!(Command::new("git")
@@ -1634,7 +1635,8 @@ mod tests {
 
     #[test]
     fn isolated_worktree_does_not_mix_active_checkout_edits() {
-        let root = std::env::temp_dir().join(format!("omp-git-isolation-{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("pidesk-git-isolation-{}", uuid::Uuid::new_v4()));
         let source = root.join("source");
         let isolated = root.join("isolated");
         std::fs::create_dir_all(&source).unwrap();
@@ -1697,7 +1699,7 @@ mod tests {
     #[test]
     fn changed_symlink_cannot_revert_a_hunk_through_its_target() {
         use std::os::unix::fs::symlink;
-        let dir = std::env::temp_dir().join(format!("omp-git-link-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("pidesk-git-link-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         assert!(Command::new("git")
             .arg("-C")
@@ -1748,7 +1750,7 @@ mod tests {
 
     #[test]
     fn subdirectory_uses_repo_root_for_file_revert_and_hunks() {
-        let root = std::env::temp_dir().join(format!("omp-git-subdir-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("pidesk-git-subdir-{}", uuid::Uuid::new_v4()));
         let subdir = root.join("workspace");
         std::fs::create_dir_all(&subdir).unwrap();
         assert!(Command::new("git")
@@ -1793,7 +1795,7 @@ mod tests {
 
     #[test]
     fn staged_rename_revert_restores_source() {
-        let root = std::env::temp_dir().join(format!("omp-git-rename-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("pidesk-git-rename-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         assert!(Command::new("git")
             .args(["-C", root.to_str().unwrap(), "init", "-q"])
@@ -1838,7 +1840,7 @@ mod tests {
 
     #[test]
     fn oversized_file_is_hashed_without_loading_payload() {
-        let root = std::env::temp_dir().join(format!("omp-git-large-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("pidesk-git-large-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         assert!(Command::new("git")
             .args(["-C", root.to_str().unwrap(), "init", "-q"])
@@ -1889,7 +1891,7 @@ mod tests {
 
     #[test]
     fn stress_status_and_large_file_review_stay_bounded() {
-        let root = std::env::temp_dir().join(format!("omp-git-stress-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("pidesk-git-stress-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         assert!(Command::new("git")
             .args(["-C", root.to_str().unwrap(), "init", "-q"])

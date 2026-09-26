@@ -2,9 +2,7 @@
   import { Wrench } from '@lucide/svelte';
   import ToolShell from './ToolShell.svelte';
   import {
-    argPath,
     formatDuration,
-    isXdTarget,
     prettyJson,
     preview,
     resultDuration,
@@ -20,8 +18,6 @@
 
   const output = $derived(resultText(item.result ?? item.partial));
   const duration = $derived(resultDuration(item.result));
-  const xd = $derived(isXdTarget(item.args));
-  const target = $derived(argPath(item.args));
   const meta = $derived(duration !== undefined ? formatDuration(duration) : undefined);
   const truncated = $derived(output.length > 3000);
   const shownOutput = $derived(truncated ? `${output.slice(0, 3000)}\n…` : output);
@@ -34,13 +30,9 @@
     <span class="line">
       {item.toolName}
       {#if item.intent}<span class="t">— {preview(item.intent, 60)}</span>{/if}
-      {#if xd && target}<span class="t">— {target}</span>{/if}
     </span>
   {/snippet}
   {#snippet detail()}
-    {#if xd}
-      <div class="row"><span class="k">action</span><span class="v">Tool device call via <code>{target}</code></span></div>
-    {/if}
     {#if item.intent}
       <div class="row"><span class="k">intent</span><span class="v muted">{item.intent}</span></div>
     {/if}

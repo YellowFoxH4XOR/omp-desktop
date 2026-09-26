@@ -24,7 +24,7 @@
   import DiffEditor from './DiffEditor.svelte';
   import { detectEol, errorMessage, joinPath, statusMeta, type EolKind } from './util';
 
-  const MODE_KEY = 'omp.changes.diffMode';
+  const MODE_KEY = 'pidesk.changes.diffMode';
   const NARROW_PX = 460;
 
   let {
@@ -347,6 +347,7 @@
 
   onMount(() => {
     try {
+      // Read the old preference once; subsequent changes use πDesk's key.
       const saved = localStorage.getItem(MODE_KEY);
       if (saved === 'unified' || saved === 'split') mode = saved;
     } catch {

@@ -1,4 +1,4 @@
-export type HarnessKind = 'omp' | 'pi';
+export type HarnessKind = 'pi';
 export type ThreadStatus = 'active' | 'waiting' | 'idle' | 'completed' | 'failed' | 'disconnected';
 export type ToolStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
 
@@ -8,9 +8,14 @@ export interface HarnessInstallation {
   version: string;
   source: string;
 }
+export type InstallStage = 'preparing' | 'installing' | 'verifying';
+export type InstallStatus = 'idle' | InstallStage | 'complete' | 'failed';
 export interface HarnessInstallCommand {
   kind: HarnessKind;
   command: string;
+  installPath: string;
+  agentDir: string;
+  loginCommand: string;
 }
 
 export interface Project {
@@ -43,12 +48,6 @@ export interface ModelInfo {
   name: string;
   contextWindow?: number;
   reasoning?: boolean;
-}
-export interface LoginProvider {
-  id: string;
-  name: string;
-  available: boolean;
-  authenticated: boolean;
 }
 export interface ContextUsage { tokens: number | null; contextWindow: number; percent: number | null }
 export interface Usage {
@@ -88,33 +87,12 @@ export interface SessionSnapshot {
   models: ModelInfo[];
   levels: string[];
   capabilities: HarnessCapabilities;
-  agents: AgentInfo[];
 }
 export interface ToolResult { content?: RpcContent[]; details?: unknown; isError?: boolean }
 export type ConversationItem =
   | { id: string; kind: 'user' | 'text' | 'thinking'; text: string; streaming?: boolean; timestamp?: number }
   | { id: string; kind: 'tool'; toolCallId: string; toolName: string; args: Record<string, unknown>; intent?: string; status: ToolStatus; result?: ToolResult; partial?: ToolResult; timestamp?: number }
   | { id: string; kind: 'custom' | 'notice' | 'advisor'; text: string; customType?: string; details?: unknown; level?: string; timestamp?: number };
-export interface AgentInfo {
-  id: string;
-  parentId?: string;
-  parentToolCallId?: string;
-  name: string;
-  role?: string;
-  task?: string;
-  status: 'pending' | 'running' | 'waiting' | 'completed' | 'failed' | 'aborted' | 'parked';
-  model?: string;
-  effort?: string;
-  activity?: string;
-  tokens?: number;
-  contextTokens?: number;
-  contextWindow?: number;
-  cost?: number;
-  durationMs?: number;
-  toolCount?: number;
-  sessionFile?: string;
-  worktreePath?: string;
-}
 export interface UiRequest {
   id: string;
   method: 'permission' | 'select' | 'confirm' | 'input' | 'editor' | 'open_url';
@@ -135,7 +113,6 @@ export interface UiResponse { value?: string; confirmed?: boolean; cancelled?: b
 export interface SessionView {
   threadId: string;
   items: ConversationItem[];
-  agents: AgentInfo[];
   pendingRequests: UiRequest[];
   status: ThreadStatus;
   capabilities: HarnessCapabilities;
@@ -175,5 +152,20 @@ export type BackendEvent =
   | { type: 'rpc'; threadId: string; frame: Record<string, unknown> }
   | { type: 'exited'; threadId: string; code?: number; stderr: string; expected: boolean }
   | { type: 'git_changed'; threadId: string }
+  | { type: 'install_stage'; kind: HarnessKind; stage: InstallStage }
   | { type: 'install_progress'; kind: HarnessKind; line: string }
   | { type: 'install_finished'; kind: HarnessKind; success: boolean; error?: string };
+export interface ThreadRuntime {
+  threadId: string;
+  projectId: string;
+  title: string;
+  pid?: number | null;
+  memoryBytes?: number | null;
+  processCount: number;
+  busy: boolean;
+  idleSeconds: number;
+}
+export interface RuntimeStats {
+  appBytes?: number | null;
+  threads: ThreadRuntime[];
+}

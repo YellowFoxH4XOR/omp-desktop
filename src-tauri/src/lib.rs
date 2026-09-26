@@ -24,11 +24,11 @@ pub fn run() {
             let data_dir = app
                 .path()
                 .app_data_dir()
-                .unwrap_or_else(|_| util::home_dir().join(".omp-desktop"));
+                .unwrap_or_else(|_| util::home_dir().join(".pidesk"));
             let database = store::db_path(&data_dir);
             let store = Arc::new(store::Store::open(&database).map_err(|error| {
                 std::io::Error::other(format!(
-                    "Could not open OMP Desktop metadata at {}: {error}",
+                    "Could not open πDesk metadata at {}: {error}",
                     database.display()
                 ))
             })?);
@@ -42,7 +42,6 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::detect_harnesses,
-            commands::set_executable_override,
             commands::install_harness,
             commands::harness_install_commands,
             commands::list_projects,
@@ -52,6 +51,7 @@ pub fn run() {
             commands::create_thread,
             commands::open_thread,
             commands::stop_thread,
+            commands::get_runtime_stats,
             commands::restart_thread,
             commands::send_prompt,
             commands::abort_thread,
@@ -63,10 +63,6 @@ pub fn run() {
             commands::rename_thread,
             commands::set_thread_flags,
             commands::respond_ui,
-            commands::get_subagent_messages,
-            commands::get_subagents,
-            commands::get_login_providers,
-            commands::login_provider,
             commands::git_status,
             commands::git_file,
             commands::git_revert_file,
@@ -79,7 +75,9 @@ pub fn run() {
             if let tauri::RunEvent::Exit = event {
                 if let Some(state) = app.try_state::<state::AppState>() {
                     let threads = state.threads.clone();
+                    let registry = state.registry.clone();
                     let _ = tauri::async_runtime::block_on(async move {
+                        registry.shutdown().await;
                         threads.shutdown_all().await;
                     });
                 }

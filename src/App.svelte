@@ -3,12 +3,14 @@
   import { onMount, tick } from 'svelte';
   import { open } from '@tauri-apps/plugin-dialog';
   import { VList } from 'virtua/svelte';
-  import { Plus, Settings2, GitCompareArrows, Network, Search, ChevronDown, ChevronRight, X, Pin, Archive, MoreHorizontal, RefreshCw, Terminal, FolderOpen, FolderPlus, Folder, AlertTriangle, LoaderCircle, Check, SquarePen, GitFork, Trash2, Sparkles, MessageSquare, Monitor, Sun, Moon } from '@lucide/svelte';
+  import { Plus, Settings2, GitCompareArrows, Search, ChevronRight, X, Pin, Archive, MoreHorizontal, RefreshCw, Terminal, FolderOpen, FolderPlus, Folder, AlertTriangle, LoaderCircle, Check, SquarePen, GitFork, Trash2, MessageSquare, Monitor, Sun, Moon } from '@lucide/svelte';
   import { api, onBackendEvent } from '$lib/api';
   import { SessionModel } from '$lib/session.svelte';
   import Conversation from '$lib/components/conversation/Conversation.svelte';
-  import type { BackendEvent, HarnessInstallation, HarnessInstallCommand, HarnessKind, LoginProvider, Project, Thread, ThreadStatus, UiResponse } from '$lib/types';
-  type AgentsPanelComponent = (typeof import('$lib/components/agents/AgentsPanel.svelte'))['default'];
+  import PiSetup from '$lib/components/setup/PiSetup.svelte';
+  import PiSignIn from '$lib/components/setup/PiSignIn.svelte';
+  import RuntimeMonitor from '$lib/components/runtime/RuntimeMonitor.svelte';
+  import type { BackendEvent, HarnessInstallation, HarnessInstallCommand, InstallStatus, Project, Thread, ThreadStatus, UiResponse } from '$lib/types';
   type ChangesPanelComponent = (typeof import('$lib/components/diff/ChangesPanel.svelte'))['default'];
   type RpcFrame = Record<string, unknown>;
   interface OpenedSession {
@@ -48,8 +50,7 @@
   let loadingThread = $state(false);
   let pendingAction = $state(false);
   let pendingActionCount = 0;
-  let rightPanel = $state<'changes' | 'agents' | null>(null);
-  let AgentsPanel = $state<AgentsPanelComponent | null>(null);
+  let rightPanel = $state<'changes' | null>(null);
   let ChangesPanel = $state<ChangesPanelComponent | null>(null);
   let diffPath = $state<string | undefined>(undefined);
   let sidebarWidth = $state(256);
@@ -60,15 +61,18 @@
   let switchIndex = $state(0);
   let showArchived = $state(false);
   let theme = $state<'system' | 'dark' | 'light'>('system');
-  let installInProgress = $state<HarnessKind | null>(null);
+  let installInProgress = $state(false);
+  let installStatus = $state<InstallStatus>('idle');
   let installLog = $state<string[]>([]);
-  let installCommands = $state<HarnessInstallCommand[] | null>(null);
-  let installCommandsRequested = false;
-  let loginProviders = $state<LoginProvider[]>([]);
-  let loggingIn = $state<string | null>(null);
-  let newHarness = $state<HarnessKind>('omp');
+  let installError = $state('');
+  let installPlan = $state<HarnessInstallCommand | null>(null);
+  let installPlanError = $state('');
+  let installerVisible = $state(false);
+  let checkingRuntime = $state(false);
+  let eventsReady = $state(false);
   let renaming = $state<string | null>(null);
   let projectMenu = $state<string | null>(null);
+  let collapsedProjects = $state<Set<string>>(new Set());
   let renameText = $state('');
   let sidebarResizing = false;
   let panelResizing = false;
@@ -83,15 +87,14 @@
   let projectSelectionToken = 0;
   let threadSelectionToken = 0;
   const currentView = $derived(activeSession?.view);
-  const availableKinds = $derived(new Set(harnesses.map(h => h.kind)));
-  const onboarding = $derived(!detecting && harnesses.length === 0);
+  const installation = $derived(harnesses[0]);
+  const onboarding = $derived(!detecting && !installation);
   const switchEntries = $derived(projects.flatMap(project => [
     { kind: 'project' as const, label: project.displayName, subtitle: project.path, project },
     ...(threadsByProject[project.id] ?? []).filter(t => !t.archived).map(thread => ({ kind: 'thread' as const, label: thread.title || 'New thread', subtitle: project.displayName, project, thread }))
   ]).filter(entry => `${entry.label} ${entry.subtitle}`.toLowerCase().includes(switchQuery.toLowerCase())).slice(0, 40));
   const visibleThread = $derived(activeThread && activeProject && activeThread.projectId === activeProject.id ? activeThread : null);
-  const ompInstallCommand = $derived(installCommands?.find(command => command.kind === 'omp')?.command ?? 'bun install -g @oh-my-pi/pi-coding-agent');
-  const piInstallCommand = $derived(installCommands?.find(command => command.kind === 'pi')?.command ?? 'npm install -g --ignore-scripts @earendil-works/pi-coding-agent');
+  const installReady = $derived(eventsReady && installPlan !== null);
 
   function utf8Bytes(value: string): number {
     return utf8Encoder.encode(value).byteLength;
@@ -196,8 +199,7 @@
   }
   function isSessionInactive(model: SessionModel): boolean {
     const view = model.view;
-    return view.status !== 'active' && view.status !== 'waiting' &&
-      !view.agents.some(agent => agent.status === 'running' || agent.status === 'waiting');
+    return view.status !== 'active' && view.status !== 'waiting';
   }
   function removeCachedSession(threadId: string, expected?: SessionModel) {
     const model = liveSessions.get(threadId);
@@ -252,18 +254,11 @@
     if (kind === 'response' && frame.success === false && model?.view.status === 'failed') {
       updateThreadStatus(threadId, 'failed');
     }
-    if (kind === 'agent_settled' || (kind === 'agent_end' && frame.isTerminal !== false && frame.willRetry !== true)) {
-      const harness = kind === 'agent_end' ? (activeThread?.id === threadId ? activeThread.harness : Object.values(threadsByProject).flat().find(thread => thread.id === threadId)?.harness) : undefined;
-      if (kind !== 'agent_end' || harness !== 'pi') {
-        const runningChild = model?.view.agents.some(agent => agent.status === 'running');
-        updateThreadStatus(threadId, model?.view.status === 'failed' ? 'failed' : runningChild ? 'active' : 'completed');
-      }
+    // The backend settles Pi only after checking queued and extension work.
+    if (kind === 'agent_settled') {
+      updateThreadStatus(threadId, model?.view.status === 'failed' ? 'failed' : 'completed');
     }
     if (kind === 'extension_ui_request' && ['select', 'confirm', 'input', 'editor'].includes(String(frame.method))) updateThreadStatus(threadId, 'waiting');
-    if (kind === 'subagent_lifecycle' || kind === 'subagent_progress') {
-      const runningChild = model?.view.agents.some(agent => agent.status === 'running');
-      if (runningChild) updateThreadStatus(threadId, 'active');
-    }
     if (model && activeThread?.id !== threadId && isSessionInactive(model)) scheduleIdleStop(threadId);
     enforceSessionLimit();
   }
@@ -353,17 +348,23 @@
     } else if (event.type === 'exited') {
       if (!event.expected) {
         recordCrashDetails(event.threadId, event.stderr);
-        liveSessions.get(event.threadId)?.setError(`${activeThread?.id === event.threadId ? activeThread.harness.toUpperCase() : 'Harness'} stopped unexpectedly. Your visible conversation is preserved.`);
+        liveSessions.get(event.threadId)?.setError('Pi stopped unexpectedly. Your visible conversation is preserved.');
         updateThreadStatus(event.threadId, 'disconnected');
       } else {
         updateThreadStatus(event.threadId, 'idle');
         if (activeThread?.id !== event.threadId) removeCachedSession(event.threadId);
       }
-    } else if (event.type === 'install_progress' && installInProgress === event.kind) {
-      installLog = [...installLog.slice(-199), event.line];
-    } else if (event.type === 'install_finished' && installInProgress === event.kind) {
-      if (!event.success && event.error) installLog = [...installLog, event.error];
+    } else if (event.type === 'install_stage' && installInProgress) {
+      installStatus = event.stage;
+    } else if (event.type === 'install_progress' && installInProgress) {
+      appendInstallLog(event.line);
+    } else if (event.type === 'install_finished' && installInProgress && !event.success) {
+      installError = event.error || 'Pi could not be installed. Review the output and try again.';
+      installStatus = 'failed';
     }
+  }
+  function appendInstallLog(line: string) {
+    installLog = [...installLog, ...truncateUtf8(line, 4096).split(/\r?\n/)].slice(-200);
   }
   onMount(() => {
     sidebarWidth = Number(localStorage.getItem('sidebarWidth')) || 256;
@@ -373,15 +374,17 @@
     applyTheme();
     let unlisten: (() => void) | undefined;
     let disposed = false;
-    void onBackendEvent(handleBackendEvent).then(fn => { if (disposed) fn(); else unlisten = fn; }).catch(err => { if (!disposed) startupError = errorText(err); });
-    void Promise.allSettled([refreshHarnesses(), refreshProjects()]).then(() => { detecting = false; });
+    void onBackendEvent(handleBackendEvent).then(fn => {
+      if (disposed) fn();
+      else { unlisten = fn; eventsReady = true; }
+    }).catch(err => { if (!disposed) startupError = `Could not connect live events. Relaunch πDesk: ${errorText(err)}`; });
+    void Promise.allSettled([checkPrivateRuntime(), refreshProjects()]).then(() => { detecting = false; });
     const onKey = (event: KeyboardEvent) => {
       if (!event.metaKey && event.key !== 'Escape') return;
       const key = event.key.toLowerCase();
       if (event.metaKey && key === 'k') { event.preventDefault(); void openSwitcher(); }
       else if (event.metaKey && key === 'n') { event.preventDefault(); if (activeProject) void createThread(activeProject); }
       else if (event.metaKey && event.shiftKey && key === 'd') { event.preventDefault(); togglePanel('changes'); }
-      else if (event.metaKey && event.shiftKey && key === 'a') { event.preventDefault(); togglePanel('agents'); }
       else if (event.metaKey && key === ',') { event.preventDefault(); void openSettings(); }
       else if (event.key === 'Escape') {
         if (errorDetailsOpen) errorDetailsOpen = false;
@@ -418,18 +421,23 @@
     return () => { disposed = true; unlisten?.(); window.removeEventListener('keydown', onKey); window.removeEventListener('mousemove', move); window.removeEventListener('mouseup', up); window.removeEventListener('error', onWindowError); window.removeEventListener('unhandledrejection', onWindowRejection); for (const timer of idleStopTimers.values()) clearTimeout(timer); idleStopTimers.clear(); };
   });
   function applyTheme() { document.documentElement.dataset.theme = theme === 'system' ? '' : theme; localStorage.setItem('theme', theme); }
-  async function refreshInstallCommands() {
-    if (installCommandsRequested) return;
-    installCommandsRequested = true;
-    try { installCommands = await api.harnessInstallCommands(); }
-    catch { installCommands = null; }
-  }
   async function refreshHarnesses() {
+    // Older/system runtime responses must not bypass the private setup screen.
+    harnesses = (await api.detectHarnesses()).filter(candidate => candidate.kind === 'pi' && candidate.source === 'managed');
+  }
+  async function checkPrivateRuntime() {
+    if (checkingRuntime || installInProgress) return;
+    checkingRuntime = true;
+    installPlanError = '';
     try {
-      harnesses = await api.detectHarnesses();
-      if (harnesses.length === 1) newHarness = harnesses[0].kind;
-    } catch (error) { startupError = `Could not detect harnesses: ${errorText(error)}`; }
-    if (harnesses.length === 0) void refreshInstallCommands();
+      const plans = await api.harnessInstallCommands();
+      installPlan = plans.find(plan => plan.kind === 'pi' && plan.installPath && plan.agentDir && plan.loginCommand && plan.command) ?? null;
+      if (!installPlan) throw new Error('Private installer information is unavailable. Relaunch or update πDesk.');
+      await refreshHarnesses();
+      if (installation && installerVisible) { installStatus = 'complete'; installError = ''; }
+    } catch (error) {
+      installPlanError = errorText(error);
+    } finally { checkingRuntime = false; }
   }
   async function refreshProjects() {
     try {
@@ -450,17 +458,62 @@
       return null;
     }
   }
+  function expandProject(projectId: string) {
+    if (!collapsedProjects.has(projectId)) return;
+    const next = new Set(collapsedProjects);
+    next.delete(projectId);
+    collapsedProjects = next;
+  }
+  /** Clicking the open project collapses it; any other project is selected and expanded. */
+  function toggleProject(project: Project) {
+    if (activeProject?.id !== project.id) {
+      void selectProject(project);
+      return;
+    }
+    const next = new Set(collapsedProjects);
+    if (next.has(project.id)) next.delete(project.id);
+    else next.add(project.id);
+    collapsedProjects = next;
+  }
+  async function stopThreadsFromMonitor(threadIds: string[]) {
+    const failures: string[] = [];
+    await Promise.all(threadIds.map(async threadId => {
+      cancelIdleStop(threadId);
+      const inflight = stopping.get(threadId);
+      if (inflight) { await inflight; return; }
+      const job = api.stopThread(threadId).then(() => {
+        if (activeThread?.id !== threadId) removeCachedSession(threadId);
+      });
+      const tracked: Promise<void> = job.catch(() => undefined).finally(() => {
+        if (stopping.get(threadId) === tracked) stopping.delete(threadId);
+      });
+      stopping.set(threadId, tracked);
+      try { await job; } catch (error) { failures.push(errorText(error)); }
+    }));
+    if (failures.length) startupError = `Could not stop ${failures.length === 1 ? 'a thread' : `${failures.length} threads`}: ${failures[0]}`;
+  }
+  async function openThreadById(threadId: string, projectId: string) {
+    const project = projects.find(candidate => candidate.id === projectId);
+    if (!project) return;
+    let thread = threadsByProject[projectId]?.find(candidate => candidate.id === threadId);
+    if (!thread) thread = (await refreshThreads(projectId))?.find(candidate => candidate.id === threadId);
+    if (!thread) return;
+    if (activeProject?.id !== projectId) {
+      const selectionToken = beginProjectSelection(project);
+      void refreshThreads(projectId, selectionToken);
+    }
+    await selectThread(thread);
+  }
   function beginProjectSelection(project: Project): number {
+    expandProject(project.id);
     leaveCurrentThread();
     const selectionToken = ++projectSelectionToken;
     ++threadSelectionToken;
     activeProject = project;
     activeThread = null;
     errorDetailsOpen = false;
-    loginProviders = [];
     renaming = null;
     renameText = '';
-    newHarness = project.preferredHarness;
     selectedThreadId = null;
     activeSession = null;
     loadingThread = false;
@@ -506,7 +559,7 @@
     if (!path) return;
     beginPendingAction();
     try {
-      const project = await api.addProject(path, availableKinds.has(newHarness) ? newHarness : harnesses[0]?.kind ?? 'omp');
+      const project = await api.addProject(path, 'pi');
       const existing = projects.find(candidate => candidate.path === project.path);
       if (!existing) projects = [...projects, project];
       if (projectToken === projectSelectionToken && threadToken === threadSelectionToken && !invalidatedProjects.has(project.id)) await selectProject(existing ?? project);
@@ -515,7 +568,7 @@
     } finally { endPendingAction(); }
   }
   async function removeProject(project: Project) {
-    if (!window.confirm(`Remove “${project.displayName}” from OMP Desktop?\n\nRepository files, Git history, and harness sessions will not be deleted.`)) return;
+    if (!window.confirm(`Remove “${project.displayName}” from πDesk?\n\nRepository files, Git history, and harness sessions will not be deleted.`)) return;
     try {
       await api.removeProject(project.id);
       invalidatedProjects.add(project.id);
@@ -539,14 +592,14 @@
     } catch (error) { startupError = `Could not remove project: ${errorText(error)}`; }
   }
   async function createThread(project: Project) {
+    if (!installation || installInProgress) return;
     const projectToken = projectSelectionToken;
     const threadToken = threadSelectionToken;
     beginPendingAction();
     try {
       const activePeer = (threadsByProject[project.id] ?? []).some(thread => thread.status === 'active' || thread.status === 'waiting');
       const isolated = activePeer && project.isGit;
-      const harness = availableKinds.has(newHarness) ? newHarness : harnesses[0]?.kind ?? project.preferredHarness;
-      const thread = await api.createThread(project.id, harness, isolated);
+      const thread = await api.createThread(project.id, 'pi', isolated);
       if (!invalidatedProjects.has(project.id)) {
         threadsByProject[project.id] = [thread, ...(threadsByProject[project.id] ?? []).filter(candidate => candidate.id !== thread.id)];
       }
@@ -556,6 +609,8 @@
     } finally { endPendingAction(); }
   }
   async function selectThread(thread: Thread) {
+    if (!installation || installInProgress) return;
+    expandProject(thread.projectId);
     const selectionToken = ++threadSelectionToken;
     const inflightStop = stopping.get(thread.id);
     if (inflightStop) {
@@ -593,17 +648,13 @@
       if (selectionToken === threadSelectionToken) loadingThread = false;
     }
   }
-  async function openPanel(panel: 'changes' | 'agents') {
-    if (panel === 'agents' && !activeSession?.view.capabilities.agents) return;
+  async function openPanel(panel: 'changes') {
     const threadId = activeThread?.id;
     const projectId = activeThread?.projectId;
     const selectionToken = threadSelectionToken;
     rightPanel = panel;
     try {
-      if (panel === 'agents' && !AgentsPanel) {
-        const component = (await import('$lib/components/agents/AgentsPanel.svelte')).default;
-        if (activeThread?.id === threadId && activeProject?.id === projectId && rightPanel === panel && threadSelectionToken === selectionToken && !invalidatedProjects.has(projectId ?? '')) AgentsPanel = component;
-      } else if (panel === 'changes' && !ChangesPanel) {
+      if (!ChangesPanel) {
         const component = (await import('$lib/components/diff/ChangesPanel.svelte')).default;
         if (activeThread?.id === threadId && activeProject?.id === projectId && rightPanel === panel && threadSelectionToken === selectionToken && !invalidatedProjects.has(projectId ?? '')) ChangesPanel = component;
       }
@@ -614,7 +665,7 @@
       }
     }
   }
-  function togglePanel(panel: 'changes' | 'agents') {
+  function togglePanel(panel: 'changes') {
     if (rightPanel === panel) rightPanel = null;
     else void openPanel(panel);
   }
@@ -755,53 +806,28 @@
       if (activeThread?.id === targetThread.id && activeSession === targetSession && threadSelectionToken === selectionToken && !invalidatedProjects.has(projectId)) startupError = `Could not change effort: ${errorText(error)}`;
     }
   }
-  async function install(kind: HarnessKind) {
-    if (installInProgress !== null) return;
-    installInProgress = kind; installLog = [];
-    try { await api.installHarness(kind); await refreshHarnesses(); }
-    catch (error) { installLog = [...installLog, errorText(error)]; }
-    finally { installInProgress = null; }
+  async function install() {
+    if (installInProgress || !installReady || checkingRuntime) return;
+    installInProgress = true;
+    installerVisible = true;
+    installStatus = 'preparing';
+    installLog = [];
+    installError = '';
+    try {
+      await api.installHarness('pi');
+      if (installError) throw new Error(installError);
+      await refreshHarnesses();
+      if (!installation) throw new Error('Installation finished, but the private Pi could not be verified. Review the output and retry.');
+      installStatus = 'complete';
+      installError = '';
+    } catch (error) {
+      installError = errorText(error);
+      appendInstallLog(installError);
+      installStatus = 'failed';
+    } finally { installInProgress = false; }
   }
-  async function locate(kind: HarnessKind) {
-    const result = await open({ multiple: false, directory: false, title: `Locate ${kind.toUpperCase()} executable` });
-    const path = Array.isArray(result) ? result[0] : result;
-    if (!path) return;
-    try { await api.setExecutableOverride(kind, path); await refreshHarnesses(); }
-    catch (error) { startupError = `Invalid executable: ${errorText(error)}`; }
-  }
-  async function openSettings() {
+  function openSettings() {
     settingsOpen = true;
-    loginProviders = [];
-    const targetThread = activeThread;
-    if (targetThread?.harness !== 'omp') return;
-    const projectId = targetThread.projectId;
-    const selectionToken = threadSelectionToken;
-    try {
-      const providers = await api.getLoginProviders(targetThread.id);
-      if (activeThread?.id === targetThread.id && threadSelectionToken === selectionToken && !invalidatedProjects.has(projectId) && !invalidatedThreads.has(targetThread.id)) loginProviders = providers;
-    } catch (error) {
-      if (activeThread?.id === targetThread.id && threadSelectionToken === selectionToken && !invalidatedProjects.has(projectId)) startupError = `Could not load providers: ${errorText(error)}`;
-    }
-  }
-  async function login(providerId: string) {
-    const targetThread = activeThread;
-    if (!targetThread) return;
-    const projectId = targetThread.projectId;
-    const selectionToken = threadSelectionToken;
-    loggingIn = providerId;
-    settingsOpen = false;
-    try {
-      await api.loginProvider(targetThread.id, providerId);
-      const providers = await api.getLoginProviders(targetThread.id);
-      if (activeThread?.id === targetThread.id && threadSelectionToken === selectionToken && !invalidatedProjects.has(projectId) && !invalidatedThreads.has(targetThread.id)) {
-        loginProviders = providers;
-        settingsOpen = true;
-      }
-    } catch (error) {
-      if (activeThread?.id === targetThread.id && threadSelectionToken === selectionToken && !invalidatedProjects.has(projectId)) startupError = `Sign-in failed: ${errorText(error)}`;
-    } finally {
-      if (loggingIn === providerId) loggingIn = null;
-    }
   }
   async function openSwitcher() {
     switchQuery = ''; switchIndex = 0; switcherOpen = true;
@@ -846,10 +872,11 @@
     <div class="project-list">
       <div class="section-label"><span>Projects</span><button class="mini-button" title="Add project" aria-label="Add project" onclick={() => void addProject()}><Plus size={14} strokeWidth={2} /></button></div>
       {#each projects as project (project.id)}
-        {@const open = activeProject?.id === project.id}
+        {@const selected = activeProject?.id === project.id}
+        {@const open = selected && !collapsedProjects.has(project.id)}
         <section class="project-section">
-          <div class="project-row" class:active={open}>
-            <button class="project-toggle" onclick={() => void selectProject(project)} aria-label={`Open ${project.displayName}`} aria-expanded={open}>
+          <div class="project-row" class:active={selected}>
+            <button class="project-toggle" onclick={() => toggleProject(project)} aria-label={`Open ${project.displayName}`} aria-expanded={open} title={selected ? (open ? 'Collapse project' : 'Expand project') : `Open ${project.displayName}`}>
               <ChevronRight size={12} strokeWidth={2.2} class={open ? 'chev open' : 'chev'} />
               <span class="project-glyph" aria-hidden="true">{project.displayName[0]?.toUpperCase()}</span>
               <span class="project-name">{project.displayName}</span>
@@ -867,9 +894,6 @@
             <div class="thread-list">
               <div class="new-thread-row">
                 <button class="new-thread" disabled={pendingAction || !harnesses.length} onclick={() => void createThread(project)}><Plus size={13} strokeWidth={2.2} /> New thread</button>
-                {#if harnesses.length > 1}
-                  <label class="harness-picker" title="Harness for new threads"><select aria-label="Harness for new threads" bind:value={newHarness}><option value="omp">OMP</option><option value="pi">Pi</option></select><ChevronDown size={11} strokeWidth={2} /></label>
-                {/if}
               </div>
               {#if visible.length}
                 <VList data={visible} getKey={thread => thread.id} style={`height: min(58vh, ${visible.length * 30 + (renaming ? 96 : 0)}px);`}>
@@ -913,59 +937,45 @@
   <main class="main-pane">
     <header class="main-header" data-tauri-drag-region>
       <div class="crumbs" data-tauri-drag-region>
-        {#if activeProject}<span class="crumb-project">{activeProject.displayName}</span>{:else}<span class="crumb-project">OMP Desktop</span>{/if}
+        {#if activeProject}<span class="crumb-project">{activeProject.displayName}</span>{:else}<span class="crumb-project">πDesk</span>{/if}
         {#if visibleThread}<ChevronRight size={13} strokeWidth={2} class="crumb-sep" /><span class="top-thread">{visibleThread.title || 'New thread'}</span>{/if}
         {#if visibleThread && currentView && currentView.status !== 'idle'}<span class={`status-pill ${currentView.status}`} title={STATUS_LABEL[currentView.status]}><span class={`status-dot ${currentView.status}`}></span><span class="pill-label">{STATUS_LABEL[currentView.status]}</span></span>{/if}
       </div>
       {#if visibleThread && currentView}
         <div class="header-actions">
           {#if visibleThread.worktreePath}<span class="badge" title={`Isolated worktree: ${visibleThread.worktreePath}`}><GitFork size={11} strokeWidth={2} /> Isolated</span>{/if}
-          <span class="badge harness" title="Harness">{visibleThread.harness.toUpperCase()}</span>
           <div class="panel-toggles">
             <button class:pressed={rightPanel === 'changes'} class="toggle-button" title="Changes (⌘⇧D)" aria-label="Toggle changes" aria-pressed={rightPanel === 'changes'} onclick={() => togglePanel('changes')}><GitCompareArrows size={14} strokeWidth={1.9} /><span>Changes</span></button>
-            {#if currentView.capabilities.agents}
-              {@const running = currentView.agents.filter(agent => agent.status === 'running').length}
-              <button class:pressed={rightPanel === 'agents'} class="toggle-button" title="Agents (⌘⇧A)" aria-label="Toggle agents" aria-pressed={rightPanel === 'agents'} onclick={() => togglePanel('agents')}><Network size={14} strokeWidth={1.9} /><span>Agents</span>{#if running}<span class="count">{running}</span>{/if}</button>
-            {/if}
           </div>
         </div>
       {/if}
     </header>
 
     {#if startupError}<div class="error-banner" role="alert"><AlertTriangle size={14}/><span>{startupError}</span><button aria-label="Dismiss error" onclick={() => startupError = ''}><X size={14}/></button></div>{/if}
-    {#if detecting}<div class="main-empty"><LoaderCircle class="spin" size={24} strokeWidth={1.6}/><h2>Finding your coding harnesses</h2><p>Checking OMP, Pi, and your shell environment.</p></div>
-    {:else if onboarding}
-      <div class="onboarding">
-        <div class="onboarding-mark" aria-hidden="true"><Sparkles size={22} strokeWidth={1.6} /></div>
-        <h1>Your agents, in focus.</h1>
-        <p class="onboarding-intro">A calm home for OMP and Pi sessions, tool activity, subagents, and code review. Your code and sessions stay on this Mac.</p>
-        <div class="harness-choices">
-          <div class="harness-card"><div class="harness-icon">O</div><div class="harness-copy"><h3>Oh My Pi</h3><p>Rich agent orchestration and tooling.</p><code>{ompInstallCommand}</code></div><button class="primary-button" disabled={installInProgress !== null} onclick={() => void install('omp')}>{installInProgress === 'omp' ? 'Installing…' : 'Install'}</button></div>
-          <div class="harness-card"><div class="harness-icon">π</div><div class="harness-copy"><h3>Pi</h3><p>The lightweight coding-agent foundation.</p><code>{piInstallCommand}</code></div><button class="secondary-button" disabled={installInProgress !== null} onclick={() => void install('pi')}>{installInProgress === 'pi' ? 'Installing…' : 'Install'}</button></div>
-        </div>
-        <p class="install-notice">Installation runs only after you choose it.</p>
-        {#if installLog.length}<pre class="install-log" aria-live="polite">{installLog.join('\n')}</pre>{/if}
-        <div class="onboarding-actions"><button onclick={() => void locate('omp')}>Locate OMP executable</button><button onclick={() => void locate('pi')}>Locate Pi executable</button><button onclick={() => void refreshHarnesses()}><RefreshCw size={13}/> Retry detection</button></div>
-      </div>
+    {#if detecting}<div class="main-empty"><LoaderCircle class="spin" size={24} strokeWidth={1.6}/><h2>Checking private Pi</h2><p>Looking only inside πDesk’s installation directory.</p></div>
+    {:else if onboarding || installerVisible}
+      <PiSetup plan={installPlan} status={installStatus} busy={installInProgress} lines={installLog} error={installError || installPlanError} ready={installReady} checking={checkingRuntime} onInstall={() => void install()} onCheck={() => void checkPrivateRuntime()} onContinue={() => { installerVisible = false; installStatus = 'idle'; }} />
     {:else if !activeProject}
       <div class="main-empty"><div class="empty-graphic"><FolderOpen size={26} strokeWidth={1.5}/></div><h2>Start with a project</h2><p>Choose a local folder. Nothing is uploaded or copied.</p><button class="primary-button" onclick={() => void addProject()}><Plus size={15} strokeWidth={2.2}/> Add project</button></div>
     {:else if loadingThread}
-      <div class="main-empty"><LoaderCircle class="spin" size={24} strokeWidth={1.6}/><h2>Opening thread</h2><p>Restoring the conversation from {visibleThread?.harness.toUpperCase() ?? activeProject.preferredHarness.toUpperCase()}.</p></div>
+      <div class="main-empty"><LoaderCircle class="spin" size={24} strokeWidth={1.6}/><h2>Opening thread</h2><p>Restoring the conversation from Pi.</p></div>
     {:else if !visibleThread || !currentView}
       <div class="main-empty"><div class="empty-graphic"><SquarePen size={24} strokeWidth={1.5}/></div><h2>What shall we work on?</h2><p>Start a thread in <strong>{activeProject.displayName}</strong> to talk to your agent.</p><button class="primary-button" disabled={pendingAction || !harnesses.length} onclick={() => void createThread(activeProject!)}><Plus size={15} strokeWidth={2.2}/> New thread</button><div class="empty-hint"><kbd>⌘</kbd><kbd>N</kbd> new thread <span class="dot-sep"></span> <kbd>⌘</kbd><kbd>K</kbd> jump anywhere</div></div>
     {:else}
       {#if currentView.error}<div class="error-banner"><AlertTriangle size={14}/><span>{currentView.error}</span>{#if visibleThread && crashDetails[visibleThread.id]}<button onclick={() => errorDetailsOpen = true}>View details</button>{/if}<button class="banner-action" onclick={() => void restart()}><RefreshCw size={13}/> Restart session</button></div>{/if}
-      <Conversation view={currentView} onSend={send} onAbort={stop} onShowChanges={showChanges} onShowAgents={() => void openPanel('agents')} onRespond={respond} onSetModel={setModel} onSetEffort={setEffort} />
+      <Conversation view={currentView} onSend={send} onAbort={stop} onShowChanges={showChanges} onRespond={respond} onSetModel={setModel} onSetEffort={setEffort} />
+    {/if}
+    {#if !detecting && !onboarding && !installerVisible}
+      <footer class="status-bar">
+        <RuntimeMonitor {projects} activeThreadId={visibleThread?.id ?? null} onStop={stopThreadsFromMonitor} onOpenThread={(threadId, projectId) => void openThreadById(threadId, projectId)} />
+      </footer>
     {/if}
   </main>
 
   {#if rightPanel && visibleThread && currentView}
     <div class="resize-handle panel-handle" role="slider" tabindex="0" aria-orientation="vertical" aria-valuemin="320" aria-valuemax="850" aria-valuenow={panelWidth} aria-label="Resize detail panel" onmousedown={() => panelResizing = true} onkeydown={event => { if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); panelWidth = Math.max(320, Math.min(850, panelWidth + (event.key === 'ArrowLeft' ? 12 : -12))); localStorage.setItem('panelWidth', String(panelWidth)); } }}></div>
-    <aside class="details-pane" aria-label={rightPanel === 'agents' ? 'Agents' : 'Changes'}>
-      {#if rightPanel === 'agents'}
-        {#if AgentsPanel}<AgentsPanel view={currentView} onClose={() => rightPanel = null} />
-        {:else}<div class="panel-loading"><LoaderCircle class="spin" size={16}/><span>Loading agents…</span></div>{/if}
-      {:else if ChangesPanel}<ChangesPanel thread={visibleThread} onClose={() => rightPanel = null} focusPath={diffPath} />
+    <aside class="details-pane" aria-label="Changes">
+      {#if ChangesPanel}<ChangesPanel thread={visibleThread} onClose={() => rightPanel = null} focusPath={diffPath} />
       {:else}<div class="panel-loading"><LoaderCircle class="spin" size={16}/><span>Loading changes…</span></div>{/if}
     </aside>
   {/if}
@@ -983,8 +993,8 @@
 
 {#if errorDetailsOpen && visibleThread}
   <div class="overlay" role="presentation" onclick={event => { if (event.target === event.currentTarget) errorDetailsOpen = false; }}>
-    <div class="settings dialog" role="dialog" aria-modal="true" aria-label="Harness error details">
-      <header><h2>Harness error</h2><button class="icon-button" aria-label="Close details" onclick={() => errorDetailsOpen = false}><X size={16}/></button></header>
+    <div class="settings dialog" role="dialog" aria-modal="true" aria-label="Pi error details">
+      <header><h2>Pi error</h2><button class="icon-button" aria-label="Close details" onclick={() => errorDetailsOpen = false}><X size={16}/></button></header>
       <pre class="error-details">{crashDetails[visibleThread.id]}</pre>
     </div>
   </div>
@@ -1034,35 +1044,19 @@
         </div>
       </section>
       <section>
-        <h3>Coding harnesses</h3><p>System installations are used directly, including their existing sessions and credentials.</p>
+        <h3>Private Pi installation</h3><p>πDesk uses only its own copy under <code>~/.pidesk</code>. Your system Pi is never selected or modified.</p>
         <div class="setting-group">
-          {#each ['omp', 'pi'] as kind}
-            {@const installation = harnesses.find(h => h.kind === kind)}
-            <div class="setting-row"><span class="setting-name"><Terminal size={15} strokeWidth={1.8}/> {kind.toUpperCase()}</span>
-              {#if installation}<span class="install-path" title={installation.path}><span class="version">{installation.version}</span><small><bdi>{installation.path}</bdi></small></span>
-              {:else}<span class="missing">Not found</span>{/if}
-              <button class="secondary-button small" onclick={() => void locate(kind as HarnessKind)}>Choose…</button>
-            </div>
-          {/each}
-        </div>
-        <button class="text-button" onclick={() => void refreshHarnesses()}><RefreshCw size={13}/> Scan again</button>
-      </section>
-      {#if visibleThread?.harness === 'omp'}
-        <section>
-          <h3>Provider sign-in</h3><p>OMP manages credentials. This app never stores provider tokens.</p>
-          <div class="setting-group">
-            {#each loginProviders.filter(provider => provider.available) as provider}
-              <div class="setting-row">
-                <span class="setting-name">{provider.name}</span>
-                <span class:authenticated={provider.authenticated} class="provider-state">{#if provider.authenticated}<Check size={12} strokeWidth={2.4}/> Connected{:else}Not connected{/if}</span>
-                {#if !provider.authenticated}<button class="secondary-button small" disabled={loggingIn !== null} onclick={() => void login(provider.id)}>{loggingIn === provider.id ? 'Signing in…' : 'Sign in'}</button>{/if}
-              </div>
-            {/each}
-            {#if loginProviders.length === 0}<p class="setting-empty">Open an OMP thread to view sign-in providers.</p>{/if}
+          <div class="setting-row"><span class="setting-name"><Terminal size={15} strokeWidth={1.8}/> Pi</span>
+            {#if installation}<span class="install-path" title={installation.path}><span class="version">{installation.version}</span><small><bdi>{installation.path}</bdi></small></span>
+            {:else}<span class="missing">Not found</span>{/if}
+            {#if !installation}<button class="secondary-button small" onclick={() => { settingsOpen = false; installerVisible = true; }}>Set up Pi</button>{/if}
           </div>
-        </section>
-      {/if}
-      <section><h3>Privacy</h3><p class="last">Project metadata is stored locally. OMP and Pi retain control of sessions, credentials, extensions, and provider connections. This app sends no product telemetry.</p></section>
+        </div>
+        <button class="text-button" disabled={installInProgress || checkingRuntime} onclick={() => void checkPrivateRuntime()}><RefreshCw size={13}/> Check private installation</button>
+        {#if installPlanError}<p role="alert">{installPlanError}</p>{/if}
+      </section>
+      {#if installation && installPlan}<section><PiSignIn command={installPlan.loginCommand} /></section>{/if}
+      <section><h3>Privacy</h3><p class="last">Pi stores its settings, extensions, credentials, and sessions inside πDesk’s private directory. Nothing is copied from your terminal Pi, and it is never modified. πDesk sends no product telemetry.</p></section>
     </div>
   </div>
 {/if}
@@ -1106,10 +1100,6 @@
   .new-thread { flex:1; display:flex; align-items:center; gap:8px; border:0; background:transparent; padding:5px 8px; border-radius:var(--radius-sm); color:var(--muted); font-size:12.5px; text-align:left; }
   .new-thread:hover:not(:disabled) { color:var(--text); background:color-mix(in srgb, var(--surface-2) 70%, transparent); }
   .new-thread :global(svg) { color:var(--accent); }
-  .harness-picker { position:relative; display:flex; align-items:center; gap:2px; color:var(--subtle); padding:0 6px; height:22px; border-radius:5px; }
-  .harness-picker:hover { background:var(--surface-2); color:var(--text); }
-  .harness-picker select { appearance:none; border:0; background:transparent; color:inherit; font-size:10.5px; font-weight:600; letter-spacing:.04em; cursor:pointer; padding:0; }
-  .harness-picker :global(svg) { pointer-events:none; }
   .thread-row { display:flex; align-items:center; border-radius:var(--radius-sm); height:28px; margin:1px 0; }
   .thread-row:hover { background:color-mix(in srgb, var(--surface-2) 70%, transparent); }
   .thread-row.active { background:var(--surface-2); }
@@ -1158,13 +1148,12 @@
   .status-pill.failed, .status-pill.disconnected { color:var(--bad); background:var(--bad-bg); }
   .header-actions { display:flex; align-items:center; gap:8px; flex-shrink:0; }
   .badge { display:inline-flex; align-items:center; gap:4px; height:20px; padding:0 7px; border-radius:5px; border:1px solid var(--line-strong); color:var(--muted); font-size:10.5px; font-weight:600; letter-spacing:.03em; }
-  .badge.harness { border-color:transparent; background:var(--surface-2); }
   .panel-toggles { display:flex; gap:2px; padding:2px; border-radius:8px; background:var(--surface); border:1px solid var(--line); }
   .toggle-button { display:inline-flex; align-items:center; gap:6px; height:26px; padding:0 10px; border:0; border-radius:6px; background:transparent; color:var(--muted); font-size:12px; font-weight:500; }
   .toggle-button:hover { color:var(--text); }
   .toggle-button.pressed { background:var(--elevated); color:var(--text); box-shadow:var(--shadow-sm), 0 0 0 1px var(--line); }
-  .toggle-button .count { min-width:16px; height:16px; padding:0 4px; border-radius:8px; background:var(--accent); color:var(--on-accent); font-size:10px; font-weight:700; display:inline-flex; align-items:center; justify-content:center; }
 
+  .status-bar { flex:none; display:flex; justify-content:flex-end; align-items:center; height:36px; padding:0 12px; }
   .details-pane { width:var(--panel-width); min-width:320px; max-width:850px; display:flex; flex-direction:column; overflow:hidden; background:var(--panel); animation:panel-arrive .16s var(--ease); }
   @keyframes panel-arrive { from { opacity:.4; transform:translateX(8px); } to { opacity:1; transform:none; } }
   .panel-loading { display:flex; align-items:center; justify-content:center; flex:1; gap:9px; color:var(--muted); font-size:12px; }
@@ -1190,22 +1179,8 @@
   .error-banner button { display:flex; align-items:center; gap:5px; background:transparent; border:0; color:inherit; white-space:nowrap; padding:4px 8px; border-radius:var(--radius-sm); font-size:12px; font-weight:500; }
   .error-banner button:hover { background:color-mix(in srgb, var(--bad) 14%, transparent); }
 
-  .onboarding { width:min(560px, calc(100% - 60px)); align-self:center; margin:auto; max-height:100%; overflow:auto; padding:40px 0; animation:ui-rise .3s var(--ease); }
-  .onboarding-mark { width:48px; height:48px; border-radius:14px; display:flex; align-items:center; justify-content:center; color:var(--on-accent); background:linear-gradient(145deg, var(--accent), var(--accent-strong)); box-shadow:0 8px 24px color-mix(in srgb, var(--accent) 35%, transparent); }
-  .onboarding h1 { font-size:28px; margin:20px 0 8px; font-weight:650; letter-spacing:-.03em; }
-  .onboarding-intro { color:var(--muted); line-height:1.65; margin:0 0 28px; font-size:14px; }
-  .harness-choices { display:grid; grid-template-columns:minmax(0, 1fr); gap:10px; }
-  .harness-card { display:flex; align-items:center; gap:14px; padding:14px 16px; background:var(--surface); border:1px solid var(--line); border-radius:var(--radius-lg); }
-  .harness-icon { width:40px; height:40px; flex-shrink:0; display:flex; align-items:center; justify-content:center; border-radius:10px; background:var(--elevated); box-shadow:var(--shadow-sm), 0 0 0 1px var(--line); color:var(--text); font-size:19px; font-weight:700; }
-  .harness-copy { flex:1; min-width:0; }
-  .harness-copy h3 { margin:0 0 1px; font-size:14px; font-weight:600; }
-  .harness-copy p { margin:0 0 6px; color:var(--muted); font-size:12px; }
-  .harness-copy code { display:block; color:var(--subtle); font-size:10.5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  .install-notice { color:var(--subtle); font-size:12px; margin:14px 2px 0; }
-  .install-log { background:var(--sidebar); color:var(--muted); border:1px solid var(--line); border-radius:var(--radius); padding:12px; max-height:160px; overflow:auto; font-size:11px; white-space:pre-wrap; margin:14px 0 0; }
-  .onboarding-actions { display:flex; flex-wrap:wrap; gap:16px; margin-top:22px; }
-  .onboarding-actions button, .text-button { display:inline-flex; align-items:center; gap:5px; border:0; background:none; color:var(--muted); font-size:12px; padding:3px 0; }
-  .onboarding-actions button:hover, .text-button:hover { color:var(--accent); }
+  .text-button { display:inline-flex; align-items:center; gap:5px; border:0; background:none; color:var(--muted); font-size:12px; padding:3px 0; }
+  .text-button:hover:not(:disabled) { color:var(--accent); }
 
   /* ---------- Dialogs ---------- */
   .overlay { position:fixed; inset:0; background:rgb(0 0 0 / .35); z-index:30; display:flex; align-items:flex-start; justify-content:center; padding-top:14vh; backdrop-filter:blur(2px); animation:fade-in .12s ease-out; }
@@ -1236,11 +1211,9 @@
   .settings p { color:var(--muted); font-size:12px; line-height:1.55; margin:0 0 12px; }
   .settings p.last { margin:0; }
   .setting-group { border:1px solid var(--line); border-radius:var(--radius); padding:0 12px; margin-bottom:10px; background:var(--bg); }
-  .setting-group .setting-row + .setting-row { border-top:1px solid var(--line); }
   .setting-row { display:flex; align-items:center; gap:12px; min-height:44px; }
   .setting-row > span:first-child { display:flex; align-items:center; gap:9px; margin-right:auto; white-space:nowrap; font-size:12.5px; }
   .setting-name :global(svg) { color:var(--subtle); }
-  .setting-empty { padding:12px 0; margin:0 !important; }
   .segmented { display:flex; gap:2px; padding:2px; border-radius:8px; background:var(--surface); border:1px solid var(--line); }
   .segmented button { display:inline-flex; align-items:center; gap:5px; height:24px; padding:0 10px; border:0; border-radius:6px; background:transparent; color:var(--muted); font-size:12px; }
   .segmented button:hover { color:var(--text); }
@@ -1250,11 +1223,9 @@
   .install-path small { display:block; max-width:220px; color:var(--subtle); font-size:11px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; direction:rtl; }
   .missing { color:var(--subtle); font-size:12px; }
   .error-details { white-space:pre-wrap; overflow:auto; max-height:52vh; padding:16px 20px; margin:0; font:11.5px/1.6 var(--mono); color:var(--muted); }
-  .provider-state { display:inline-flex; align-items:center; gap:4px; font-size:12px; color:var(--subtle); }
-  .provider-state.authenticated { color:var(--good); }
 
   /* Header adapts to the main pane's own width (side panels shrink it). */
-  @container main (max-width: 760px) { .badge.harness, .toggle-button span:not(.count) { display:none; } .toggle-button { padding:0 8px; } }
+  @container main (max-width: 760px) { .toggle-button span:not(.count) { display:none; } .toggle-button { padding:0 8px; } }
   @container main (max-width: 620px) { .crumb-project, .crumbs :global(.crumb-sep), .badge { display:none; } }
   @container main (max-width: 520px) { .status-pill { padding:0; width:18px; height:18px; justify-content:center; } .status-pill .pill-label { display:none; } }
 </style>

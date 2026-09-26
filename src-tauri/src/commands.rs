@@ -1,12 +1,11 @@
 use crate::dto::{
-    AgentInfo, ChangesSummary, GitFile, HarnessInstallation, HarnessKind, LoginProvider, ModelInfo,
-    Project, SessionSnapshot, SessionState, Thread, UiResponse, Usage,
+    ChangesSummary, GitFile, HarnessInstallation, HarnessKind, ModelInfo, Project, SessionSnapshot,
+    SessionState, Thread, UiResponse, Usage,
 };
 use crate::error::{cmd_err, AppError, CmdResult};
 use crate::git;
 use crate::state::AppState;
 use crate::util;
-use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use tauri::State;
@@ -59,19 +58,6 @@ pub async fn detect_harnesses(state: State<'_, AppState>) -> CmdResult<Vec<Harne
 }
 
 #[tauri::command]
-pub async fn set_executable_override(
-    state: State<'_, AppState>,
-    kind: HarnessKind,
-    path: String,
-) -> CmdResult<HarnessInstallation> {
-    state
-        .registry
-        .set_override(kind, &path)
-        .await
-        .map_err(cmd_err)
-}
-
-#[tauri::command]
 pub async fn install_harness(state: State<'_, AppState>, kind: HarnessKind) -> CmdResult<()> {
     let _active_install = ActiveInstallGuard::acquire(kind).map_err(cmd_err)?;
     state
@@ -121,15 +107,7 @@ fn add_project_inner(
     }
     let resolved = util::resolve_path(&p);
     let is_git = git::is_repo(&resolved);
-    // Harness config markers influence the preferred harness: an explicit
-    // .omp or .pi directory wins over the picker default.
-    let preferred = if resolved.join(".omp").exists() {
-        HarnessKind::Omp
-    } else if resolved.join(".pi").exists() {
-        HarnessKind::Pi
-    } else {
-        harness
-    };
+    let preferred = harness;
     let display_name = resolved
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -188,6 +166,12 @@ pub async fn open_thread(
     thread_id: String,
 ) -> CmdResult<SessionSnapshot> {
     state.threads.snapshot(&thread_id).await.map_err(cmd_err)
+}
+
+#[tauri::command]
+pub async fn get_runtime_stats(state: State<'_, AppState>) -> CmdResult<crate::dto::RuntimeStats> {
+    let threads = state.threads.clone();
+    blocking(move || Ok(threads.runtime_stats())).await
 }
 
 #[tauri::command]
@@ -318,64 +302,6 @@ pub async fn respond_ui(
     state
         .threads
         .respond_ui(&thread_id, &request_id, response)
-        .await
-        .map_err(cmd_err)
-}
-
-// ---------------------------------------------------------------------
-// Subagents
-// ---------------------------------------------------------------------
-
-#[tauri::command]
-pub async fn get_subagent_messages(
-    state: State<'_, AppState>,
-    thread_id: String,
-    agent_id: String,
-) -> CmdResult<Vec<Value>> {
-    state
-        .threads
-        .get_subagent_messages(&thread_id, &agent_id)
-        .await
-        .map_err(cmd_err)
-}
-
-#[tauri::command]
-pub async fn get_subagents(
-    state: State<'_, AppState>,
-    thread_id: String,
-) -> CmdResult<Vec<AgentInfo>> {
-    state
-        .threads
-        .get_subagents(&thread_id)
-        .await
-        .map_err(cmd_err)
-}
-
-// ---------------------------------------------------------------------
-// Login providers
-// ---------------------------------------------------------------------
-
-#[tauri::command]
-pub async fn get_login_providers(
-    state: State<'_, AppState>,
-    thread_id: String,
-) -> CmdResult<Vec<LoginProvider>> {
-    state
-        .threads
-        .get_login_providers(&thread_id)
-        .await
-        .map_err(cmd_err)
-}
-
-#[tauri::command]
-pub async fn login_provider(
-    state: State<'_, AppState>,
-    thread_id: String,
-    provider_id: String,
-) -> CmdResult<()> {
-    state
-        .threads
-        .login_provider(&thread_id, &provider_id)
         .await
         .map_err(cmd_err)
 }

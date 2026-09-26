@@ -98,36 +98,8 @@ impl Store {
              CREATE TABLE IF NOT EXISTS settings (
                key TEXT PRIMARY KEY,
                value TEXT NOT NULL
-             );",
-        )?;
-        Ok(())
-    }
-
-    // ---- settings ----
-
-    /// Checked read: only "no such row" maps to `Ok(None)`; lock/IO and
-    /// corruption errors propagate to the caller. Callers where a missing
-    /// value changes what runs or what the user sees as configured MUST use
-    /// this rather than swallowing errors.
-    pub fn get_setting_checked(&self, key: &str) -> AppResult<Option<String>> {
-        let conn = self.conn.lock();
-        match conn.query_row(
-            "SELECT value FROM settings WHERE key = ?1",
-            params![key],
-            |row| row.get::<_, String>(0),
-        ) {
-            Ok(value) => Ok(Some(value)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(other) => Err(other.into()),
-        }
-    }
-
-    pub fn set_setting(&self, key: &str, value: &str) -> AppResult<()> {
-        let conn = self.conn.lock();
-        conn.execute(
-            "INSERT INTO settings(key, value) VALUES(?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![key, value],
+             );
+             DROP TABLE IF EXISTS hidden_projects;",
         )?;
         Ok(())
     }
@@ -138,7 +110,8 @@ impl Store {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT id, path, display_name, preferred_harness, is_git, created_at, last_opened_at
-             FROM projects ORDER BY last_opened_at DESC",
+             FROM projects
+             ORDER BY last_opened_at DESC",
         )?;
         let rows = stmt
             .query_map([], |r| {
@@ -146,7 +119,7 @@ impl Store {
                     id: r.get(0)?,
                     path: r.get(1)?,
                     display_name: r.get(2)?,
-                    preferred_harness: r.get::<_, String>(3)?.parse().unwrap_or(HarnessKind::Omp),
+                    preferred_harness: r.get::<_, String>(3)?.parse().unwrap_or(HarnessKind::Pi),
                     is_git: r.get::<_, i64>(4)? != 0,
                     created_at: r.get(5)?,
                     last_opened_at: r.get(6)?,
@@ -206,14 +179,15 @@ impl Store {
         let conn = self.conn.lock();
         let p = conn.query_row(
             "SELECT id, path, display_name, preferred_harness, is_git, created_at, last_opened_at
-             FROM projects WHERE id = ?1",
+             FROM projects
+             WHERE id = ?1",
             params![id],
             |r| {
                 Ok(Project {
                     id: r.get(0)?,
                     path: r.get(1)?,
                     display_name: r.get(2)?,
-                    preferred_harness: r.get::<_, String>(3)?.parse().unwrap_or(HarnessKind::Omp),
+                    preferred_harness: r.get::<_, String>(3)?.parse().unwrap_or(HarnessKind::Pi),
                     is_git: r.get::<_, i64>(4)? != 0,
                     created_at: r.get(5)?,
                     last_opened_at: r.get(6)?,
@@ -239,8 +213,11 @@ impl Store {
     }
 
     pub fn remove_project(&self, id: &str) -> AppResult<()> {
-        let conn = self.conn.lock();
-        conn.execute("DELETE FROM projects WHERE id = ?1", params![id])?;
+        let mut conn = self.conn.lock();
+        let transaction = conn.transaction()?;
+        transaction.execute("DELETE FROM threads WHERE project_id = ?1", params![id])?;
+        transaction.execute("DELETE FROM projects WHERE id = ?1", params![id])?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -250,7 +227,7 @@ impl Store {
         Ok(ThreadRow {
             id: r.get(0)?,
             project_id: r.get(1)?,
-            harness: r.get::<_, String>(2)?.parse().unwrap_or(HarnessKind::Omp),
+            harness: HarnessKind::Pi,
             session_id: r.get(3)?,
             session_file: r.get(4)?,
             cwd: r.get(5)?,
@@ -266,6 +243,19 @@ impl Store {
 
     const THREAD_COLS: &'static str =
         "id, project_id, harness, session_id, session_file, cwd, title, pinned, archived, status, created_at, last_viewed_at, worktree_path";
+
+    /// Session files already mapped to a thread, so discovery never imports a
+    /// second thread for the same journal.
+    pub fn registered_session_files(&self, project_id: &str) -> AppResult<Vec<String>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT session_file FROM threads WHERE project_id = ?1 AND session_file != ''",
+        )?;
+        let files = stmt
+            .query_map(params![project_id], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(files)
+    }
 
     pub fn list_threads(&self, project_id: &str) -> AppResult<Vec<ThreadRow>> {
         let conn = self.conn.lock();
@@ -402,7 +392,8 @@ impl Store {
     pub fn mark_all_threads_disconnected(&self) -> AppResult<()> {
         let conn = self.conn.lock();
         conn.execute(
-            "UPDATE threads SET status = 'disconnected' WHERE status IN ('active', 'waiting')",
+            "UPDATE threads SET status = 'disconnected'
+             WHERE status IN ('active', 'waiting')",
             [],
         )?;
         Ok(())
@@ -411,7 +402,7 @@ impl Store {
 
 /// Path of the SQLite database inside the app data dir.
 pub fn db_path(app_data_dir: &Path) -> PathBuf {
-    app_data_dir.join("omp-desktop.sqlite3")
+    app_data_dir.join("pidesk.sqlite3")
 }
 
 #[cfg(test)]
@@ -420,7 +411,7 @@ mod tests {
 
     #[test]
     fn projects_and_threads_survive_restart_without_owning_files() {
-        let dir = std::env::temp_dir().join(format!("omp-store-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("pidesk-store-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let source = dir.join("source.txt");
         std::fs::write(&source, "keep me").unwrap();
@@ -430,14 +421,14 @@ mod tests {
         {
             let store = Store::open(&db).unwrap();
             let project = store
-                .add_project(&dir.to_string_lossy(), "Fixture", HarnessKind::Omp, true)
+                .add_project(&dir.to_string_lossy(), "Fixture", HarnessKind::Pi, true)
                 .unwrap();
             project_id = project.id;
             store
                 .upsert_thread(
                     &thread_id,
                     &project_id,
-                    HarnessKind::Omp,
+                    HarnessKind::Pi,
                     "session-1",
                     "/tmp/session.jsonl",
                     &dir.to_string_lossy(),
@@ -467,10 +458,10 @@ mod tests {
     #[test]
     fn startup_marks_interrupted_threads_disconnected() {
         let store = Store::open(Path::new(":memory:")).unwrap();
-        let dir = std::env::temp_dir().join(format!("omp-store-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("pidesk-store-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let project = store
-            .add_project(&dir.to_string_lossy(), "Fixture", HarnessKind::Omp, false)
+            .add_project(&dir.to_string_lossy(), "Fixture", HarnessKind::Pi, false)
             .unwrap();
         for (index, status) in ["idle", "completed", "active", "waiting"]
             .iter()
@@ -480,7 +471,7 @@ mod tests {
                 .upsert_thread(
                     &format!("thread-{index}"),
                     &project.id,
-                    HarnessKind::Omp,
+                    HarnessKind::Pi,
                     "",
                     "",
                     &dir.to_string_lossy(),
@@ -511,18 +502,57 @@ mod tests {
     }
 
     #[test]
+    fn session_files_map_to_one_thread_and_project_removal_is_complete() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let project = store
+            .add_project("/tmp/project", "Fixture", HarnessKind::Pi, false)
+            .unwrap();
+        let thread = |id: &str, file: &str| {
+            store.upsert_thread(
+                id,
+                &project.id,
+                HarnessKind::Pi,
+                "session",
+                file,
+                "/tmp/project",
+                "Title",
+                "idle",
+                None,
+                None,
+            )
+        };
+        thread("one", "/tmp/one.jsonl").unwrap();
+        // A journal can never back two threads.
+        assert!(thread("two", "/tmp/one.jsonl").is_err());
+        assert_eq!(
+            store.registered_session_files(&project.id).unwrap(),
+            vec!["/tmp/one.jsonl".to_string()]
+        );
+
+        store.remove_project(&project.id).unwrap();
+        assert!(store.get_project(&project.id).is_err());
+        assert!(store.get_thread("one").is_err());
+        assert!(store.list_projects().unwrap().is_empty());
+        let restored = store
+            .add_project("/tmp/project", "Fixture", HarnessKind::Pi, false)
+            .unwrap();
+        assert_ne!(restored.id, project.id);
+        assert!(store.list_threads(&restored.id).unwrap().is_empty());
+    }
+
+    #[test]
     fn omitted_state_fields_do_not_erase_session_mapping() {
         let store = Store::open(Path::new(":memory:")).unwrap();
-        let dir = std::env::temp_dir().join(format!("omp-store-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("pidesk-store-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let project = store
-            .add_project(&dir.to_string_lossy(), "Fixture", HarnessKind::Omp, false)
+            .add_project(&dir.to_string_lossy(), "Fixture", HarnessKind::Pi, false)
             .unwrap();
         store
             .upsert_thread(
                 "thread",
                 &project.id,
-                HarnessKind::Omp,
+                HarnessKind::Pi,
                 "session",
                 "/tmp/session.jsonl",
                 &dir.to_string_lossy(),

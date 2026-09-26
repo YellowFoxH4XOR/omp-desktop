@@ -1,652 +1,610 @@
-use crate::dto::{BackendEvent, HarnessInstallation, HarnessKind};
+use crate::dto::{
+    BackendEvent, HarnessInstallCommand, HarnessInstallation, HarnessKind, InstallStage,
+};
 use crate::error::{AppError, AppResult};
-use crate::store::Store;
 use crate::util;
-use parking_lot::Mutex;
+use serde_json::Value;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
-use tokio::process::Command;
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::process::{Child, Command};
 
-const SETTING_OVERRIDE_OMP: &str = "executable_override.omp";
-const SETTING_OVERRIDE_PI: &str = "executable_override.pi";
+// Pin the RPC contract this desktop build supports; updates are never implicit.
+const PI_PACKAGE: &str = "@earendil-works/pi-coding-agent";
+const PI_PACKAGE_SPEC: &str = "@earendil-works/pi-coding-agent@0.87.1";
+const INCOMPLETE_MARKER: &str = ".pidesk-install-incomplete";
+const MAX_PROBE_BYTES: u64 = 1024 * 1024;
+const MAX_LOG_LINE_BYTES: usize = 4096;
+const MAX_LOG_LINES: usize = 5000;
+const INSTALL_TIMEOUT_SECS: u64 = 600;
+type Emit = Arc<dyn Fn(BackendEvent) + Send + Sync>;
 
-const MAX_PROBE_OUTPUT_BYTES: u64 = 1_048_576;
+fn executable_in(root: &Path) -> PathBuf {
+    root.join("runtime/node_modules/.bin/pi")
+}
 
-/// Fixed, allowlisted install commands. These are exactly what the onboarding
-/// UI displays (via `install_commands`) and what `install_harness` executes
-/// (via `install_command`); nothing else may be executed by install_harness.
-/// The executed argv is intentionally unchanged (see E6 accepted risk): the
-/// UI copy is derived from the same source so it cannot drift.
-fn install_command(kind: HarnessKind) -> (&'static str, Vec<&'static str>) {
-    match kind {
-        HarnessKind::Omp => ("bun", vec!["install", "-g", "@oh-my-pi/pi-coding-agent"]),
-        HarnessKind::Pi => (
-            "npm",
-            vec![
-                "install",
-                "-g",
-                "--ignore-scripts",
-                "@earendil-works/pi-coding-agent",
-            ],
-        ),
+fn shell_quote(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./:@=".contains(c))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
     }
 }
 
-fn install_command_display(kind: HarnessKind) -> String {
-    let (prog, args) = install_command(kind);
-    std::iter::once(prog)
-        .chain(args.iter().copied())
+/// Fixed argv shared by the command display and execution. A private working
+/// directory and explicit npm configs avoid project/user global-install flags.
+fn install_args(root: &Path) -> Vec<String> {
+    vec![
+        "install".into(),
+        "--prefix".into(),
+        root.join("runtime").to_string_lossy().into_owned(),
+        "--global=false".into(),
+        "--ignore-scripts".into(),
+        "--no-audit".into(),
+        "--no-fund".into(),
+        "--progress=false".into(),
+        "--color=false".into(),
+        "--save-exact".into(),
+        "--userconfig".into(),
+        root.join("npm-user.conf").to_string_lossy().into_owned(),
+        "--globalconfig".into(),
+        root.join("npm-global.conf").to_string_lossy().into_owned(),
+        "--cache".into(),
+        root.join("npm-cache").to_string_lossy().into_owned(),
+        PI_PACKAGE_SPEC.into(),
+    ]
+}
+
+fn install_plan(root: &Path) -> HarnessInstallCommand {
+    let command = std::iter::once("npm".to_string())
+        .chain(install_args(root).iter().map(|arg| shell_quote(arg)))
         .collect::<Vec<_>>()
-        .join(" ")
-}
-
-/// UI display copies of the fixed install commands, one per harness kind.
-pub fn install_commands() -> Vec<crate::dto::HarnessInstallCommand> {
-    [HarnessKind::Omp, HarnessKind::Pi]
-        .iter()
-        .map(|kind| crate::dto::HarnessInstallCommand {
-            kind: *kind,
-            command: install_command_display(*kind),
-        })
-        .collect()
-}
-
-fn override_setting_key(kind: HarnessKind) -> &'static str {
-    match kind {
-        HarnessKind::Omp => SETTING_OVERRIDE_OMP,
-        HarnessKind::Pi => SETTING_OVERRIDE_PI,
+        .join(" ");
+    let agent = shell_quote(&root.join("agent").to_string_lossy());
+    let sessions = shell_quote(&root.join("agent/sessions").to_string_lossy());
+    let bin = shell_quote(&root.join("runtime/node_modules/.bin").to_string_lossy());
+    let executable = shell_quote(&executable_in(root).to_string_lossy());
+    HarnessInstallCommand {
+        kind: HarnessKind::Pi,
+        command,
+        install_path: root.join("runtime").to_string_lossy().into_owned(),
+        agent_dir: root.join("agent").to_string_lossy().into_owned(),
+        // Copyable, credential-free display; don't embed proxy values or keys.
+        login_command: format!("env -i HOME=\"$HOME\" USER=\"$USER\" PATH={bin}:\"$PATH\" TERM=\"${{TERM:-xterm-256color}}\" PI_CODING_AGENT_DIR={agent} PI_CODING_AGENT_SESSION_DIR={sessions} PI_SKIP_VERSION_CHECK=1 PI_TELEMETRY=0 {executable} --no-approve --session-dir {sessions}"),
     }
 }
 
-fn override_digest_key(kind: HarnessKind) -> &'static str {
-    match kind {
-        HarnessKind::Omp => "executable_override_digest.omp",
-        HarnessKind::Pi => "executable_override_digest.pi",
-    }
+pub fn install_commands() -> Vec<HarnessInstallCommand> {
+    vec![install_plan(&util::pidesk_root())]
 }
 
-fn override_version_key(kind: HarnessKind) -> &'static str {
-    match kind {
-        HarnessKind::Omp => "executable_override_version.omp",
-        HarnessKind::Pi => "executable_override_version.pi",
+/// No PATH lookup for Pi, no user override, and no fallback outside the private
+/// package. The npm-created .bin symlink is allowed only within that package.
+fn managed_executable(root: &Path) -> AppResult<PathBuf> {
+    util::check_owned_path(root, true)?;
+    for dir in [
+        "runtime",
+        "runtime/node_modules",
+        "runtime/node_modules/.bin",
+        "runtime/node_modules/@earendil-works",
+        "runtime/node_modules/@earendil-works/pi-coding-agent",
+    ] {
+        util::check_owned_path(&root.join(dir), true)?;
     }
-}
-
-/// Ownership/type gate for a user-supplied executable override. The override
-/// becomes the binary every later spawn runs, so it must be an absolute path
-/// to a regular file the current user owns, with no group/world write bits
-/// (on Unix) and no symlink anywhere in the resolution (a symlink could be
-/// repointed after validation).
-fn check_override_file(path: &Path) -> AppResult<PathBuf> {
-    if !path.is_absolute() {
+    let package = root.join("runtime/node_modules").join(PI_PACKAGE);
+    let canonical_package = std::fs::canonicalize(&package)?;
+    let manifest = package.join("package.json");
+    util::check_owned_path(&manifest, false)?;
+    if std::fs::metadata(&manifest)?.len() > MAX_PROBE_BYTES {
         return Err(AppError::new(
-            "The override must be an absolute path, not a relative one.",
+            "The private Pi package manifest is too large.",
         ));
     }
-    // Reject symlinks before resolving: `symlink_metadata` does not follow
-    // the final component, and `canonicalize` afterwards catches symlinked
-    // parents. Either way the stored path is the fully resolved one.
-    let meta = std::fs::symlink_metadata(path)
-        .map_err(|_| AppError::new(format!("No executable exists at {}.", path.display())))?;
-    if meta.file_type().is_symlink() {
+    let manifest: Value = serde_json::from_slice(&std::fs::read(manifest)?)?;
+    if manifest.get("name").and_then(Value::as_str) != Some(PI_PACKAGE) {
         return Err(AppError::new(
-            "The override must be a real file, not a symlink.",
+            "The private package is not Pi. Retry installation.",
         ));
     }
-    let resolved = std::fs::canonicalize(path)
-        .map_err(|_| AppError::new(format!("No executable exists at {}.", path.display())))?;
-    if std::fs::symlink_metadata(&resolved)
-        .map(|m| !m.file_type().is_file())
-        .unwrap_or(true)
-    {
-        return Err(AppError::new(format!(
-            "No executable exists at {}.",
-            path.display()
-        )));
+    let resolved = std::fs::canonicalize(executable_in(root))
+        .map_err(|_| AppError::new("Private Pi is missing. Choose Install Pi in πDesk."))?;
+    if !resolved.starts_with(&canonical_package) {
+        return Err(AppError::new(
+            "The private Pi executable points outside its own package.",
+        ));
     }
+    util::check_owned_path(&resolved, false)?;
+    if !util::is_executable(&resolved) {
+        return Err(AppError::new(
+            "The private Pi executable is not runnable. Retry installation.",
+        ));
+    }
+    Ok(resolved)
+}
+
+async fn stop_child(child: &mut Child) {
+    // Only signal the original process group while its leader is unreaped.
+    if matches!(child.try_wait(), Ok(None)) {
+        #[cfg(unix)]
+        if let Some(pid) = child.id() {
+            unsafe {
+                libc::kill(-(pid as i32), libc::SIGKILL);
+            }
+        }
+        let _ = child.start_kill();
+    }
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await;
+}
+
+fn command_for(root: &Path, executable: &Path) -> Command {
+    let mut command = Command::new(executable);
+    util::configure_private_command(&mut command, root);
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let meta = std::fs::metadata(&resolved)
-            .map_err(|_| AppError::new(format!("No executable exists at {}.", path.display())))?;
-        if meta.uid() != unsafe { libc::geteuid() } {
-            return Err(AppError::new(
-                "The override must be owned by the current user.",
-            ));
-        }
-        if meta.mode() & 0o022 != 0 {
-            return Err(AppError::new(
-                "The override must not be writable by group or others.",
-            ));
-        }
-    }
-    Ok(resolved)
-}
-
-/// Re-verify a stored override immediately before use: the file must still
-/// pass the ownership/type gate and its digest must match the value recorded
-/// at validation time. Fails closed when the override changed or the stored
-/// digest is missing (e.g. written by an older build).
-fn verify_stored_override_file(
-    store: &Store,
-    kind: HarnessKind,
-    path: &Path,
-) -> AppResult<PathBuf> {
-    let resolved = check_override_file(path)?;
-    let expected = store
-        .get_setting_checked(override_digest_key(kind))?
-        .filter(|s| !s.is_empty());
-    let actual = util::file_digest(&resolved)?;
-    if expected.as_deref() != Some(actual.as_str()) {
-        return Err(AppError::new(format!(
-            "{} override at {} changed since it was validated. Re-select it in Settings.",
-            kind.display_name(),
-            resolved.display()
-        )));
-    }
-    Ok(resolved)
-}
-
-/// Well-known install locations checked after PATH lookups.
-fn known_locations(kind: HarnessKind) -> Vec<PathBuf> {
-    let home = util::home_dir();
-    let name = kind.binary_name();
-    let mut v = vec![
-        PathBuf::from("/opt/homebrew/bin").join(name),
-        PathBuf::from("/usr/local/bin").join(name),
-        home.join(".bun/bin").join(name),
-        home.join(".local/bin").join(name),
-        home.join(".npm-global/bin").join(name),
-        home.join(".volta/bin").join(name),
-        home.join(".local/share/pnpm").join(name),
-        PathBuf::from("/usr/bin").join(name),
-    ];
-    if let Ok(nvm) = std::env::var("NVM_DIR") {
-        v.push(PathBuf::from(nvm).join("current/bin").join(name));
-    }
-    v
-}
-
-async fn run_probe(
-    path: &Path,
-    args: &[&str],
-    timeout: std::time::Duration,
-    timeout_error: AppError,
-) -> AppResult<std::process::Output> {
-    let mut child = Command::new(path)
-        .args(args)
-        .env("PATH", util::merged_path())
+    command.process_group(0);
+    command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+    command
+}
+
+async fn probe(root: &Path, executable: &Path, args: &[&str]) -> AppResult<String> {
+    let mut child = command_for(root, executable)
+        .args(args)
+        .env("PI_OFFLINE", "1")
         .spawn()
-        .map_err(|e| AppError::new(format!("Could not run {}: {e}", path.display())))?;
-    let stdout = child.stdout.take().expect("probe stdout piped");
-    let stderr = child.stderr.take().expect("probe stderr piped");
-    let stdout_task = tokio::spawn(async move {
+        .map_err(|error| {
+            AppError::new(format!("Could not run {}: {error}", executable.display()))
+        })?;
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let out_task = tokio::spawn(async move {
         let mut bytes = Vec::new();
-        let _ = stdout
-            .take(MAX_PROBE_OUTPUT_BYTES)
+        stdout
+            .take(MAX_PROBE_BYTES)
             .read_to_end(&mut bytes)
-            .await;
-        bytes
+            .await
+            .map(|_| bytes)
     });
-    let stderr_task = tokio::spawn(async move {
+    let err_task = tokio::spawn(async move {
         let mut bytes = Vec::new();
-        let _ = stderr
-            .take(MAX_PROBE_OUTPUT_BYTES)
+        stderr
+            .take(MAX_PROBE_BYTES)
             .read_to_end(&mut bytes)
-            .await;
-        bytes
+            .await
+            .map(|_| bytes)
     });
-    let status = match tokio::time::timeout(timeout, child.wait()).await {
-        Ok(Ok(status)) => status,
-        Ok(Err(error)) => {
-            let _ = child.start_kill();
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await;
-            return Err(AppError::new(format!(
-                "Could not inspect {}: {error}",
-                path.display()
-            )));
-        }
-        Err(_) => {
-            let _ = child.start_kill();
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await;
-            return Err(timeout_error);
-        }
+    let status = tokio::time::timeout(std::time::Duration::from_secs(15), child.wait()).await;
+    if !matches!(status, Ok(Ok(_))) {
+        stop_child(&mut child).await;
+        out_task.abort();
+        err_task.abort();
+        return Err(AppError::new(format!(
+            "{} did not respond in time.",
+            executable.display()
+        )));
+    }
+    let status = status.unwrap()?;
+    let out_abort = out_task.abort_handle();
+    let err_abort = err_task.abort_handle();
+    let output = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        (out_task.await, err_task.await)
+    })
+    .await;
+    let Ok((Ok(Ok(stdout)), Ok(Ok(stderr)))) = output else {
+        out_abort.abort();
+        err_abort.abort();
+        return Err(AppError::new("Could not read the executable's response."));
     };
-    Ok(std::process::Output {
-        status,
-        stdout: stdout_task.await.unwrap_or_default(),
-        stderr: stderr_task.await.unwrap_or_default(),
+    if !status.success() {
+        return Err(AppError::new(format!(
+            "{} failed its readiness check (exit {}).",
+            executable.display(),
+            status.code().unwrap_or(-1)
+        )));
+    }
+    Ok(format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    ))
+}
+
+async fn validate_pi(root: &Path) -> AppResult<HarnessInstallation> {
+    let executable = managed_executable(root)?;
+    let version_text = probe(root, &executable, &["--version"]).await?;
+    let version = util::parse_version(&version_text)
+        .ok_or_else(|| AppError::new("Private Pi did not report its version."))?;
+    let help = probe(
+        root,
+        &executable,
+        &[
+            "--help",
+            "--no-extensions",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-context-files",
+            "--no-approve",
+        ],
+    )
+    .await?
+    .to_ascii_lowercase();
+    if !help.contains("pi - ai coding assistant")
+        || !help.contains("--mode")
+        || !help.contains("--no-approve")
+    {
+        return Err(AppError::new(
+            "The private executable is not a supported Pi CLI. Retry installation.",
+        ));
+    }
+    Ok(HarnessInstallation {
+        kind: HarnessKind::Pi,
+        path: executable.to_string_lossy().into_owned(),
+        version,
+        source: "managed".into(),
     })
 }
 
-/// Validate a candidate executable by running `<path> --version`.
-/// Returns the parsed version string on success.
-async fn validate_executable(path: &Path, kind: HarnessKind) -> AppResult<String> {
-    let out = run_probe(
-        path,
-        &["--version"],
-        std::time::Duration::from_secs(15),
-        AppError::new(format!(
-            "{} at {} did not answer --version in time.",
-            kind.display_name(),
-            path.display()
-        )),
-    )
-    .await?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    if !out.status.success() {
-        return Err(AppError::new(format!(
-            "{} is not a working {} executable (exit {}).",
-            path.display(),
-            kind.display_name(),
-            out.status.code().unwrap_or(-1)
-        )));
+fn emit_line(emit: &Emit, count: &AtomicUsize, bytes: &[u8], truncated: bool) {
+    let index = count.fetch_add(1, Ordering::Relaxed);
+    if index > MAX_LOG_LINES {
+        return;
     }
-    let text = format!("{stdout}\n{stderr}");
-    let version = util::parse_version(&text).ok_or_else(|| {
-        AppError::new(format!(
-            "{} did not report a version; is it really {}?",
-            path.display(),
-            kind.display_name()
-        ))
-    })?;
-    match kind {
-        HarnessKind::Omp if !stdout.trim_start().to_ascii_lowercase().starts_with("omp") => {
-            return Err(AppError::new(
-                "The selected executable reports a version, but is not OMP.",
-            ));
+    let line = if index == MAX_LOG_LINES {
+        "[Further installer output omitted; installation is still running.]".to_string()
+    } else {
+        let text = String::from_utf8_lossy(bytes);
+        let text = text.trim_end_matches('\r');
+        if text.is_empty() {
+            return;
         }
-        HarnessKind::Pi => {
-            // Pi's --version prints a bare semver; confirm its identity from
-            // its CLI help without launching an agent or reading credentials.
-            let help = run_probe(
-                path,
-                &["--help"],
-                std::time::Duration::from_secs(15),
-                AppError::new("Pi --help did not respond in time."),
-            )
-            .await?;
-            let help_text = String::from_utf8_lossy(&help.stdout).to_ascii_lowercase();
-            if !help.status.success()
-                || !help_text.contains("pi - ai coding assistant")
-                || !help_text.contains("--mode")
-            {
-                return Err(AppError::new(
-                    "The selected executable is not a supported Pi CLI.",
-                ));
+        let mut line = util::redact_secrets(text);
+        if truncated {
+            line.push_str(" [truncated]");
+        }
+        line
+    };
+    emit(BackendEvent::InstallProgress {
+        kind: HarnessKind::Pi,
+        line,
+    });
+}
+
+/// Drain both streams even after limits are reached so a noisy subprocess
+/// cannot fill a pipe, allocate unbounded lines, or flood the event queue.
+async fn stream_output(
+    mut stream: impl AsyncRead + Unpin,
+    emit: Emit,
+    count: Arc<AtomicUsize>,
+) -> std::io::Result<()> {
+    let mut chunk = [0u8; 4096];
+    let mut line = Vec::new();
+    let mut truncated = false;
+    loop {
+        let length = stream.read(&mut chunk).await?;
+        if length == 0 {
+            break;
+        }
+        for byte in &chunk[..length] {
+            if *byte == b'\n' || *byte == b'\r' {
+                emit_line(&emit, &count, &line, truncated);
+                line.clear();
+                truncated = false;
+            } else if line.len() < MAX_LOG_LINE_BYTES {
+                line.push(*byte);
+            } else {
+                truncated = true;
             }
         }
-        _ => {}
     }
-    Ok(version)
+    if !line.is_empty() {
+        emit_line(&emit, &count, &line, truncated);
+    }
+    Ok(())
 }
 
 pub struct HarnessRegistry {
-    store: Arc<Store>,
-    /// Resolved executable per kind, refreshed by detect/override/install.
-    resolved: Mutex<std::collections::HashMap<HarnessKind, HarnessInstallation>>,
+    root: PathBuf,
+    closing: AtomicBool,
+    installing: AtomicBool,
+    stop_install: tokio::sync::Notify,
+    install_done: tokio::sync::Notify,
+}
+
+struct InstallActivity<'a>(&'a HarnessRegistry);
+impl Drop for InstallActivity<'_> {
+    fn drop(&mut self) {
+        self.0.installing.store(false, Ordering::SeqCst);
+        self.0.install_done.notify_one();
+    }
 }
 
 impl HarnessRegistry {
-    pub fn new(store: Arc<Store>) -> Self {
+    pub fn new() -> Self {
+        Self::at_root(util::pidesk_root())
+    }
+
+    fn at_root(root: PathBuf) -> Self {
         Self {
-            store,
-            resolved: Mutex::new(std::collections::HashMap::new()),
+            root,
+            closing: AtomicBool::new(false),
+            installing: AtomicBool::new(false),
+            stop_install: tokio::sync::Notify::new(),
+            install_done: tokio::sync::Notify::new(),
         }
     }
 
-    /// Currently resolved executable for a kind, if detection has run.
-    pub fn executable(&self, kind: HarnessKind) -> Option<HarnessInstallation> {
-        self.resolved.lock().get(&kind).cloned()
+    pub async fn shutdown(&self) {
+        self.closing.store(true, Ordering::SeqCst);
+        self.stop_install.notify_one();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            while self.installing.load(Ordering::SeqCst) {
+                self.install_done.notified().await;
+            }
+        })
+        .await;
     }
 
-    /// Executable path for spawning; errors with guidance when undetected.
-    /// A stored override is re-verified by digest immediately before use
-    /// (never executed just to detect it); non-override candidates keep the
-    /// existing `--version` identity gate.
-    pub async fn executable_path(&self, kind: HarnessKind) -> AppResult<PathBuf> {
-        // A configured override always takes precedence over any cached
-        // install and fails closed, so check the store first: a missing,
-        // changed, or unreadable override must error rather than silently
-        // run a stale cached binary (or skip to a different one).
-        let configured = self.store.get_setting_checked(override_setting_key(kind))?;
-        if let Some(ov) = configured {
-            if !ov.trim().is_empty() {
-                return verify_stored_override_file(&self.store, kind, Path::new(ov.trim()))
-                    .map_err(|e| {
-                        self.resolved.lock().remove(&kind);
-                        e
-                    });
-            }
+    fn check_open(&self) -> AppResult<()> {
+        if self.closing.load(Ordering::SeqCst) {
+            Err(AppError::new(
+                "Installation stopped because πDesk is closing. Retry next time you open the app.",
+            ))
+        } else {
+            Ok(())
         }
-        if let Some(inst) = self.executable(kind) {
-            return Ok(PathBuf::from(inst.path));
-        }
-        // Lazy detection so commands work even if detect_harnesses was skipped.
-        self.detect_kind(kind).await
     }
 
-    /// Detect one kind, verifying a stored override by digest and validating
-    /// non-override candidates by execution as before. A configured override
-    /// takes precedence and fails closed: when the user's chosen executable
-    /// is missing, changed, or unreadable, spawning must error rather than
-    /// silently run a different binary.
-    async fn detect_kind(&self, kind: HarnessKind) -> AppResult<PathBuf> {
-        let configured = self.store.get_setting_checked(override_setting_key(kind))?;
-        if let Some(ov) = configured {
-            if !ov.trim().is_empty() {
-                let resolved = verify_stored_override_file(&self.store, kind, Path::new(ov.trim()))
-                    .map_err(|e| {
-                        // Fail closed: never serve a stale cached install
-                        // after the override broke.
-                        self.resolved.lock().remove(&kind);
-                        e
-                    })?;
-                let version = self
-                    .store
-                    .get_setting_checked(override_version_key(kind))?
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_default();
-                let inst = HarnessInstallation {
-                    kind,
-                    path: resolved.to_string_lossy().to_string(),
-                    version,
-                    source: "override".to_string(),
-                };
-                self.resolved.lock().insert(kind, inst.clone());
-                return Ok(PathBuf::from(inst.path));
-            }
-        }
-        for (path, source) in self.candidates(kind) {
-            if source == "override" {
-                continue;
-            }
-            if let Ok(version) = validate_executable(&path, kind).await {
-                let inst = HarnessInstallation {
-                    kind,
-                    path: path.to_string_lossy().to_string(),
-                    version,
-                    source,
-                };
-                self.resolved.lock().insert(kind, inst.clone());
-                return Ok(PathBuf::from(inst.path));
-            }
-        }
-        Err(AppError::new(format!(
-            "{} is not installed or could not be found. Install it or choose the executable in Settings.",
-            kind.display_name()
-        )))
-    }
-
-    /// Ordered candidate list: override → PATH → login-shell PATH → known locations.
-    /// `detect`/`detect_kind` check the override first via the checked API
-    /// and fail closed, so this list only supplies it as a fallback entry;
-    /// a database failure here skips the entry rather than inventing one.
-    fn candidates(&self, kind: HarnessKind) -> Vec<(PathBuf, String)> {
-        let mut out: Vec<(PathBuf, String)> = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        let mut push = |p: PathBuf, source: &str| {
-            let key = p.to_string_lossy().to_string();
-            if seen.insert(key) {
-                out.push((p, source.to_string()));
-            }
-        };
-        match self.store.get_setting_checked(override_setting_key(kind)) {
-            Ok(Some(ov)) if !ov.trim().is_empty() => {
-                push(PathBuf::from(ov), "override");
-            }
-            Ok(_) => {}
-            Err(_) => {}
-        }
-        let name = kind.binary_name();
-        if let Ok(p) = which::which(name) {
-            push(p, "PATH");
-        }
-        if let Some(login_path) = util::login_shell_path() {
-            if let Some(p) = util::which_in_path(name, &login_path) {
-                push(p, "login shell PATH");
-            }
-        }
-        for p in known_locations(kind) {
-            if util::is_executable(&p) {
-                push(p, "known location");
-            }
-        }
-        out
-    }
-
-    /// Full detection pass; returns every validated installation. A stored
-    /// override is verified by digest (never executed just to detect it);
-    /// non-override candidates keep the existing `--version` identity gate.
-    /// A configured override takes precedence and fails closed: a bad
-    /// override reports nothing for that kind instead of silently returning
-    /// a different binary as the user's choice.
-    pub async fn detect(&self) -> Vec<HarnessInstallation> {
-        let mut found = Vec::new();
-        for kind in [HarnessKind::Omp, HarnessKind::Pi] {
-            let configured = self
-                .store
-                .get_setting_checked(override_setting_key(kind))
-                .ok()
-                .flatten()
-                .filter(|s| !s.trim().is_empty());
-            if let Some(ov) = configured {
-                match verify_stored_override_file(&self.store, kind, Path::new(ov.trim())) {
-                    Ok(resolved) => {
-                        let version = self
-                            .store
-                            .get_setting_checked(override_version_key(kind))
-                            .ok()
-                            .flatten()
-                            .filter(|s| !s.is_empty())
-                            .unwrap_or_default();
-                        let inst = HarnessInstallation {
-                            kind,
-                            path: resolved.to_string_lossy().to_string(),
-                            version,
-                            source: "override".to_string(),
-                        };
-                        self.resolved.lock().insert(kind, inst.clone());
-                        found.push(inst);
-                    }
-                    Err(_) => {
-                        // Fail closed: drop any previously cached install for
-                        // this kind so a broken override is never served stale.
-                        self.resolved.lock().remove(&kind);
-                    }
-                }
-                continue;
-            }
-            for (path, source) in self.candidates(kind) {
-                if source == "override" {
-                    continue;
-                }
-                match validate_executable(&path, kind).await {
-                    Ok(version) => {
-                        let inst = HarnessInstallation {
-                            kind,
-                            path: path.to_string_lossy().to_string(),
-                            version,
-                            source,
-                        };
-                        self.resolved.lock().insert(kind, inst.clone());
-                        found.push(inst);
-                        break;
-                    }
-                    Err(_) => continue,
-                }
-            }
-        }
-        found
-    }
-
-    /// Pin a user-selected executable after validating it. The file must pass
-    /// the ownership/type gate first; validation still executes the chosen
-    /// binary once (the user explicitly picked it), and the resulting digest
-    /// plus version are stored so later detection/spawn only re-verifies the
-    /// digest without re-executing anything.
-    pub async fn set_override(
-        &self,
-        kind: HarnessKind,
-        path: &str,
-    ) -> AppResult<HarnessInstallation> {
-        let resolved = check_override_file(Path::new(path))?;
-        let version = validate_executable(&resolved, kind).await?;
-        let digest = util::file_digest(&resolved)?;
-        self.store
-            .set_setting(override_setting_key(kind), &resolved.to_string_lossy())?;
-        self.store.set_setting(override_digest_key(kind), &digest)?;
-        self.store
-            .set_setting(override_version_key(kind), &version)?;
-        let inst = HarnessInstallation {
-            kind,
-            path: resolved.to_string_lossy().to_string(),
-            version,
-            source: "override".to_string(),
-        };
-        self.resolved.lock().insert(kind, inst.clone());
-        Ok(inst)
-    }
-
-    /// Run the fixed install command, streaming output lines as
-    /// `install_progress` events and finishing with `install_finished`.
-    pub async fn install(&self, kind: HarnessKind, app: AppHandle) -> AppResult<()> {
-        let (prog, args) = install_command(kind);
-        let display = install_command_display(kind);
-        let emit = |ev: BackendEvent| {
-            let _ = app.emit("desktop-event", ev);
-        };
-        emit(BackendEvent::InstallProgress {
-            kind,
-            line: format!("$ {display}"),
-        });
-        let path_env = util::merged_path();
-        let resolved_prog =
-            util::which_in_path(prog, &path_env).unwrap_or_else(|| PathBuf::from(prog));
-        let mut child = match Command::new(&resolved_prog)
-            .args(&args)
-            .env("PATH", &path_env)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
+    pub async fn executable_path(&self, _kind: HarnessKind) -> AppResult<PathBuf> {
+        if self
+            .root
+            .join("runtime")
+            .join(INCOMPLETE_MARKER)
+            .try_exists()?
         {
-            Ok(c) => c,
-            Err(e) => {
-                let msg = format!("Could not start `{display}`. Is {prog} installed? ({e})");
-                emit(BackendEvent::InstallFinished {
-                    kind,
-                    success: false,
-                    error: Some(msg.clone()),
-                });
-                return Err(AppError::new(msg));
+            return Err(AppError::new(
+                "Private Pi installation is incomplete. Retry installation in πDesk.",
+            ));
+        }
+        validate_pi(&self.root)
+            .await
+            .map(|installation| PathBuf::from(installation.path))
+    }
+
+    /// Detection never creates directories, installs packages, or runs system Pi.
+    pub async fn detect(&self) -> Vec<HarnessInstallation> {
+        if self
+            .root
+            .join("runtime")
+            .join(INCOMPLETE_MARKER)
+            .try_exists()
+            .unwrap_or(true)
+        {
+            return Vec::new();
+        }
+        match validate_pi(&self.root).await {
+            Ok(installation) => vec![installation],
+            Err(_) => Vec::new(),
+        }
+    }
+
+    pub async fn install(&self, _kind: HarnessKind, app: AppHandle) -> AppResult<()> {
+        let emit: Emit = Arc::new(move |event| {
+            let _ = app.emit("desktop-event", event);
+        });
+        self.install_with_events(emit).await
+    }
+
+    async fn install_with_events(&self, emit: Emit) -> AppResult<()> {
+        // IPC also guards concurrent calls; keep shutdown ownership here.
+        if self.installing.swap(true, Ordering::SeqCst) {
+            return Err(AppError::new("Pi installation is already running."));
+        }
+        let _activity = InstallActivity(self);
+        let result = self.perform_install(&emit).await;
+        let error = result
+            .as_ref()
+            .err()
+            .map(|error| util::redact_secrets(&error.to_string()));
+        emit(BackendEvent::InstallFinished {
+            kind: HarnessKind::Pi,
+            success: result.is_ok(),
+            error,
+        });
+        result
+    }
+
+    async fn perform_install(&self, emit: &Emit) -> AppResult<()> {
+        emit(BackendEvent::InstallStage {
+            kind: HarnessKind::Pi,
+            stage: InstallStage::Preparing,
+        });
+        self.check_open()?;
+        if self.root.try_exists()? {
+            util::check_owned_path(&self.root, true)?;
+        }
+        // This endpoint is setup, not a live-runtime upgrade. Never replace a
+        // working installation while it may have active sessions.
+        if !self.detect().await.is_empty() {
+            emit(BackendEvent::InstallProgress {
+                kind: HarnessKind::Pi,
+                line: "Private Pi is already installed and verified.".into(),
+            });
+            return Ok(());
+        }
+        let path = util::merged_path();
+        let node = util::which_in_path("node", &path).ok_or_else(|| AppError::new("Node.js 22.19+ is required. Install Node.js, then retry here; your system Pi is not used."))?;
+        let npm = util::which_in_path("npm", &path).ok_or_else(|| {
+            AppError::new("npm is required. Install Node.js with npm, then retry.")
+        })?;
+        self.install_package(emit, &node, &npm).await
+    }
+
+    async fn install_package(&self, emit: &Emit, node: &Path, npm: &Path) -> AppResult<()> {
+        self.check_open()?;
+        let node_version = probe(&self.root, node, &["--version"]).await?;
+        self.check_open()?;
+        let version = util::parse_version(&node_version)
+            .ok_or_else(|| AppError::new("Could not determine the Node.js version."))?;
+        let parts: Vec<u64> = version
+            .split('.')
+            .take(2)
+            .filter_map(|part| part.parse().ok())
+            .collect();
+        if parts.len() != 2 || parts[0] < 22 || (parts[0] == 22 && parts[1] < 19) {
+            return Err(AppError::new(
+                "Node.js 22.19 or newer is required. Update Node.js, then retry.",
+            ));
+        }
+        emit(BackendEvent::InstallProgress {
+            kind: HarnessKind::Pi,
+            line: format!("Node.js {version} found. Preparing πDesk's private directories…"),
+        });
+        for dir in ["", "runtime", "agent", "agent/sessions", "npm-cache"] {
+            util::ensure_private_directory(&self.root, &self.root.join(dir))?;
+        }
+        // Serialize across application instances as well as the IPC guard.
+        let lock_path = self.root.join("install.lock");
+        let lock_file = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                util::check_owned_path(&lock_path, false)?;
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&lock_path)?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        lock_file.try_lock().map_err(|_| {
+            AppError::new(
+                "Another πDesk instance is installing Pi. Wait for it to finish, then check again.",
+            )
+        })?;
+        // Empty app-owned configs prevent inherited npm prefix/scripts/registry
+        // settings from changing this fixed local install.
+        for name in ["npm-user.conf", "npm-global.conf"] {
+            let config = self.root.join(name);
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&config)
+            {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    util::check_owned_path(&config, false)?;
+                    if std::fs::metadata(&config)?.len() != 0 {
+                        return Err(AppError::new("πDesk's installer npm config must be empty. Remove its custom contents before retrying."));
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let marker = self.root.join("runtime").join(INCOMPLETE_MARKER);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&marker)
+        {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                util::check_owned_path(&marker, false)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        emit(BackendEvent::InstallProgress {
+            kind: HarnessKind::Pi,
+            line: format!("$ {}", install_plan(&self.root).command),
+        });
+        emit(BackendEvent::InstallStage {
+            kind: HarnessKind::Pi,
+            stage: InstallStage::Installing,
+        });
+        self.check_open()?;
+        let mut child = command_for(&self.root, npm)
+            .args(install_args(&self.root))
+            .current_dir(self.root.join("runtime"))
+            .env("PATH", util::merged_path())
+            .env("NO_COLOR", "1")
+            .env("CI", "true")
+            .spawn()
+            .map_err(|error| AppError::new(format!("Could not start npm: {error}")))?;
+        let count = Arc::new(AtomicUsize::new(0));
+        let out_task = tokio::spawn(stream_output(
+            child.stdout.take().expect("piped stdout"),
+            emit.clone(),
+            count.clone(),
+        ));
+        let err_task = tokio::spawn(stream_output(
+            child.stderr.take().expect("piped stderr"),
+            emit.clone(),
+            count,
+        ));
+        let status = tokio::select! {
+            status = tokio::time::timeout(std::time::Duration::from_secs(INSTALL_TIMEOUT_SECS), child.wait()) => status,
+            _ = self.stop_install.notified() => {
+                stop_child(&mut child).await;
+                out_task.abort(); err_task.abort();
+                return Err(AppError::new("Installation stopped because πDesk is closing. Retry next time you open the app."));
             }
         };
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-        let mut tasks = Vec::new();
-        if let Some(stream) = stdout {
-            let app3 = app.clone();
-            tasks.push(tokio::spawn(async move {
-                let mut lines = BufReader::new(stream).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    let line = util::redact_secrets(line.trim_end());
-                    if line.is_empty() {
-                        continue;
-                    }
-                    let _ = app3.emit(
-                        "desktop-event",
-                        BackendEvent::InstallProgress { kind, line },
-                    );
-                }
-            }));
+        let Ok(status) = status else {
+            stop_child(&mut child).await;
+            out_task.abort();
+            err_task.abort();
+            return Err(AppError::new(
+                "Pi installation timed out after 10 minutes. Check your connection and retry.",
+            ));
+        };
+        let out_abort = out_task.abort_handle();
+        let err_abort = err_task.abort_handle();
+        let drained = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            (out_task.await, err_task.await)
+        })
+        .await;
+        if !matches!(drained, Ok((Ok(Ok(())), Ok(Ok(()))))) {
+            out_abort.abort();
+            err_abort.abort();
+            return Err(AppError::new(
+                "Installer output did not close cleanly. Retry installation.",
+            ));
         }
-        if let Some(stream) = stderr {
-            let app3 = app.clone();
-            tasks.push(tokio::spawn(async move {
-                let mut lines = BufReader::new(stream).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    let line = util::redact_secrets(line.trim_end());
-                    if line.is_empty() {
-                        continue;
-                    }
-                    let _ = app3.emit(
-                        "desktop-event",
-                        BackendEvent::InstallProgress { kind, line },
-                    );
-                }
-            }));
+        let status = status?;
+        if !status.success() {
+            return Err(AppError::new(format!("npm exited with code {}. Review the terminal output, fix the reported issue, and retry.", status.code().unwrap_or(-1))));
         }
-        let status = child.wait().await;
-        for t in tasks {
-            let _ = t.await;
-        }
-        match status {
-            Ok(s) if s.success() => {
-                emit(BackendEvent::InstallProgress {
-                    kind,
-                    line: "Install finished. Verifying…".to_string(),
-                });
-                // Re-detect so the new installation is registered.
-                let found = self.detect().await;
-                if let Some(inst) = found.iter().find(|i| i.kind == kind) {
-                    emit(BackendEvent::InstallProgress {
-                        kind,
-                        line: format!(
-                            "{} {} detected at {}",
-                            kind.display_name(),
-                            inst.version,
-                            inst.path
-                        ),
-                    });
-                    emit(BackendEvent::InstallFinished {
-                        kind,
-                        success: true,
-                        error: None,
-                    });
-                    Ok(())
-                } else {
-                    let msg = format!(
-                        "Install completed but {} still could not be found. You may need to restart the app or select the executable manually.",
-                        kind.display_name()
-                    );
-                    emit(BackendEvent::InstallFinished {
-                        kind,
-                        success: false,
-                        error: Some(msg.clone()),
-                    });
-                    Err(AppError::new(msg))
-                }
-            }
-            Ok(s) => {
-                let msg = format!(
-                    "`{display}` failed with exit code {}.",
-                    s.code().unwrap_or(-1)
-                );
-                emit(BackendEvent::InstallFinished {
-                    kind,
-                    success: false,
-                    error: Some(msg.clone()),
-                });
-                Err(AppError::new(msg))
-            }
-            Err(e) => {
-                let msg = format!("Install failed: {e}");
-                emit(BackendEvent::InstallFinished {
-                    kind,
-                    success: false,
-                    error: Some(msg.clone()),
-                });
-                Err(AppError::new(msg))
-            }
-        }
+        emit(BackendEvent::InstallStage {
+            kind: HarnessKind::Pi,
+            stage: InstallStage::Verifying,
+        });
+        emit(BackendEvent::InstallProgress {
+            kind: HarnessKind::Pi,
+            line: "Packages installed. Verifying the private Pi executable…".into(),
+        });
+        self.check_open()?;
+        let installation = validate_pi(&self.root).await?;
+        self.check_open()?;
+        std::fs::remove_file(marker)?;
+        emit(BackendEvent::InstallProgress {
+            kind: HarnessKind::Pi,
+            line: format!(
+                "Pi {} is ready at {}. Your existing Pi was not changed.",
+                installation.version, installation.path
+            ),
+        });
+        Ok(())
     }
 }
 
@@ -655,31 +613,208 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    #[tokio::test]
-    async fn rejects_unrelated_executable_that_prints_semver() {
-        let dir = std::env::temp_dir().join(format!("omp-harness-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let fake = dir.join("fake-agent");
-        std::fs::write(&fake, "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 1.2.3; else echo 'not a coding agent'; fi\n").unwrap();
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(validate_executable(&fake, HarnessKind::Omp).await.is_err());
-        assert!(validate_executable(&fake, HarnessKind::Pi).await.is_err());
-        std::fs::remove_dir_all(dir).unwrap();
+    fn root() -> PathBuf {
+        std::env::temp_dir().join(format!("pidesk-runtime-{}", uuid::Uuid::new_v4()))
+    }
+
+    fn fake_private_pi(root: &Path) {
+        let package = root.join("runtime/node_modules").join(PI_PACKAGE);
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::create_dir_all(root.join("runtime/node_modules/.bin")).unwrap();
+        std::fs::write(
+            package.join("package.json"),
+            format!("{{\"name\":\"{PI_PACKAGE}\"}}"),
+        )
+        .unwrap();
+        let executable = package.join("cli.js");
+        std::fs::write(&executable, "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 0.87.1; else echo 'Pi - AI coding assistant --mode --no-approve'; fi\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(&executable, executable_in(root)).unwrap();
     }
 
     #[tokio::test]
-    #[ignore = "requires both OMP and Pi installed on this machine"]
-    async fn detects_system_harnesses_without_changing_credentials() {
-        let dir = std::env::temp_dir().join(format!("omp-detect-test-{}", uuid::Uuid::new_v4()));
-        let store = Arc::new(Store::open(&crate::store::db_path(&dir)).unwrap());
-        let registry = HarnessRegistry::new(store);
-        let found = registry.detect().await;
-        assert!(found
+    async fn missing_runtime_never_falls_back_or_creates_files() {
+        let root = root();
+        let registry = HarnessRegistry::at_root(root.clone());
+        assert!(registry.detect().await.is_empty());
+        assert!(registry.executable_path(HarnessKind::Pi).await.is_err());
+        assert!(!root.exists());
+    }
+
+    #[tokio::test]
+    async fn only_complete_private_package_is_detected() {
+        let root = root();
+        fake_private_pi(&root);
+        let registry = HarnessRegistry::at_root(root.clone());
+        let installs = registry.detect().await;
+        assert_eq!(installs.len(), 1);
+        assert_eq!(installs[0].source, "managed");
+        std::fs::write(root.join("runtime").join(INCOMPLETE_MARKER), "").unwrap();
+        assert!(registry.detect().await.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn preparation_failure_emits_one_finished_event_without_running_installer() {
+        let root = root();
+        std::fs::write(&root, "not a directory").unwrap();
+        let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let emit: Emit = Arc::new(move |event| captured.lock().push(event));
+        let registry = HarnessRegistry::at_root(root.clone());
+        assert!(registry.install_with_events(emit).await.is_err());
+        let events = events.lock();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events[0],
+            BackendEvent::InstallStage {
+                stage: InstallStage::Preparing,
+                ..
+            }
+        ));
+        assert!(matches!(
+            events[1],
+            BackendEvent::InstallFinished { success: false, .. }
+        ));
+        assert_eq!(std::fs::read_to_string(&root).unwrap(), "not a directory");
+        std::fs::remove_file(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn fake_installer_streams_failure_and_verifies_success_on_retry() {
+        let root = root();
+        fake_private_pi(&root);
+        let marker = root.join("runtime").join(INCOMPLETE_MARKER);
+        std::fs::write(&marker, "").unwrap();
+        let node = root.join("fake-node");
+        let npm = root.join("fake-npm");
+        std::fs::write(&node, "#!/bin/sh\necho v22.19.0\n").unwrap();
+        std::fs::write(&npm, "#!/bin/sh\necho 'Registry unavailable' >&2\nexit 7\n").unwrap();
+        for bin in [&node, &npm] {
+            std::fs::set_permissions(bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let emit: Emit = Arc::new(move |event| captured.lock().push(event));
+        let registry = HarnessRegistry::at_root(root.clone());
+        let failure = registry
+            .install_package(&emit, &node, &npm)
+            .await
+            .unwrap_err();
+        assert!(failure.to_string().contains("code 7"));
+        assert!(marker.exists());
+        assert!(registry.detect().await.is_empty());
+        assert!(events.lock().iter().any(|event| matches!(event, BackendEvent::InstallProgress { line, .. } if line == "Registry unavailable")));
+        std::fs::write(&npm, "#!/bin/sh\nprintf '%s\\n' \"$@\" > received-args.txt\necho 'Downloaded private packages'\n").unwrap();
+        registry.install_package(&emit, &node, &npm).await.unwrap();
+        assert!(!marker.exists());
+        assert_eq!(registry.detect().await.len(), 1);
+        let args = std::fs::read_to_string(root.join("runtime/received-args.txt")).unwrap();
+        assert_eq!(
+            args.lines().collect::<Vec<_>>(),
+            install_args(&root)
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+        );
+        assert!(events.lock().iter().any(|event| matches!(
+            event,
+            BackendEvent::InstallStage {
+                stage: InstallStage::Verifying,
+                ..
+            }
+        )));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_stops_fake_installer_and_keeps_incomplete_marker() {
+        let root = root();
+        fake_private_pi(&root);
+        let node = root.join("fake-node");
+        let npm = root.join("fake-npm");
+        std::fs::write(&node, "#!/bin/sh\necho v22.19.0\n").unwrap();
+        std::fs::write(&npm, "#!/bin/sh\necho started\nexec /bin/sleep 60\n").unwrap();
+        for bin in [&node, &npm] {
+            std::fs::set_permissions(bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let started = parking_lot::Mutex::new(Some(tx));
+        let emit: Emit = Arc::new(move |event| {
+            if matches!(event, BackendEvent::InstallProgress { ref line, .. } if line == "started")
+            {
+                if let Some(tx) = started.lock().take() {
+                    let _ = tx.send(());
+                }
+            }
+        });
+        let registry = Arc::new(HarnessRegistry::at_root(root.clone()));
+        let running = registry.clone();
+        let job = tokio::spawn(async move { running.install_package(&emit, &node, &npm).await });
+        tokio::time::timeout(std::time::Duration::from_secs(10), rx)
+            .await
+            .unwrap()
+            .unwrap();
+        registry.shutdown().await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), job)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.unwrap_err().to_string().contains("closing"));
+        assert!(root.join("runtime").join(INCOMPLETE_MARKER).exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_private_bin_pointing_at_system_executable() {
+        let root = root();
+        fake_private_pi(&root);
+        std::fs::remove_file(executable_in(&root)).unwrap();
+        std::os::unix::fs::symlink("/bin/sh", executable_in(&root)).unwrap();
+        assert!(managed_executable(&root).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn installer_is_local_fixed_and_safely_displayed() {
+        let root = Path::new("/tmp/desk user's home/.pidesk");
+        let args = install_args(root);
+        assert!(!args.iter().any(|arg| arg == "-g" || arg == "--global"));
+        assert!(args.contains(&"--global=false".to_string()));
+        assert!(args.contains(&"--ignore-scripts".to_string()));
+        assert!(args.contains(&root.join("runtime").to_string_lossy().into_owned()));
+        let plan = install_plan(root);
+        assert!(plan.command.contains("'\\''"));
+        assert!(plan.login_command.starts_with("env -i "));
+        assert!(plan.login_command.contains("--session-dir"));
+    }
+
+    #[tokio::test]
+    async fn installer_logs_are_bounded_redacted_and_drained() {
+        let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let emit: Emit = Arc::new(move |event| {
+            captured.lock().push(event);
+        });
+        let input = format!(
+            "Authorization: Bearer top-secret\n{}\nlast line\n",
+            "é".repeat(MAX_LOG_LINE_BYTES)
+        );
+        stream_output(input.as_bytes(), emit, Arc::new(AtomicUsize::new(0)))
+            .await
+            .unwrap();
+        let events = events.lock();
+        assert_eq!(events.len(), 3);
+        let lines: Vec<&str> = events
             .iter()
-            .any(|install| install.kind == HarnessKind::Omp && !install.version.is_empty()));
-        assert!(found
-            .iter()
-            .any(|install| install.kind == HarnessKind::Pi && !install.version.is_empty()));
-        std::fs::remove_dir_all(dir).unwrap();
+            .filter_map(|event| match event {
+                BackendEvent::InstallProgress { line, .. } => Some(line.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(!lines[0].contains("top-secret"));
+        assert!(lines[1].len() < MAX_LOG_LINE_BYTES + 30);
+        assert!(lines[1].ends_with("[truncated]"));
+        assert_eq!(lines[2], "last line");
     }
 }

@@ -4,17 +4,17 @@ import type { RpcMessage, SessionSnapshot } from './types';
 
 const snapshot: SessionSnapshot = {
   thread: {
-    id: 'thread-1', projectId: 'project-1', harness: 'omp', sessionId: 'session-1',
+    id: 'thread-1', projectId: 'project-1', harness: 'pi', sessionId: 'session-1',
     sessionFile: '/tmp/session.jsonl', cwd: '/tmp/project', title: 'Fixture',
     pinned: false, archived: false, status: 'idle',
     createdAt: '2026-09-23T00:00:00Z', lastViewedAt: '2026-09-23T00:00:00Z'
   },
   messages: [],
   state: { sessionId: 'session-1', isStreaming: false },
-  models: [], levels: [], agents: [],
+  models: [], levels: [],
   capabilities: {
-    agents: true, nestedAgents: true, agentSteering: false, agentKill: false,
-    agentRevive: false, planMode: false, permissions: true, modelSwitching: true,
+    agents: false, nestedAgents: false, agentSteering: false, agentKill: false,
+    agentRevive: false, planMode: false, permissions: false, modelSwitching: true,
     effortLevels: true, contextUsage: true, tokenUsage: true, worktrees: true
   }
 };
@@ -23,7 +23,7 @@ function assistantTexts(model: SessionModel): string[] {
   return model.view.items.flatMap(item => item.kind === 'text' ? [item.text] : []);
 }
 
-test('OMP full message_start followed by deltas renders the answer once', () => {
+test('Pi message_start followed by deltas renders once and waits for settlement', () => {
   const model = new SessionModel(snapshot);
   const answer: RpcMessage = {
     role: 'assistant', content: [{ type: 'text', text: 'One streamed answer.' }],
@@ -35,15 +35,17 @@ test('OMP full message_start followed by deltas renders the answer once', () => 
   model.apply({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', contentIndex: 0, delta: 'One streamed answer.' } });
   expect(assistantTexts(model)).toEqual(['One streamed answer.']);
   model.apply({ type: 'message_end', message: answer });
-  model.apply({ type: 'agent_end', messages: [answer], isTerminal: true });
+  model.apply({ type: 'agent_end', messages: [answer] });
   expect(assistantTexts(model)).toEqual(['One streamed answer.']);
+  expect(model.view.status).toBe('active');
+  model.apply({ type: 'agent_settled' });
   expect(model.view.status).toBe('completed');
 });
 
-test('OMP approval select remains an explicit permission request', () => {
+test('Pi extension selects preserve their method regardless of title', () => {
   const model = new SessionModel(snapshot);
   model.apply({ type: 'extension_ui_request', id: 'approval-1', method: 'select', title: 'Allow tool: bash\nCommand: rm -rf build/', options: ['Approve', 'Deny'] });
-  expect(model.view.pendingRequests).toMatchObject([{ id: 'approval-1', method: 'permission', toolName: 'bash' }]);
+  expect(model.view.pendingRequests).toMatchObject([{ id: 'approval-1', method: 'select', options: ['Approve', 'Deny'] }]);
   expect(model.view.status).toBe('waiting');
   model.dismissRequest('approval-1');
   expect(model.view.pendingRequests).toHaveLength(0);
@@ -155,7 +157,7 @@ test('a large terminal agent-end summary does not duplicate delivered messages',
   expect(model.view.items.filter(item => item.kind === 'user')).toHaveLength(messages.length);
 });
 
-test('long sessions preserve replayed messages, tool ordering, nested agents, and status within budget', () => {
+test('long Pi sessions preserve replayed messages, tool ordering, and settled status', () => {
   const messages: RpcMessage[] = Array.from({ length: 5000 }, (_, index) => ({
     role: 'user', content: `Message ${index}`, timestamp: index + 1
   }));
@@ -170,14 +172,6 @@ test('long sessions preserve replayed messages, tool ordering, nested agents, an
       result: { content: [{ type: 'text', text: `Result ${index}` }] }
     });
   }
-  const agentIds = ['Stress-0'];
-  for (let index = 1; index < 10; index++) agentIds.push(`${agentIds.at(-1)}.Level-${index}`);
-  for (const id of agentIds) {
-    model.apply({ type: 'subagent_lifecycle', payload: { id, agent: 'task', status: 'started' } });
-  }
-  for (const id of agentIds) {
-    model.apply({ type: 'subagent_lifecycle', payload: { id, agent: 'task', status: 'completed' } });
-  }
   model.apply({ type: 'agent_settled' });
 
   const users = model.view.items.filter(item => item.kind === 'user');
@@ -190,8 +184,6 @@ test('long sessions preserve replayed messages, tool ordering, nested agents, an
     Array.from({ length: 100 }, (_, index) => `tool-${index}`)
   );
   expect(tools.every(tool => tool.kind === 'tool' && tool.status === 'completed')).toBe(true);
-  expect(model.view.agents.map(agent => agent.name)).toEqual(agentIds.map(id => id.split('.').at(-1)));
-  expect(model.view.agents.every(agent => agent.status === 'completed')).toBe(true);
   expect(model.view.status).toBe('completed');
 });
 
@@ -203,29 +195,12 @@ test('late same-id prompt failure ends the run with an actionable error', () => 
   expect(model.view.items.some(item => item.kind === 'notice' && item.text.includes('Model could not start'))).toBe(true);
 });
 
-test('nested worker progress preserves names, hierarchy, activity, and model effort', () => {
+test('Pi config events update model and thinking level', () => {
   const model = new SessionModel(snapshot);
-  model.apply({ type: 'subagent_lifecycle', payload: {
-    id: 'Backend', agent: 'task', agentSource: 'bundled', status: 'started', index: 0
-  } });
-  model.apply({ type: 'subagent_lifecycle', payload: {
-    id: 'Backend.DatabaseExpert', agent: 'scout', agentSource: 'bundled',
-    parentToolCallId: 'call-1', status: 'started', index: 0
-  } });
-  model.apply({ type: 'subagent_progress', payload: {
-    agent: 'scout', agentSource: 'bundled', parentToolCallId: 'call-1',
-    progress: { id: 'Backend.DatabaseExpert', status: 'running', lastIntent: 'Reading schema.rs',
-      resolvedModelIdentity: 'openai/gpt-small', resolvedThinkingLevel: 'high', tokens: 2048 }
-  } });
-  expect(model.view.agents.map(agent => agent.name)).toEqual(['Backend', 'DatabaseExpert']);
-  expect(model.view.agents[1]).toMatchObject({
-    parentId: 'Backend', parentToolCallId: 'call-1', role: 'scout',
-    activity: 'Reading schema.rs', model: 'openai/gpt-small', effort: 'high', tokens: 2048
-  });
-  model.apply({ type: 'subagent_lifecycle', payload: {
-    id: 'Backend.DatabaseExpert', agent: 'scout', status: 'completed', index: 0
-  } });
-  expect(model.view.agents[1].status).toBe('completed');
+  model.apply({ type: 'config_update', property: 'model', value: { provider: 'test', id: 'test-model', name: 'Test' } });
+  model.apply({ type: 'config_update', property: 'thinkingLevel', value: 'high' });
+  expect(model.view.model).toMatchObject({ provider: 'test', id: 'test-model' });
+  expect(model.view.effort).toBe('high');
 });
 
 test('live bash output is capped to a tail and still reconciles with the final message', () => {
