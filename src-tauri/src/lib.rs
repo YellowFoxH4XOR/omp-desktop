@@ -3,10 +3,12 @@ mod dto;
 mod error;
 mod git;
 mod harness;
+mod pi_settings;
 pub mod rpc;
 mod sessions;
 mod state;
 mod store;
+mod terminal;
 mod threads;
 mod util;
 mod watcher;
@@ -51,7 +53,13 @@ pub fn run() {
             commands::create_thread,
             commands::open_thread,
             commands::stop_thread,
+            commands::thread_delete_preview,
+            commands::delete_thread,
             commands::get_runtime_stats,
+            commands::get_model_defaults,
+            commands::set_default_model,
+            commands::set_default_thinking_level,
+            commands::prewarm_thread,
             commands::restart_thread,
             commands::send_prompt,
             commands::abort_thread,
@@ -63,6 +71,11 @@ pub fn run() {
             commands::rename_thread,
             commands::set_thread_flags,
             commands::respond_ui,
+            commands::terminal_open,
+            commands::terminal_write,
+            commands::terminal_ack,
+            commands::terminal_resize,
+            commands::terminal_close,
             commands::git_status,
             commands::git_file,
             commands::git_revert_file,
@@ -75,6 +88,7 @@ pub fn run() {
             if let tauri::RunEvent::Exit = event {
                 if let Some(state) = app.try_state::<state::AppState>() {
                     let threads = state.threads.clone();
+                    state.terminals.shutdown();
                     let registry = state.registry.clone();
                     let _ = tauri::async_runtime::block_on(async move {
                         registry.shutdown().await;

@@ -1,6 +1,6 @@
 use crate::dto::{
     BackendEvent, ContextUsage, HarnessCapabilities, HarnessKind, ModelInfo, SessionSnapshot,
-    SessionState, Thread, TokenCounts, Usage,
+    SessionState, Thread, ThreadDeletePreview, TokenCounts, Usage,
 };
 use crate::error::{AppError, AppResult};
 use crate::git;
@@ -12,7 +12,7 @@ use crate::util;
 use crate::watcher::WatcherManager;
 use parking_lot::Mutex;
 use serde_json::{json, Map, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -138,6 +138,48 @@ fn acquire_owner(owners: &Mutex<HashMap<String, String>>, cwd: &str, thread_id: 
     true
 }
 
+fn delete_worktree_path(row: &ThreadRow) -> AppResult<Option<PathBuf>> {
+    let Some(path) = row.worktree_path.as_deref() else {
+        return Ok(None);
+    };
+    let path = git::private_worktree_path(Path::new(path))?;
+    if path.file_name() != Some(std::ffi::OsStr::new(&row.id))
+        || git::private_worktree_path(Path::new(&row.cwd))? != path
+    {
+        return Err(AppError::new(
+            "The stored worktree does not match this thread. No files were deleted.",
+        ));
+    }
+    Ok(Some(path))
+}
+
+fn delete_session_journal(row: &ThreadRow) -> AppResult<()> {
+    delete_session_journal_at(row, &util::pidesk_root())
+}
+
+fn delete_session_journal_at(row: &ThreadRow, root: &Path) -> AppResult<()> {
+    if !row.session_file.is_empty() {
+        let path = Path::new(&row.session_file);
+        if path.exists() {
+            let validated = util::private_session_path_in(root, path, true)?;
+            std::fs::remove_file(validated)?;
+        } else {
+            util::private_session_path_in(root, path, false)?;
+        }
+    }
+    if row.worktree_path.is_some() {
+        let directory = util::session_dir_for(Path::new(&row.cwd));
+        if directory.exists() {
+            util::check_owned_path(&directory, true)?;
+            // Only remove an empty directory; never touch another journal.
+            if std::fs::read_dir(&directory)?.next().is_none() {
+                std::fs::remove_dir(directory)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn resume_arguments(session_id: &str, session_file: &str) -> AppResult<Vec<String>> {
     match (session_id, session_file) {
         ("", "") => Ok(Vec::new()),
@@ -213,6 +255,7 @@ pub struct ThreadManager {
     checkout_owners: Arc<Mutex<HashMap<String, String>>>,
     shutting_down: AtomicBool,
     live_admissions: Mutex<usize>,
+    deleting: Mutex<HashSet<String>>,
 }
 
 struct ThreadLocks {
@@ -237,6 +280,7 @@ impl ThreadManager {
             checkout_owners: Arc::new(Mutex::new(HashMap::new())),
             shutting_down: AtomicBool::new(false),
             live_admissions: Mutex::new(0),
+            deleting: Mutex::new(HashSet::new()),
         })
     }
 
@@ -427,6 +471,69 @@ impl ThreadManager {
         Ok(row.into_dto())
     }
 
+    /// Inspect without mutating; recheck dirtiness when the user confirms.
+    pub fn delete_preview(&self, thread_id: &str) -> AppResult<ThreadDeletePreview> {
+        let row = self.store.get_thread(thread_id)?;
+        let worktree = delete_worktree_path(&row)?;
+        let changed_files = if let Some(path) = &worktree {
+            if path.exists() {
+                git::worktree_changed_entries(path)?
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        let has_session = if row.session_file.is_empty() {
+            false
+        } else {
+            let path = Path::new(&row.session_file);
+            if path.exists() {
+                util::private_session_file(path)?;
+                true
+            } else {
+                util::private_session_target(path)?;
+                false
+            }
+        };
+        Ok(ThreadDeletePreview {
+            has_session,
+            worktree_path: worktree.map(|path| path.to_string_lossy().into_owned()),
+            changed_files,
+        })
+    }
+
+    /// Stop Pi before touching files; preserve the store row until every
+    /// cleanup step succeeds so a partially completed deletion is retryable.
+    pub async fn delete_thread(&self, thread_id: &str, discard_changes: bool) -> AppResult<()> {
+        self.store.get_thread(thread_id)?;
+        if !self.deleting.lock().insert(thread_id.to_string()) {
+            return Err(AppError::new("This thread is already being deleted."));
+        }
+        let result = async {
+            self.stop(thread_id).await?;
+            self.watcher.unwatch(thread_id);
+            let store = self.store.clone();
+            let id = thread_id.to_string();
+            tauri::async_runtime::spawn_blocking(move || {
+                let row = store.get_thread(&id)?;
+                let project = store.get_project(&row.project_id)?;
+                if let Some(path) = delete_worktree_path(&row)? {
+                    if path.exists() {
+                        if git::worktree_changed_entries(&path)? > 0 && !discard_changes {
+                            return Err(AppError::new("The isolated worktree has uncommitted changes. Confirm discarding them before deleting."));
+                        }
+                    }
+                    git::remove_worktree(Path::new(&project.path), &path, discard_changes)?;
+                }
+                delete_session_journal(&row)?;
+                store.delete_thread(&id)
+            }).await.map_err(|_| AppError::new("Could not finish thread deletion."))?
+        }.await;
+        self.deleting.lock().remove(thread_id);
+        result
+    }
+
     // ------------------------------------------------------------------
     // Process lifecycle
     // ------------------------------------------------------------------
@@ -449,6 +556,9 @@ impl ThreadManager {
         let _lifecycle = locks.lifecycle.lock().await;
         if self.shutting_down.load(Ordering::SeqCst) {
             return Err(AppError::new("The app is shutting down."));
+        }
+        if self.deleting.lock().contains(thread_id) {
+            return Err(AppError::new("This thread is being deleted."));
         }
         if let Some(live) = Self::take_reusable_live(&self.live, thread_id) {
             live.note_activity();
@@ -1405,6 +1515,17 @@ fn value_to_model(v: &Value) -> Option<ModelInfo> {
             .to_string(),
         context_window: v.get("contextWindow").and_then(Value::as_u64),
         reasoning: v.get("reasoning").and_then(Value::as_bool),
+        max_tokens: v.get("maxTokens").and_then(Value::as_u64),
+        images: v
+            .get("input")
+            .and_then(Value::as_array)
+            .map(|kinds| kinds.iter().any(|kind| kind.as_str() == Some("image"))),
+        cost: v.get("cost").and_then(|cost| {
+            Some(crate::dto::ModelCost {
+                input: cost.get("input").and_then(Value::as_f64)?,
+                output: cost.get("output").and_then(Value::as_f64)?,
+            })
+        }),
     })
 }
 
@@ -1465,6 +1586,44 @@ fn build_usage(stats: &Value) -> Usage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deletion_only_removes_private_journals() {
+        let root = std::env::temp_dir().join(format!("pidesk-delete-{}", uuid::Uuid::new_v4()));
+        let sessions = root.join("agent/sessions/thread");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let journal = sessions.join("session.jsonl");
+        let outside = root.join("outside.jsonl");
+        std::fs::write(&journal, "history").unwrap();
+        std::fs::write(&outside, "keep").unwrap();
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let project = store
+            .add_project("/tmp/project", "Fixture", HarnessKind::Pi, false)
+            .unwrap();
+        let row = store
+            .upsert_thread(
+                "one",
+                &project.id,
+                HarnessKind::Pi,
+                "session",
+                &journal.to_string_lossy(),
+                "/tmp/project",
+                "",
+                "idle",
+                None,
+                None,
+            )
+            .unwrap();
+        delete_session_journal_at(&row, &root).unwrap();
+        assert!(!journal.exists());
+        // Missing journals are safe to retry, but an outside mapping is not.
+        delete_session_journal_at(&row, &root).unwrap();
+        let mut forged = row;
+        forged.session_file = outside.to_string_lossy().into_owned();
+        assert!(delete_session_journal_at(&forged, &root).is_err());
+        assert!(outside.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn missing_mapped_session_fails_closed() {

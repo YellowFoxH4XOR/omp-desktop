@@ -1,6 +1,8 @@
 <script lang="ts">
   import { ArrowUp, Brain, ChevronDown, CornerDownLeft, Cpu, Square } from '@lucide/svelte';
   import type { ContextUsage, ModelInfo, ThreadStatus } from '../../types';
+  import ModelPicker from './ModelPicker.svelte';
+  import { modelKey } from './model-utils';
 
   type SendMode = 'prompt' | 'steer' | 'follow_up';
 
@@ -16,6 +18,9 @@
     onSend: (message: string, mode: SendMode) => void | Promise<void>;
     onAbort: () => void | Promise<void>;
     onSetModel?: (value: string) => void | Promise<void>;
+    /** `provider/id` of the default model for new threads. */
+    defaultModelKey?: string | null;
+    onMakeDefault?: (model: ModelInfo) => void | Promise<void>;
     onSetEffort?: (level: string) => void | Promise<void>;
   }
 
@@ -31,10 +36,13 @@
     onSend,
     onAbort,
     onSetModel,
+    defaultModelKey = null,
+    onMakeDefault,
     onSetEffort,
   }: Props = $props();
 
-  const modelValue = $derived(model ? `${model.provider}/${model.id}` : '');
+  // Session state carries a slim model; the catalogue entry has context and traits.
+  const currentModel = $derived(model ? (models.find((entry) => modelKey(entry) === modelKey(model)) ?? model) : null);
   const contextPercent = $derived(
     contextUsage?.percent != null ? Math.max(0, Math.min(100, Math.round(contextUsage.percent))) : null,
   );
@@ -209,16 +217,9 @@
     <div class="toolbar">
       <div class="left">
         {#if models.length > 0 && onSetModel}
-          <label class="pill model" title="Model">
-            <Cpu size={12} strokeWidth={2} />
-            <select value={modelValue} onchange={(e) => void onSetModel(e.currentTarget.value)} aria-label="Select model">
-              {#if !model}<option value="">Default model</option>{/if}
-              {#each models as option (option.provider + '/' + option.id)}
-                <option value={`${option.provider}/${option.id}`}>{option.name}</option>
-              {/each}
-            </select>
-            <ChevronDown size={11} strokeWidth={2} />
-          </label>
+          <div class="pill model picker-slot">
+            <ModelPicker {models} current={currentModel} defaultKey={defaultModelKey} onSelect={onSetModel} {onMakeDefault} />
+          </div>
         {:else if model}
           <span class="pill model static" title={`${model.name} · ${model.provider}`}><Cpu size={12} strokeWidth={2} />{model.name}</span>
         {/if}
@@ -447,8 +448,12 @@
     min-width: 0;
     overflow: hidden;
   }
-  .pill.model select {
-    min-width: 0;
+  .picker-slot {
+    padding: 0;
+  }
+  .picker-slot:hover,
+  .picker-slot:focus-within {
+    background: transparent;
   }
   .pill:hover:not(.static),
   .pill:focus-within {

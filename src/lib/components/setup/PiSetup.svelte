@@ -15,8 +15,9 @@
     onInstall: () => void;
     onCheck: () => void;
     onContinue: () => void;
+    onOpenTerminal: () => void;
   }
-  let { plan, status, busy, lines, error, ready, checking, onInstall, onCheck, onContinue }: Props = $props();
+  let { plan, status, busy, lines, error, ready, checking, onInstall, onCheck, onContinue, onOpenTerminal }: Props = $props();
   let output = $state<HTMLDivElement>();
   let following = $state(true);
   const steps = ['Check requirements', 'Install packages', 'Verify Pi'];
@@ -78,7 +79,7 @@
 
     {#if error}<div class="install-error" role="alert"><AlertTriangle size={16} /><div><strong>{status === 'failed' ? 'Installation didn’t finish' : 'Setup is unavailable'}</strong><p>{error}</p><small>Your existing Pi installation has not been changed.</small></div></div>{/if}
 
-    {#if status === 'complete' && plan}<PiSignIn command={plan.loginCommand} />{/if}
+    {#if status === 'complete' && plan}<PiSignIn command={plan.loginCommand} {onOpenTerminal} />{/if}
 
     <div class="actions">
       {#if status === 'complete'}

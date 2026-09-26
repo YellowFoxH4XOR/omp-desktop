@@ -1366,6 +1366,97 @@ pub fn create_worktree(repo: &Path, dest: &Path) -> AppResult<()> {
     Ok(())
 }
 
+/// Remove only a direct child of πDesk's private worktrees directory. The
+/// stored path is metadata, never permission to delete an arbitrary checkout.
+pub fn private_worktree_path(path: &Path) -> AppResult<PathBuf> {
+    util::check_owned_path(&util::pidesk_root(), true)?;
+    private_worktree_path_at(path, &util::pidesk_root().join("worktrees"))
+}
+
+fn private_worktree_path_at(path: &Path, base: &Path) -> AppResult<PathBuf> {
+    util::check_owned_path(base, true)?;
+    let base = std::fs::canonicalize(base)?;
+    let path = util::normalize_path(path);
+    let parent = path
+        .parent()
+        .ok_or_else(|| AppError::new("This worktree does not belong to πDesk."))?;
+    if std::fs::canonicalize(parent)? != base {
+        return Err(AppError::new("This worktree does not belong to πDesk."));
+    }
+    let path = base.join(
+        path.file_name()
+            .ok_or_else(|| AppError::new("This worktree does not belong to πDesk."))?,
+    );
+    if path.exists() {
+        util::check_owned_path(&path, true)?;
+        if std::fs::canonicalize(&path)? != path {
+            return Err(AppError::new("This worktree does not belong to πDesk."));
+        }
+    } else if std::fs::symlink_metadata(&path).is_ok() {
+        return Err(AppError::new("This worktree does not belong to πDesk."));
+    }
+    Ok(path)
+}
+
+/// Include ignored and non-UTF-8 entries: force-removing a worktree can
+/// discard those too, even though the normal Changes panel omits them.
+pub fn worktree_changed_entries(path: &Path) -> AppResult<usize> {
+    let porcelain = git_ok_capped(
+        path,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignored=matching",
+        ],
+        MAX_CHANGED_FILE_OUTPUT_BYTES,
+    )?;
+    let mut count = 0;
+    let mut fields = porcelain.split(|byte| *byte == 0);
+    while let Some(field) = fields.next() {
+        if field.len() < 4 {
+            continue;
+        }
+        count += 1;
+        if field[0] == b'R' || field[1] == b'R' || field[0] == b'C' || field[1] == b'C' {
+            fields.next(); // rename source, not an extra changed entry
+        }
+    }
+    Ok(count)
+}
+
+pub fn remove_worktree(repo: &Path, path: &Path, force: bool) -> AppResult<()> {
+    let path = private_worktree_path(path)?;
+    remove_worktree_checked(repo, &path, force)
+}
+
+fn remove_worktree_checked(repo: &Path, path: &Path, force: bool) -> AppResult<()> {
+    if path.exists() {
+        if !force && worktree_changed_entries(path)? > 0 {
+            return Err(AppError::new("The isolated worktree has changes. Confirm discarding them before deleting this thread."));
+        }
+        let mut command = git_command(repo);
+        command.args(["worktree", "remove"]);
+        if force {
+            command.arg("--force");
+        }
+        let output = command
+            .arg(path)
+            .stdin(std::process::Stdio::null())
+            .output()?;
+        if !output.status.success() {
+            return Err(AppError::new(if force {
+                "Could not remove the isolated worktree. Check for locked or nested worktrees and try again."
+            } else {
+                "The isolated worktree has changes. Confirm discarding them before deleting this thread."
+            }));
+        }
+    }
+    git_ok(repo, &["worktree", "prune"])?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1631,6 +1722,51 @@ mod tests {
         revert_file(&dir, "example.txt", Some(&fresh.current_hash)).unwrap();
         assert_eq!(std::fs::read_to_string(path).unwrap(), "alpha\nbeta\n");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn private_worktree_removal_refuses_dirty_and_outside_paths() {
+        let root =
+            std::env::temp_dir().join(format!("pidesk-remove-worktree-{}", uuid::Uuid::new_v4()));
+        let source = root.join("source");
+        let base = root.join("worktrees");
+        let dest = base.join("isolated");
+        std::fs::create_dir_all(&source).unwrap();
+        assert!(git(&source, &["init", "-q"]).unwrap().status.success());
+        std::fs::write(source.join("file.txt"), "base\n").unwrap();
+        git_ok(&source, &["add", "."]).unwrap();
+        assert!(git(
+            &source,
+            &[
+                "-c",
+                "user.name=QA",
+                "-c",
+                "user.email=qa@localhost",
+                "commit",
+                "-qm",
+                "Base"
+            ]
+        )
+        .unwrap()
+        .status
+        .success());
+        create_worktree(&source, &dest).unwrap();
+        assert!(private_worktree_path_at(&source, &base).is_err());
+        std::fs::write(dest.join("file.txt"), "modified\n").unwrap();
+        let checked = private_worktree_path_at(&dest, &base).unwrap();
+        assert_eq!(worktree_changed_entries(&dest).unwrap(), 1);
+        assert!(remove_worktree_checked(&source, &checked, false).is_err());
+        assert!(dest.exists());
+        remove_worktree_checked(&source, &checked, true).unwrap();
+        assert!(!dest.exists());
+        std::fs::write(source.join(".git/info/exclude"), "ignored.txt\n").unwrap();
+        create_worktree(&source, &dest).unwrap();
+        std::fs::write(dest.join("ignored.txt"), "private data\n").unwrap();
+        assert!(status(&dest).unwrap().files.is_empty());
+        assert_eq!(worktree_changed_entries(&dest).unwrap(), 1);
+        assert!(remove_worktree_checked(&source, &checked, false).is_err());
+        remove_worktree_checked(&source, &checked, true).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

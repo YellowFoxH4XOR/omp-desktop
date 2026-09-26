@@ -319,6 +319,14 @@ impl Store {
         self.get_thread(id)
     }
 
+    pub fn delete_thread(&self, id: &str) -> AppResult<()> {
+        let conn = self.conn.lock();
+        if conn.execute("DELETE FROM threads WHERE id = ?1", params![id])? == 0 {
+            return Err(AppError::new("Thread not found. It may have been removed."));
+        }
+        Ok(())
+    }
+
     pub fn update_thread_status(&self, id: &str, status: &str) -> AppResult<()> {
         let conn = self.conn.lock();
         conn.execute(
@@ -453,6 +461,35 @@ mod tests {
         }
         assert_eq!(std::fs::read_to_string(source).unwrap(), "keep me");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn delete_thread_removes_only_its_metadata() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let project = store
+            .add_project("/tmp/project", "Fixture", HarnessKind::Pi, false)
+            .unwrap();
+        for id in ["one", "two"] {
+            store
+                .upsert_thread(
+                    id,
+                    &project.id,
+                    HarnessKind::Pi,
+                    "",
+                    "",
+                    "/tmp/project",
+                    id,
+                    "idle",
+                    None,
+                    None,
+                )
+                .unwrap();
+        }
+        store.delete_thread("one").unwrap();
+        assert!(store.get_thread("one").is_err());
+        assert_eq!(store.get_thread("two").unwrap().title, "two");
+        assert!(store.get_project(&project.id).is_ok());
+        assert!(store.delete_thread("one").is_err());
     }
 
     #[test]

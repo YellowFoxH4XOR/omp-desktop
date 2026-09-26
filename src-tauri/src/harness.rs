@@ -25,7 +25,7 @@ fn executable_in(root: &Path) -> PathBuf {
     root.join("runtime/node_modules/.bin/pi")
 }
 
-fn shell_quote(value: &str) -> String {
+pub(crate) fn shell_quote(value: &str) -> String {
     if !value.is_empty()
         && value
             .chars()
@@ -61,22 +61,29 @@ fn install_args(root: &Path) -> Vec<String> {
     ]
 }
 
+/// Shell-safe, credential-free invocation shared by Settings and the PTY's
+/// `pi` function. Only πDesk's private executable and profile reach Pi.
+pub(crate) fn private_pi_invocation(root: &Path) -> String {
+    let agent = shell_quote(&root.join("agent").to_string_lossy());
+    let sessions = shell_quote(&root.join("agent/sessions").to_string_lossy());
+    let bin = shell_quote(&root.join("runtime/node_modules/.bin").to_string_lossy());
+    let executable = shell_quote(&executable_in(root).to_string_lossy());
+    let home = shell_quote(&util::home_dir().to_string_lossy());
+    format!("/usr/bin/env -i HOME={home} USER=\"${{USER:-}}\" PATH={bin}:\"$PATH\" TERM=\"${{TERM:-xterm-256color}}\" PI_CODING_AGENT_DIR={agent} PI_CODING_AGENT_SESSION_DIR={sessions} PI_SKIP_VERSION_CHECK=1 PI_TELEMETRY=0 {executable} --no-approve --session-dir {sessions}")
+}
+
 fn install_plan(root: &Path) -> HarnessInstallCommand {
     let command = std::iter::once("npm".to_string())
         .chain(install_args(root).iter().map(|arg| shell_quote(arg)))
         .collect::<Vec<_>>()
         .join(" ");
-    let agent = shell_quote(&root.join("agent").to_string_lossy());
-    let sessions = shell_quote(&root.join("agent/sessions").to_string_lossy());
-    let bin = shell_quote(&root.join("runtime/node_modules/.bin").to_string_lossy());
-    let executable = shell_quote(&executable_in(root).to_string_lossy());
     HarnessInstallCommand {
         kind: HarnessKind::Pi,
         command,
         install_path: root.join("runtime").to_string_lossy().into_owned(),
         agent_dir: root.join("agent").to_string_lossy().into_owned(),
         // Copyable, credential-free display; don't embed proxy values or keys.
-        login_command: format!("env -i HOME=\"$HOME\" USER=\"$USER\" PATH={bin}:\"$PATH\" TERM=\"${{TERM:-xterm-256color}}\" PI_CODING_AGENT_DIR={agent} PI_CODING_AGENT_SESSION_DIR={sessions} PI_SKIP_VERSION_CHECK=1 PI_TELEMETRY=0 {executable} --no-approve --session-dir {sessions}"),
+        login_command: private_pi_invocation(root),
     }
 }
 
@@ -217,6 +224,34 @@ async fn probe(root: &Path, executable: &Path, args: &[&str]) -> AppResult<Strin
     ))
 }
 
+/// Identity of a validated install. Launching Pi to re-check `--version` and
+/// `--help` costs two Node startups (~500 ms), so the result is reused until
+/// the executable or package manifest changes on disk.
+#[derive(Debug, Clone, PartialEq)]
+struct InstallFingerprint {
+    executable: PathBuf,
+    executable_len: u64,
+    executable_modified: Option<std::time::SystemTime>,
+    manifest_len: u64,
+    manifest_modified: Option<std::time::SystemTime>,
+}
+
+fn fingerprint(root: &Path, executable: &Path) -> AppResult<InstallFingerprint> {
+    let exe = std::fs::metadata(executable)?;
+    let manifest = std::fs::metadata(
+        root.join("runtime/node_modules")
+            .join(PI_PACKAGE)
+            .join("package.json"),
+    )?;
+    Ok(InstallFingerprint {
+        executable: executable.to_path_buf(),
+        executable_len: exe.len(),
+        executable_modified: exe.modified().ok(),
+        manifest_len: manifest.len(),
+        manifest_modified: manifest.modified().ok(),
+    })
+}
+
 async fn validate_pi(root: &Path) -> AppResult<HarnessInstallation> {
     let executable = managed_executable(root)?;
     let version_text = probe(root, &executable, &["--version"]).await?;
@@ -312,6 +347,7 @@ async fn stream_output(
 
 pub struct HarnessRegistry {
     root: PathBuf,
+    validated: parking_lot::Mutex<Option<(InstallFingerprint, HarnessInstallation)>>,
     closing: AtomicBool,
     installing: AtomicBool,
     stop_install: tokio::sync::Notify,
@@ -334,6 +370,7 @@ impl HarnessRegistry {
     fn at_root(root: PathBuf) -> Self {
         Self {
             root,
+            validated: parking_lot::Mutex::new(None),
             closing: AtomicBool::new(false),
             installing: AtomicBool::new(false),
             stop_install: tokio::sync::Notify::new(),
@@ -373,9 +410,25 @@ impl HarnessRegistry {
                 "Private Pi installation is incomplete. Retry installation in πDesk.",
             ));
         }
-        validate_pi(&self.root)
+        self.validated_installation()
             .await
             .map(|installation| PathBuf::from(installation.path))
+    }
+
+    /// Ownership and symlink checks always run (they are filesystem-only);
+    /// the Node probes run only when the install changed since last success.
+    async fn validated_installation(&self) -> AppResult<HarnessInstallation> {
+        let executable = managed_executable(&self.root)?;
+        let current = fingerprint(&self.root, &executable)?;
+        if let Some((cached, installation)) = self.validated.lock().as_ref() {
+            if *cached == current {
+                return Ok(installation.clone());
+            }
+        }
+        let installation = validate_pi(&self.root).await?;
+        let verified = fingerprint(&self.root, &managed_executable(&self.root)?)?;
+        *self.validated.lock() = Some((verified, installation.clone()));
+        Ok(installation)
     }
 
     /// Detection never creates directories, installs packages, or runs system Pi.
@@ -389,9 +442,12 @@ impl HarnessRegistry {
         {
             return Vec::new();
         }
-        match validate_pi(&self.root).await {
+        match self.validated_installation().await {
             Ok(installation) => vec![installation],
-            Err(_) => Vec::new(),
+            Err(_) => {
+                *self.validated.lock() = None;
+                Vec::new()
+            }
         }
     }
 
@@ -594,7 +650,8 @@ impl HarnessRegistry {
             line: "Packages installed. Verifying the private Pi executable…".into(),
         });
         self.check_open()?;
-        let installation = validate_pi(&self.root).await?;
+        *self.validated.lock() = None;
+        let installation = self.validated_installation().await?;
         self.check_open()?;
         std::fs::remove_file(marker)?;
         emit(BackendEvent::InstallProgress {
@@ -639,6 +696,42 @@ mod tests {
         assert!(registry.detect().await.is_empty());
         assert!(registry.executable_path(HarnessKind::Pi).await.is_err());
         assert!(!root.exists());
+    }
+
+    #[tokio::test]
+    async fn validation_probes_run_once_until_the_install_changes() {
+        let root = root();
+        fake_private_pi(&root);
+        let executable = root
+            .join("runtime/node_modules")
+            .join(PI_PACKAGE)
+            .join("cli.js");
+        let log = root.join("probes.log");
+        let script = |extra: &str| {
+            format!(
+                "#!/bin/sh\necho run >> '{}'\nif [ \"$1\" = \"--version\" ]; then echo 0.87.1; else echo 'Pi - AI coding assistant --mode --no-approve'; fi\n{extra}",
+                log.display()
+            )
+        };
+        std::fs::write(&executable, script("")).unwrap();
+        let probes = || {
+            std::fs::read_to_string(&log)
+                .map(|s| s.lines().count())
+                .unwrap_or(0)
+        };
+        let registry = HarnessRegistry::at_root(root.clone());
+
+        registry.executable_path(HarnessKind::Pi).await.unwrap();
+        assert_eq!(probes(), 2, "first use runs --version and --help");
+        registry.executable_path(HarnessKind::Pi).await.unwrap();
+        assert_eq!(registry.detect().await.len(), 1);
+        assert_eq!(probes(), 2, "unchanged install is not re-probed");
+
+        // A changed executable (new size) must be validated again.
+        std::fs::write(&executable, script("# updated\n")).unwrap();
+        registry.executable_path(HarnessKind::Pi).await.unwrap();
+        assert_eq!(probes(), 4);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -785,7 +878,7 @@ mod tests {
         assert!(args.contains(&root.join("runtime").to_string_lossy().into_owned()));
         let plan = install_plan(root);
         assert!(plan.command.contains("'\\''"));
-        assert!(plan.login_command.starts_with("env -i "));
+        assert!(plan.login_command.starts_with("/usr/bin/env -i "));
         assert!(plan.login_command.contains("--session-dir"));
     }
 

@@ -42,12 +42,27 @@ export interface Thread {
   lastViewedAt: string;
   worktreePath?: string;
 }
+export interface ThreadDeletePreview {
+  hasSession: boolean;
+  worktreePath?: string;
+  changedFiles: number;
+}
 export interface ModelInfo {
   provider: string;
   id: string;
   name: string;
   contextWindow?: number;
   reasoning?: boolean;
+  maxTokens?: number;
+  /** Accepts image input. */
+  images?: boolean;
+  /** USD per million tokens. */
+  cost?: { input: number; output: number };
+}
+export interface ModelDefaults {
+  provider?: string | null;
+  modelId?: string | null;
+  thinkingLevel?: string | null;
 }
 export interface ContextUsage { tokens: number | null; contextWindow: number; percent: number | null }
 export interface Usage {
