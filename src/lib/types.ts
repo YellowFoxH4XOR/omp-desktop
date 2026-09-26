@@ -41,7 +41,10 @@ export interface Thread {
   createdAt: string;
   lastViewedAt: string;
   worktreePath?: string;
+  /** Plan is read-only until the user approves a plan; Auto has full tools. */
+  mode: ThreadMode;
 }
+export type ThreadMode = 'plan' | 'auto';
 export interface ThreadDeletePreview {
   hasSession: boolean;
   worktreePath?: string;
@@ -102,6 +105,8 @@ export interface SessionSnapshot {
   models: ModelInfo[];
   levels: string[];
   capabilities: HarnessCapabilities;
+  /** Pi's runnable `/` commands (extensions, skills, prompt templates). */
+  commands?: Array<{ name: string; description?: string; source: 'extension' | 'skill' | 'prompt' }>;
 }
 export interface ToolResult { content?: RpcContent[]; details?: unknown; isError?: boolean }
 export type ConversationItem =
@@ -139,7 +144,7 @@ export interface SessionView {
   sessionFile?: string;
   models: ModelInfo[];
   levels: string[];
-  commands: Array<{ name: string; description?: string }>;
+  commands: Array<{ name: string; description?: string; source?: 'extension' | 'skill' | 'prompt' }>;
 }
 export interface ChangedFile {
   path: string;
@@ -163,7 +168,19 @@ export interface GitFile {
   binary: boolean;
   tooLarge: boolean;
 }
+export interface InternImage { data: string; mimeType: string }
+export interface InternPlan {
+  id: string;
+  threadId: string;
+  threadTitle: string;
+  projectPath: string | null;
+  summary: string;
+  actions: Array<Record<string, unknown>>;
+  details: Array<Record<string, unknown>>;
+  executing: boolean;
+}
 export type BackendEvent =
+  | { type: 'intern_changed' }
   | { type: 'rpc'; threadId: string; frame: Record<string, unknown> }
   | { type: 'exited'; threadId: string; code?: number; stderr: string; expected: boolean }
   | { type: 'git_changed'; threadId: string }
@@ -183,4 +200,58 @@ export interface ThreadRuntime {
 export interface RuntimeStats {
   appBytes?: number | null;
   threads: ThreadRuntime[];
+}
+export type PackageKind = 'extension' | 'skill' | 'theme' | 'prompt';
+export interface CatalogPackage {
+  name: string;
+  description: string;
+  author: string;
+  downloadsLabel: string;
+  downloads: number;
+  publishedMs: number;
+  types: PackageKind[];
+  /** Source for `pi install`, e.g. `npm:pi-mcp-adapter`. */
+  source: string;
+}
+export interface CatalogPage {
+  packages: CatalogPackage[];
+  page: number;
+  hasMore: boolean;
+}
+export interface InstalledPackage {
+  source: string;
+  name: string;
+  kind: 'npm' | 'git' | 'local';
+  version?: string;
+  pinned?: string;
+  description?: string;
+  latest?: string;
+  updateAvailable: boolean;
+}
+export interface McpServer {
+  name: string;
+  transport: 'stdio' | 'http' | 'socket' | 'unknown';
+  target: string;
+  disabled: boolean;
+  auth?: string;
+  lifecycle?: string;
+  hasSecrets: boolean;
+  /** Full entry (private servers only). */
+  config?: Record<string, unknown>;
+}
+export interface McpImportSource {
+  id: string;
+  path: string;
+  servers: McpServer[];
+}
+export interface McpOverview {
+  adapterInstalled: boolean;
+  adapterVersion?: string;
+  path: string;
+  servers: McpServer[];
+  approveTools: 'off' | 'all' | 'custom';
+  raw: string;
+  hasComments: boolean;
+  error?: string;
+  importSources: McpImportSource[];
 }

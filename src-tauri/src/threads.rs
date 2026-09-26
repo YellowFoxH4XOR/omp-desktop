@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::process::Command;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 
@@ -41,6 +41,7 @@ pub struct LiveThread {
     /// Monotonic identity for this process incarnation. Event callbacks carry
     /// the generation they were created for and ignore later incarnations.
     generation: u64,
+    directory: Option<Arc<std::fs::File>>,
     last_activity: Mutex<Instant>,
     streaming: AtomicBool,
     failed: AtomicBool,
@@ -217,7 +218,45 @@ fn resume_arguments(session_id: &str, session_file: &str) -> AppResult<Vec<Strin
 /// than written to `APPEND_SYSTEM.md`, which stays free for the user's own text.
 const RENDERING_GUIDE: &str = "You are running inside πDesk, a desktop app that renders your replies as GitHub-flavored Markdown. \
 When a diagram would help (architecture, flows, sequences, state machines, ER models), write it as a fenced ```mermaid code block; πDesk renders Mermaid as a real diagram. \
-Prefer Mermaid over ASCII or box-drawing art, keep node labels short, and use plain code fences only for actual code or terminal output.";
+Prefer Mermaid over ASCII or box-drawing art, keep node labels short, and use plain code fences only for actual code or terminal output. \
+When the user writes @path (for example @src/app.ts or @docs/), it names that file or folder relative to your working directory; read it before answering about it.";
+
+/// Threads run on πDesk's private Pi, but their shell sees the user's real
+/// home, where other tools (the terminal Pi, shared MCP files) keep their own
+/// config and credentials. Point the agent at its own profile instead.
+const PROFILE_GUIDE: &str = "You run on πDesk's own private Pi profile, not the user's terminal Pi. Your Pi settings, installed extensions, MCP server config (mcp.json), and sessions live in $PI_CODING_AGENT_DIR (~/.pidesk/agent); extensions keep their files under ~/.pidesk/home. To see which MCP servers you have, use the mcp tool (for example mcp({}) or mcp({ search: \"…\" })), not config files. ~/.pi, ~/.config/mcp, ~/.agents, and other apps' config directories belong to the user's other tools and may hold credentials: do not go looking in them. Questions about your MCP servers, extensions, or settings are about your own profile. If the user explicitly asks about another tool's files, πDesk will ask them to allow the read first.";
+
+/// Plan/Auto modes, loaded into every Pi πDesk starts. The file is rewritten
+/// atomically on each spawn so it always matches this build.
+const MODES_EXTENSION: &str = include_str!("pidesk-modes.mjs");
+const MODES_COMMAND: &str = "pidesk-mode";
+
+/// Write the bundled modes extension (also the agent shell's real-home hook)
+/// where every πDesk-launched Pi, including the terminal's, loads it.
+pub(crate) fn write_modes_extension(root: &Path) -> AppResult<PathBuf> {
+    let directory = root.join("extensions");
+    util::ensure_private_directory(root, &directory)?;
+    let extension = directory.join("pidesk-modes.mjs");
+    let temp = directory.join(format!("pidesk-modes-{}.tmp", uuid::Uuid::new_v4()));
+    std::fs::write(&temp, MODES_EXTENSION)?;
+    std::fs::rename(temp, &extension)?;
+    Ok(extension)
+}
+
+fn modes_arguments(root: &Path, plan: bool, locked: bool) -> AppResult<Vec<String>> {
+    let extension = write_modes_extension(root)?;
+    let mut args = vec![
+        "--extension".to_string(),
+        extension.to_string_lossy().into_owned(),
+    ];
+    if plan || locked {
+        args.push("--pidesk-plan".into());
+    }
+    if locked {
+        args.push("--pidesk-plan-locked".into());
+    }
+    Ok(args)
+}
 
 fn spawn_arguments(session_dir: &Path) -> Vec<String> {
     // sessionDir is read before project trust, so --no-approve alone does
@@ -230,7 +269,50 @@ fn spawn_arguments(session_dir: &Path) -> Vec<String> {
         session_dir.to_string_lossy().into_owned(),
         "--append-system-prompt".into(),
         RENDERING_GUIDE.into(),
+        "--append-system-prompt".into(),
+        PROFILE_GUIDE.into(),
     ]
+}
+
+/// Pi's `get_commands` reply as bounded, display-safe entries. πDesk's own
+/// host controls (`pidesk-*`) are not user commands.
+fn commands_from(value: &Value) -> Vec<crate::dto::CommandInfo> {
+    const MAX_COMMANDS: usize = 300;
+    let clip = |text: &str, max: usize| text.chars().take(max).collect::<String>();
+    value
+        .get("commands")
+        .and_then(Value::as_array)
+        .map(|commands| {
+            commands
+                .iter()
+                .filter_map(|command| {
+                    let name = command.get("name")?.as_str()?.trim();
+                    if name.is_empty()
+                        || name.len() > 120
+                        || name.starts_with("pidesk-")
+                        || name.chars().any(char::is_whitespace)
+                    {
+                        return None;
+                    }
+                    Some(crate::dto::CommandInfo {
+                        name: name.to_string(),
+                        description: command
+                            .get("description")
+                            .and_then(Value::as_str)
+                            .map(|text| clip(text.trim(), 200))
+                            .filter(|text| !text.is_empty()),
+                        source: command
+                            .get("source")
+                            .and_then(Value::as_str)
+                            .filter(|source| matches!(*source, "extension" | "skill" | "prompt"))
+                            .unwrap_or("extension")
+                            .to_string(),
+                    })
+                })
+                .take(MAX_COMMANDS)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Pi accepts letters, digits, `.`, `_`, and `-`; a leading alphanumeric keeps
@@ -420,6 +502,29 @@ impl ThreadManager {
         harness: HarnessKind,
         isolated: bool,
     ) -> AppResult<Thread> {
+        self.create_thread_with_guard(project_id, harness, isolated, false, None)
+    }
+
+    /// An ordinary project thread started from an approved Intern plan. It
+    /// has full Pi like any user thread and, like them, its own worktree in a
+    /// Git project; the approved directory identity binds that worktree to
+    /// the project Intern validated.
+    pub fn create_intern_thread(
+        &self,
+        project_id: &str,
+        directory: &crate::intern_files::BoundDirectory,
+    ) -> AppResult<Thread> {
+        self.create_thread_with_guard(project_id, HarnessKind::Pi, true, false, Some(directory))
+    }
+
+    fn create_thread_with_guard(
+        &self,
+        project_id: &str,
+        harness: HarnessKind,
+        isolated: bool,
+        guarded: bool,
+        directory: Option<&crate::intern_files::BoundDirectory>,
+    ) -> AppResult<Thread> {
         let project = self.store.get_project(project_id)?;
         let project_path = PathBuf::from(&project.path);
         let existing = self.store.list_threads(project_id)?;
@@ -436,37 +541,39 @@ impl ThreadManager {
         let owners = self.checkout_owners.lock();
         let peer = live_peer || owners.contains_key(&checkout_key);
         let git_repo = (isolated || peer) && git::is_repo(&project_path);
-        if peer && !git_repo {
-            return Err(AppError::new(
-                "Another thread is working in this directory. Wait for it to finish; concurrent threads need a Git worktree for isolation.",
-            ));
+        // A worktree needs a commit to start from; a brand-new repository
+        // shares its folder until the first commit.
+        let can_isolate = git_repo && git::has_commits(&project_path);
+        if peer && !can_isolate {
+            return Err(AppError::new(if git_repo {
+                "Another thread is working in this folder, and a separate worktree needs at least one commit. Commit once, or wait for that thread to finish."
+            } else {
+                "Another thread is working in this directory. Wait for it to finish; concurrent threads need a Git worktree for isolation."
+            }));
         }
-        let isolated = isolated || (peer && git_repo);
+        // New threads in a Git project get their own worktree; elsewhere
+        // they work in the project folder.
+        let isolated = (isolated || peer) && can_isolate;
         let id = uuid::Uuid::new_v4().to_string();
         let mut cwd = project_path.clone();
         let mut worktree_path = None;
         if isolated {
-            if !git_repo {
-                return Err(AppError::new(
-                    "Isolated threads need a Git repository; this project is not one.",
-                ));
-            }
             let dest = util::home_dir().join(".pidesk").join("worktrees").join(&id);
-            git::create_worktree(&project_path, &dest)?;
+            if let Some(directory) = directory {
+                git::create_worktree_bound(directory, &dest)?;
+            } else {
+                git::create_worktree(&project_path, &dest)?;
+            }
             cwd = dest;
             worktree_path = Some(cwd.to_string_lossy().to_string());
         }
-        let row = self.store.upsert_thread(
+        let row = self.store.create_thread_metadata(
             &id,
             project_id,
             harness,
-            "",
-            "",
             &cwd.to_string_lossy(),
-            "",
-            "idle",
             worktree_path.as_deref(),
-            None,
+            guarded,
         )?;
         Ok(row.into_dto())
     }
@@ -541,6 +648,14 @@ impl ThreadManager {
     /// Spawn (or resume) the harness process for a thread. Returns the live
     /// handle. Idempotent: returns the existing process when still running.
     pub async fn ensure_running(&self, thread_id: &str) -> AppResult<Arc<LiveThread>> {
+        self.ensure_running_at(thread_id, None).await
+    }
+
+    async fn ensure_running_at(
+        &self,
+        thread_id: &str,
+        directory: Option<&crate::intern_files::BoundDirectory>,
+    ) -> AppResult<Arc<LiveThread>> {
         // Validate before inserting so repeated calls with unknown ids can
         // never grow the map; every clone happens under the map lock so an
         // uncontended entry can be reaped safely. Register the lifecycle
@@ -558,14 +673,38 @@ impl ThreadManager {
             return Err(AppError::new("The app is shutting down."));
         }
         if self.deleting.lock().contains(thread_id) {
-            return Err(AppError::new("This thread is being deleted."));
+            return Err(AppError::new(
+                "This thread is being deleted or switched to guarded mode.",
+            ));
+        }
+        if self.store.is_intern_thread(thread_id)?
+            && self
+                .app
+                .try_state::<crate::state::AppState>()
+                .is_some_and(|state| state.intern.stopping.load(Ordering::SeqCst))
+        {
+            return Err(AppError::new(
+                "Pi Intern is stopping. Reopen it when Stop finishes.",
+            ));
+        }
+        if let Some(directory) = directory {
+            directory.verify()?;
         }
         if let Some(live) = Self::take_reusable_live(&self.live, thread_id) {
+            if let Some(directory) = directory {
+                if !live
+                    .directory
+                    .as_ref()
+                    .is_some_and(|file| directory.same_directory(file).unwrap_or(false))
+                {
+                    return Err(AppError::new("The running thread is not in the approved directory. Stop it and request a new plan."));
+                }
+            }
             live.note_activity();
             return Ok(live);
         }
         self.admit_live(thread_id)?;
-        let result = self.spawn(thread_id).await;
+        let result = self.spawn(thread_id, directory).await;
         self.finish_live_admission();
         result
     }
@@ -604,7 +743,11 @@ impl ThreadManager {
         Some(process)
     }
 
-    async fn spawn(&self, thread_id: &str) -> AppResult<Arc<LiveThread>> {
+    async fn spawn(
+        &self,
+        thread_id: &str,
+        approved_directory: Option<&crate::intern_files::BoundDirectory>,
+    ) -> AppResult<Arc<LiveThread>> {
         let row = self.store.get_thread(thread_id)?;
         let kind = row.harness;
         let cwd = PathBuf::from(&row.cwd);
@@ -619,14 +762,29 @@ impl ThreadManager {
         let session_dir = util::session_dir_for(&cwd);
         util::ensure_private_directory(&root, &session_dir)?;
         let mut args = spawn_arguments(&session_dir);
+        let guarded = self.store.is_intern_thread(thread_id)?;
+        if guarded {
+            args.extend(crate::intern::spawn_args(&root)?);
+        }
+        // Pi Intern is always in Plan mode; it reaches Auto only through the
+        // user's approval card, for one run.
+        args.extend(modes_arguments(&root, row.mode == "plan", guarded)?);
         args.extend(resume_arguments(&row.session_id, &row.session_file)?);
+        util::prepare_private_home(&root)?;
         let mut command = Command::new(&exe);
         util::configure_private_command(&mut command, &root);
+        let captured_directory = crate::intern_files::BoundDirectory::capture(&cwd)?;
+        let directory = approved_directory.unwrap_or(&captured_directory);
+        if directory.path() != util::resolve_path(&cwd) {
+            return Err(AppError::new(
+                "The thread's approved directory mapping changed.",
+            ));
+        }
+        let directory_file = Arc::new(directory.configure_command(command.as_std_mut())?);
         #[cfg(unix)]
         command.process_group(0);
         let mut child = command
             .args(&args)
-            .current_dir(&cwd)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -673,6 +831,26 @@ impl ThreadManager {
                 else {
                     return;
                 };
+                if guarded
+                    && ftype == "extension_ui_request"
+                    && frame.get("method").and_then(Value::as_str) == Some("input")
+                    && frame.get("title").and_then(Value::as_str)
+                        == Some(crate::intern::BRIDGE_TITLE)
+                {
+                    if let (Some(id), Some(raw)) = (
+                        frame.get("id").and_then(Value::as_str),
+                        frame.get("placeholder").and_then(Value::as_str),
+                    ) {
+                        crate::intern::route(
+                            app_ev.clone(),
+                            tid_ev.clone(),
+                            id.to_string(),
+                            l.client.clone(),
+                            raw.to_string(),
+                        );
+                    }
+                    return; // Internal capability request, never a user input dialog.
+                }
                 // A stop/restart on another thread can replace the live process
                 // between any two statements below. Re-check that this frame's
                 // generation is still live immediately before every shared side
@@ -699,6 +877,12 @@ impl ThreadManager {
                         }
                     }
                     "agent_settled" => {
+                        if guarded {
+                            if let Some(state) = app_ev.try_state::<crate::state::AppState>() {
+                                state.intern.cancel_thread(&tid_ev);
+                                crate::intern::changed(&app_ev);
+                            }
+                        }
                         l.streaming.store(false, Ordering::SeqCst);
                         let status = if l.failed.load(Ordering::SeqCst) {
                             "failed"
@@ -735,6 +919,12 @@ impl ThreadManager {
                             }
                         }
                         if method == "cancel" {
+                            if guarded {
+                                if let Some(state) = app_ev.try_state::<crate::state::AppState>() {
+                                    state.intern.cancel_thread(&tid_ev);
+                                    crate::intern::changed(&app_ev);
+                                }
+                            }
                             let target = frame
                                 .get("targetId")
                                 .and_then(Value::as_str)
@@ -798,6 +988,12 @@ impl ThreadManager {
                 }
                 drop(map);
                 watcher.unwatch(&tid_exit);
+                if let Some(state) = app.try_state::<crate::state::AppState>() {
+                    state.intern.cancel_thread(&tid_exit);
+                    if guarded {
+                        crate::intern::changed(&app);
+                    }
+                }
                 release_owner(&checkout_owners_exit, &cwd_exit, &tid_exit);
                 let status = if expected { "idle" } else { "disconnected" };
                 let _ = store.update_thread_status(&tid_exit, status);
@@ -822,6 +1018,7 @@ impl ThreadManager {
         let live = Arc::new(LiveThread {
             client: client.clone(),
             generation,
+            directory: Some(directory_file),
             last_activity: Mutex::new(Instant::now()),
             streaming: AtomicBool::new(false),
             failed: AtomicBool::new(false),
@@ -864,6 +1061,34 @@ impl ThreadManager {
                 )));
             }
         }
+        // Fail closed: a Plan-mode (or Intern) Pi without its guard would
+        // silently have full tools.
+        let commands = client.call("get_commands", Map::new()).await;
+        let has_command = |name: &str| {
+            commands
+                .as_ref()
+                .ok()
+                .and_then(|value| value.get("commands"))
+                .and_then(Value::as_array)
+                .is_some_and(|commands| {
+                    commands
+                        .iter()
+                        .any(|command| command.get("name").and_then(Value::as_str) == Some(name))
+                })
+        };
+        let missing = if guarded && !has_command("pidesk-intern-health") {
+            Some("Pi Intern's approval guard could not load. No work was started.")
+        } else if !has_command(MODES_COMMAND) {
+            Some("πDesk's Plan/Auto mode extension could not load. No work was started.")
+        } else {
+            None
+        };
+        if let Some(message) = missing {
+            client.shutdown().await;
+            Self::remove_generation(&self.live, &tid, generation);
+            release_owner(&checkout_owners, &cwd_cleanup, &tid);
+            return Err(AppError::new(message));
+        }
         // Readiness is proven; only now may file events start flowing.
         self.watcher.watch(&tid, &cwd);
         Self::start_idle_watch(
@@ -886,6 +1111,13 @@ impl ThreadManager {
             }
         };
         if let Err(error) = self.adopt_state(&row, &state) {
+            client.shutdown().await;
+            Self::remove_generation(&self.live, &tid, generation);
+            self.watcher.unwatch(&tid);
+            release_owner(&checkout_owners, &cwd_cleanup, &tid);
+            return Err(error);
+        }
+        if let Err(error) = directory.verify() {
             client.shutdown().await;
             Self::remove_generation(&self.live, &tid, generation);
             self.watcher.unwatch(&tid);
@@ -940,6 +1172,10 @@ impl ThreadManager {
     /// until the harness is confirmed dead: callers (and `restart()`) must
     /// not treat an unconfirmed stop as success.
     pub async fn stop(&self, thread_id: &str) -> AppResult<()> {
+        if let Some(state) = self.app.try_state::<crate::state::AppState>() {
+            state.intern.cancel_thread(thread_id);
+            crate::intern::changed(&self.app);
+        }
         // Stopping an already-removed thread must still kill its process, so
         // a live handle bypasses store validation and goes straight to the
         // map; an unknown id without a handle fails closed with no insert.
@@ -1038,6 +1274,12 @@ impl ThreadManager {
             .filter_map(|value| value.as_str().map(String::from))
             .collect::<Vec<_>>();
         let stats = client.call("get_session_stats", Map::new()).await.ok();
+        let commands = client
+            .call("get_commands", Map::new())
+            .await
+            .ok()
+            .map(|value| commands_from(&value))
+            .unwrap_or_default();
         let row = self.store.get_thread(thread_id)?;
         let mut capabilities = HarnessCapabilities::for_kind(HarnessKind::Pi);
         capabilities.model_switching = models_result.is_ok();
@@ -1053,6 +1295,7 @@ impl ThreadManager {
             models,
             levels,
             capabilities,
+            commands,
         })
     }
 
@@ -1115,6 +1358,29 @@ impl ThreadManager {
     // ------------------------------------------------------------------
 
     pub async fn send_prompt(&self, thread_id: &str, message: &str, mode: &str) -> AppResult<()> {
+        self.send_prompt_with_images(thread_id, message, mode, &[])
+            .await
+    }
+
+    pub async fn send_prompt_with_images(
+        &self,
+        thread_id: &str,
+        message: &str,
+        mode: &str,
+        images: &[crate::intern::ImageAttachment],
+    ) -> AppResult<()> {
+        self.send_prompt_at(thread_id, message, mode, images, None)
+            .await
+    }
+
+    async fn send_prompt_at(
+        &self,
+        thread_id: &str,
+        message: &str,
+        mode: &str,
+        images: &[crate::intern::ImageAttachment],
+        directory: Option<&crate::intern_files::BoundDirectory>,
+    ) -> AppResult<()> {
         self.store.get_thread(thread_id)?;
         let locks = shared_locks(thread_id);
         let _prompt = locks.prompt.lock().await;
@@ -1126,8 +1392,8 @@ impl ThreadManager {
             .get(&key)
             .is_some_and(|owner| owner == thread_id);
         self.reserve_checkout(&row.cwd, thread_id)?;
-        let client = match self.client_for(thread_id).await {
-            Ok(client) => client,
+        let client = match self.ensure_running_at(thread_id, directory).await {
+            Ok(live) => live.client.clone(),
             Err(error) => {
                 if !already_owned {
                     self.release_checkout(&row.cwd, thread_id);
@@ -1140,7 +1406,38 @@ impl ThreadManager {
             "follow_up" => "follow_up",
             _ => "prompt",
         };
-        let args = Map::from_iter([("message".into(), json!(message))]);
+        let mut args = Map::from_iter([("message".into(), json!(message))]);
+        if !images.is_empty() {
+            let state = match client.call("get_state", Map::new()).await {
+                Ok(state) => state,
+                Err(error) => {
+                    if !already_owned {
+                        self.release_checkout(&row.cwd, thread_id);
+                    }
+                    return Err(error);
+                }
+            };
+            if !state
+                .get("model")
+                .and_then(|model| model.get("input"))
+                .and_then(Value::as_array)
+                .is_some_and(|input| input.iter().any(|value| value.as_str() == Some("image")))
+            {
+                if !already_owned {
+                    self.release_checkout(&row.cwd, thread_id);
+                }
+                return Err(AppError::new("The selected model does not support images. Choose an image-capable model or remove the attachments."));
+            }
+            args.insert(
+                "images".into(),
+                json!(images
+                    .iter()
+                    .map(
+                        |image| json!({"type":"image","data":image.data,"mimeType":image.mime_type})
+                    )
+                    .collect::<Vec<_>>()),
+            );
+        }
         if let Err(error) = client.call(command, args).await {
             if !already_owned {
                 self.release_checkout(&row.cwd, thread_id);
@@ -1211,6 +1508,10 @@ impl ThreadManager {
         Ok(())
     }
     pub async fn abort(&self, thread_id: &str) -> AppResult<()> {
+        if let Some(state) = self.app.try_state::<crate::state::AppState>() {
+            state.intern.cancel_thread(thread_id);
+            crate::intern::changed(&self.app);
+        }
         let Some(client) = self.live_client(thread_id) else {
             return Ok(()); // nothing running
         };
@@ -1218,6 +1519,68 @@ impl ThreadManager {
         self.set_streaming(thread_id, false);
         self.set_status(thread_id, "waiting");
         Ok(())
+    }
+
+    /// Start a fresh conversation in the thread's running Pi (RPC
+    /// `new_session`), aborting any turn first, and remap the thread to it.
+    /// This is a deliberate host reset, so it bypasses `adopt_state`'s
+    /// same-session guard. The old journal stays on disk, unmapped.
+    pub async fn new_session(&self, thread_id: &str) -> AppResult<()> {
+        self.store.get_thread(thread_id)?;
+        let locks = shared_locks(thread_id);
+        let _prompt = locks.prompt.lock().await;
+        let client = self.client_for(thread_id).await?;
+        if self.store.get_thread(thread_id)?.status == "active"
+            || self
+                .live
+                .lock()
+                .get(thread_id)
+                .is_some_and(|live| live.streaming.load(Ordering::SeqCst))
+        {
+            client.call("abort", Map::new()).await?;
+        }
+        let result = client.call("new_session", Map::new()).await?;
+        if result.get("cancelled").and_then(Value::as_bool) == Some(true) {
+            return Err(AppError::new("Pi declined to start a new conversation."));
+        }
+        let state = client.call("get_state", Map::new()).await?;
+        let session_id = state.get("sessionId").and_then(Value::as_str).unwrap_or("");
+        let session_file = state
+            .get("sessionFile")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if session_id.is_empty() {
+            return Err(AppError::new(
+                "The harness returned an invalid empty session identity.",
+            ));
+        }
+        if !session_file.is_empty() {
+            util::private_session_target(Path::new(session_file))?;
+        }
+        self.store
+            .replace_thread_session(thread_id, session_id, session_file)?;
+        self.set_streaming(thread_id, false);
+        self.set_status(thread_id, "idle");
+        Ok(())
+    }
+
+    /// Persist a thread's Plan/Auto mode and apply it to a running Pi at
+    /// once through the modes extension's host command (handled by Pi
+    /// itself, never sent to the model).
+    pub async fn set_mode(&self, thread_id: &str, mode: &str) -> AppResult<Thread> {
+        if self.store.is_intern_thread(thread_id)? {
+            return Err(AppError::new("Pi Intern always runs in Plan mode."));
+        }
+        let row = self.store.set_thread_mode(thread_id, mode)?;
+        if let Some(client) = self.live_client(thread_id) {
+            client
+                .call(
+                    "prompt",
+                    Map::from_iter([("message".into(), json!(format!("/{MODES_COMMAND} {mode}")))]),
+                )
+                .await?;
+        }
+        Ok(row.into_dto())
     }
 
     pub async fn set_model(
@@ -1271,6 +1634,23 @@ impl ThreadManager {
     pub async fn get_levels(&self, thread_id: &str) -> AppResult<Vec<String>> {
         let client = self.client_for(thread_id).await?;
         Ok(self.fetch_levels(&client).await)
+    }
+
+    /// Pi's `/compact`: summarize older context to free tokens. It calls the
+    /// model, so it gets a longer timeout than ordinary commands.
+    pub async fn compact(&self, thread_id: &str, instructions: Option<&str>) -> AppResult<()> {
+        let client = self.client_for(thread_id).await?;
+        let mut args = Map::new();
+        if let Some(text) = instructions.map(str::trim).filter(|text| !text.is_empty()) {
+            if text.len() > 4000 {
+                return Err(AppError::new(
+                    "Compaction instructions must be under 4000 characters.",
+                ));
+            }
+            args.insert("customInstructions".into(), json!(text));
+        }
+        client.call_with_timeout("compact", args, 600).await?;
+        Ok(())
     }
 
     pub async fn get_usage(&self, thread_id: &str) -> AppResult<Usage> {
@@ -1588,6 +1968,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn slash_commands_are_bounded_and_hide_host_controls() {
+        let reply = json!({"commands": [
+            {"name": "mcp-auth", "description": "Sign in", "source": "extension"},
+            {"name": "skill:mcp-scripting", "source": "skill"},
+            {"name": "fix-tests", "description": "Fix failing tests", "source": "prompt"},
+            {"name": "pidesk-mode", "source": "extension"},
+            {"name": "bad name", "source": "extension"},
+            {"name": "odd", "source": "weird"}
+        ]});
+        let commands = commands_from(&reply);
+        let names: Vec<_> = commands
+            .iter()
+            .map(|c| (c.name.as_str(), c.source.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                ("mcp-auth", "extension"),
+                ("skill:mcp-scripting", "skill"),
+                ("fix-tests", "prompt"),
+                ("odd", "extension")
+            ]
+        );
+        assert_eq!(commands[0].description.as_deref(), Some("Sign in"));
+        assert!(commands_from(&json!({})).is_empty());
+    }
+
+    #[test]
     fn deletion_only_removes_private_journals() {
         let root = std::env::temp_dir().join(format!("pidesk-delete-{}", uuid::Uuid::new_v4()));
         let sessions = root.join("agent/sessions/thread");
@@ -1744,6 +2152,7 @@ mod tests {
         Arc::new(LiveThread {
             client: spawn_cat(),
             generation: 1,
+            directory: None,
             last_activity: Mutex::new(Instant::now()),
             streaming: AtomicBool::new(false),
             failed: AtomicBool::new(false),

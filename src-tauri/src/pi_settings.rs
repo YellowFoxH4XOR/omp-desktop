@@ -27,7 +27,7 @@ fn valid_id(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || "._:/@+-".contains(c))
 }
 
-fn read_object(path: &Path) -> AppResult<Map<String, Value>> {
+pub(crate) fn read_object(path: &Path) -> AppResult<Map<String, Value>> {
     if !path.exists() {
         return Ok(Map::new());
     }
@@ -41,6 +41,27 @@ fn read_object(path: &Path) -> AppResult<Map<String, Value>> {
             "Pi's settings file is not valid JSON. Fix or remove ~/.pidesk/agent/settings.json.",
         )),
     }
+}
+
+/// Package sources declared in the private Pi's settings, in order. Object
+/// entries (`{ "source": … }`) contribute their source.
+pub fn read_packages(root: &Path) -> AppResult<Vec<String>> {
+    let settings = read_object(&settings_path(root))?;
+    let Some(Value::Array(entries)) = settings.get("packages") else {
+        return Ok(vec![]);
+    };
+    Ok(entries
+        .iter()
+        .filter_map(|entry| match entry {
+            Value::String(source) => Some(source.clone()),
+            Value::Object(object) => object
+                .get("source")
+                .and_then(Value::as_str)
+                .map(String::from),
+            _ => None,
+        })
+        .take(200)
+        .collect())
 }
 
 pub fn read_defaults(root: &Path) -> AppResult<ModelDefaults> {
@@ -67,8 +88,19 @@ fn update(root: &Path, changes: &[(&str, &str)]) -> AppResult<ModelDefaults> {
     for (key, value) in changes {
         settings.insert((*key).to_string(), Value::String((*value).to_string()));
     }
-    let mut bytes = serde_json::to_vec_pretty(&Value::Object(settings))?;
+    write_object(&path, settings)?;
+    read_defaults(root)
+}
+
+/// Atomically replace a private JSON file (0600, never following a symlink).
+pub(crate) fn write_object(path: &Path, object: Map<String, Value>) -> AppResult<()> {
+    let mut bytes = serde_json::to_vec_pretty(&Value::Object(object))?;
     bytes.push(b'\n');
+    write_bytes(path, &bytes)
+}
+
+/// Atomically replace a private file with exactly these bytes.
+pub(crate) fn write_bytes(path: &Path, bytes: &[u8]) -> AppResult<()> {
     let temp = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -79,7 +111,7 @@ fn update(root: &Path, changes: &[(&str, &str)]) -> AppResult<ModelDefaults> {
     }
     let written = (|| -> AppResult<()> {
         let mut file = options.open(&temp)?;
-        file.write_all(&bytes)?;
+        file.write_all(bytes)?;
         file.sync_all()?;
         std::fs::rename(&temp, &path)?;
         Ok(())
@@ -87,8 +119,7 @@ fn update(root: &Path, changes: &[(&str, &str)]) -> AppResult<ModelDefaults> {
     if written.is_err() {
         let _ = std::fs::remove_file(&temp);
     }
-    written?;
-    read_defaults(root)
+    written
 }
 
 pub fn set_default_model(root: &Path, provider: &str, model_id: &str) -> AppResult<ModelDefaults> {

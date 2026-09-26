@@ -1,10 +1,10 @@
 <script lang="ts">
   import './app.css';
-  import { onMount, tick } from 'svelte';
+  import { onMount, tick, untrack } from 'svelte';
   import { open } from '@tauri-apps/plugin-dialog';
   import { revealItemInDir } from '@tauri-apps/plugin-opener';
   import { VList } from 'virtua/svelte';
-  import { Plus, Settings2, GitCompareArrows, Search, ChevronRight, X, Pin, Archive, MoreHorizontal, RefreshCw, Terminal, FolderOpen, FolderPlus, Folder, AlertTriangle, LoaderCircle, Check, SquarePen, GitFork, Trash2, MessageSquare, Monitor, Sun, Moon } from '@lucide/svelte';
+  import { Bot, Cpu, House, Plug, Puzzle, SlidersHorizontal, Plus, Settings2, GitCompareArrows, Search, ChevronRight, X, Pin, Archive, MoreHorizontal, RefreshCw, Terminal, FolderPlus, Folder, AlertTriangle, LoaderCircle, Check, SquarePen, GitFork, Trash2, MessageSquare, Monitor, Sun, Moon } from '@lucide/svelte';
   import { api, onBackendEvent } from '$lib/api';
   import { SessionModel } from '$lib/session.svelte';
   import Conversation from '$lib/components/conversation/Conversation.svelte';
@@ -14,8 +14,19 @@
   import ModelPicker from '$lib/components/conversation/ModelPicker.svelte';
   import { modelKey } from '$lib/components/conversation/model-utils';
   import PiTerminal from '$lib/components/terminal/PiTerminal.svelte';
+  import PiIntern from '$lib/components/intern/PiIntern.svelte';
+  import Welcome from '$lib/components/welcome/Welcome.svelte';
+  import PlanReview from '$lib/components/plan/PlanReview.svelte';
+  import CountUp from '$lib/components/common/CountUp.svelte';
+  import Extensions from '$lib/components/settings/Extensions.svelte';
+  import McpServers from '$lib/components/settings/McpServers.svelte';
+  import { openExternal } from '$lib/components/conversation/links';
+  import { checkForUpdates } from '$lib/extension-updates.svelte';
+  import { parseSlash, TERMINAL_ONLY } from '$lib/slash';
+  import { ago, clock } from '$lib/time';
+  import { planOf, PLAN_APPROVE, PLAN_DECLINE, PLAN_FEEDBACK } from '$lib/plan';
   import ConfirmDialog from '$lib/components/diff/ConfirmDialog.svelte';
-  import type { BackendEvent, HarnessInstallation, HarnessInstallCommand, InstallStatus, ModelDefaults, ModelInfo, Project, SessionSnapshot, SessionState, Thread, ThreadDeletePreview, ThreadStatus, UiResponse } from '$lib/types';
+  import type { BackendEvent, HarnessInstallation, HarnessInstallCommand, InstallStatus, ModelDefaults, ModelInfo, Project, SessionSnapshot, SessionState, Thread, ThreadDeletePreview, ThreadMode, ThreadStatus, UiResponse } from '$lib/types';
   type ChangesPanelComponent = (typeof import('$lib/components/diff/ChangesPanel.svelte'))['default'];
   type RpcFrame = Record<string, unknown>;
   interface OpenedSession {
@@ -33,6 +44,7 @@
   }
 
   const MAX_CACHED_SESSIONS = 8;
+  const RECENT_THREAD_LIMIT = 10;
   /** A background thread's warm Pi is kept this long; reopening a warm thread is instant. */
   const IDLE_STOP_MS = 10 * 60_000;
   const PREWARM_HOVER_MS = 120;
@@ -46,6 +58,7 @@
   const utf8Encoder = new TextEncoder();
 
   let projects = $state<Project[]>([]);
+  let recentThreads = $state<Thread[]>([]);
   let threadsByProject = $state<Record<string, Thread[]>>({});
   let harnesses = $state<HarnessInstallation[]>([]);
   let detecting = $state(true);
@@ -59,13 +72,28 @@
   let loadingThread = $state(false);
   let pendingAction = $state(false);
   let pendingActionCount = 0;
-  let rightPanel = $state<'changes' | null>(null);
+  let rightPanel = $state<'changes' | 'plan' | null>(null);
   let ChangesPanel = $state<ChangesPanelComponent | null>(null);
   let diffPath = $state<string | undefined>(undefined);
   let sidebarWidth = $state(256);
   let panelWidth = $state(405);
   let settingsOpen = $state(false);
+  type SettingsSection = 'general' | 'models' | 'pi' | 'extensions' | 'mcp';
+  let settingsSection = $state<SettingsSection>('general');
+  const SETTINGS_SECTIONS: Array<{ id: SettingsSection; label: string; icon: typeof Cpu }> = [
+    { id: 'general', label: 'General', icon: SlidersHorizontal },
+    { id: 'models', label: 'Models', icon: Cpu },
+    { id: 'pi', label: 'Pi runtime', icon: Terminal },
+    { id: 'extensions', label: 'Extensions', icon: Puzzle },
+    { id: 'mcp', label: 'MCP servers', icon: Plug },
+  ];
+  /** Installed Pi packages with a newer npm release; badges Settings. */
+  let extensionUpdates = $state(0);
   let terminalOpen = $state(false);
+  let internOpen = $state(false);
+  let internStarted = $state(false);
+  let internPending = $state(0);
+  let internRefreshEpoch = 0;
   let copiedPath = $state(false);
   let switcherOpen = $state(false);
   let switchQuery = $state('');
@@ -101,6 +129,73 @@
   let projectSelectionToken = 0;
   let threadSelectionToken = 0;
   const currentView = $derived(activeSession?.view);
+  // Live row details: when each thread started working, a ticking clock, and
+  // Git totals for isolated worktrees (a shared checkout's diff isn't one
+  // thread's work, so those rows don't claim it).
+  let now = $state(Date.now());
+  const activeSince = $state<Record<string, number>>({});
+  const rowStats = $state<Record<string, { additions: number; deletions: number; branch?: string }>>({});
+  const statsTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const MAX_STATS_ROWS = 24;
+  $effect(() => {
+    const timer = setInterval(() => { now = Date.now(); }, 1000);
+    return () => clearInterval(timer);
+  });
+  $effect(() => {
+    for (const rows of Object.values(threadsByProject)) for (const thread of rows ?? []) {
+      const tracked = untrack(() => thread.id in activeSince);
+      if (thread.status === 'active' && !tracked) activeSince[thread.id] = Date.now();
+      else if (thread.status !== 'active' && tracked) delete activeSince[thread.id];
+    }
+  });
+  function refreshStats(thread: Thread, delay = 0) {
+    if (!thread.worktreePath) return;
+    const pending = statsTimers.get(thread.id);
+    if (pending) clearTimeout(pending);
+    statsTimers.set(thread.id, setTimeout(() => {
+      statsTimers.delete(thread.id);
+      void api.gitStatus(thread.id).then(summary => {
+        if (summary.isRepo) rowStats[thread.id] = { additions: summary.additions, deletions: summary.deletions, branch: summary.branch };
+      }).catch(() => undefined);
+    }, delay));
+  }
+  $effect(() => {
+    const project = activeProject;
+    if (!project) return;
+    const rows = (threadsByProject[project.id] ?? []).filter(thread => thread.worktreePath && !thread.archived).slice(0, MAX_STATS_ROWS);
+    for (const thread of rows) if (untrack(() => !(thread.id in rowStats))) refreshStats(thread);
+  });
+  function findThread(threadId: string): Thread | undefined {
+    for (const rows of Object.values(threadsByProject)) { const found = rows?.find(row => row.id === threadId); if (found) return found; }
+    return undefined;
+  }
+  /** A worktree's branch once one exists, else its short folder name. */
+  function worktreeLabel(thread: Thread): string {
+    const branch = rowStats[thread.id]?.branch;
+    if (branch) return branch;
+    const folder = thread.worktreePath?.split('/').filter(Boolean).at(-1) ?? '';
+    return `worktree ${folder.slice(0, 8)}`;
+  }
+  async function revealWorktree(path: string) {
+    try { await revealItemInDir(path); }
+    catch (error) { startupError = `Could not show the worktree: ${errorText(error)}`; }
+  }
+
+  /** Amber pill text for a thread that is waiting on the user. */
+  function waitingLabel(thread: Thread): string | null {
+    if (thread.status !== 'waiting') return null;
+    const session = liveSessions.get(thread.id);
+    return session?.view.pendingRequests.some(request => planOf(request) !== null) ? 'Needs approval' : 'Needs input';
+  }
+
+  // A pending Plan → Auto approval for the shown thread opens the plan panel.
+  const planRequest = $derived(currentView?.pendingRequests.find(request => planOf(request) !== null));
+  let shownPlanId: string | undefined;
+  $effect(() => {
+    const id = planRequest?.id;
+    if (id && id !== shownPlanId) { shownPlanId = id; rightPanel = 'plan'; }
+    else if (!id && rightPanel === 'plan') rightPanel = null;
+  });
   const installation = $derived(harnesses[0]);
   const onboarding = $derived(!detecting && !installation);
   const switchEntries = $derived([
@@ -419,7 +514,13 @@
     idleStopTimers.delete(threadId);
   }
   function handleBackendEvent(event: BackendEvent) {
+    if (event.type === 'intern_changed') {
+      void refreshInternState();
+      if (!internStarted) void api.internPlans().then(plans => { internPending = plans.filter(plan => !plan.executing).length; }).catch(() => undefined);
+      return;
+    }
     if ('threadId' in event && invalidatedThreads.has(event.threadId)) return;
+    if (event.type === 'git_changed') { const thread = findThread(event.threadId); if (thread) refreshStats(thread, 800); }
     if (event.type === 'rpc') {
       const pending = openingSessions.get(event.threadId);
       if (pending) {
@@ -469,7 +570,7 @@
     }).catch(err => { if (!disposed) startupError = `Could not connect live events. Relaunch πDesk: ${errorText(err)}`; });
     const runtimeReady = checkPrivateRuntime();
     void loadModelDefaults();
-    void Promise.allSettled([runtimeReady, refreshProjects(runtimeReady)]).then(() => { detecting = false; });
+    void Promise.allSettled([runtimeReady, refreshProjects()]).then(() => { detecting = false; if (installation) void checkExtensionUpdates(); });
     const onKey = (event: KeyboardEvent) => {
       if (terminalOpen || deleteDialog) return; // Terminal and ConfirmDialog own their keys.
       if (!event.metaKey && event.key !== 'Escape') return;
@@ -533,13 +634,26 @@
       installPlanError = errorText(error);
     } finally { checkingRuntime = false; }
   }
-  async function refreshProjects(runtimeReady: Promise<void>) {
+  /** Launch lands on the welcome screen; nothing is selected and no Pi starts. */
+  async function refreshProjects() {
     try {
       projects = await api.listProjects();
-      const remembered = localStorage.getItem('lastProject');
-      const selected = projects.find(p => p.id === remembered) ?? projects[0];
-      if (selected) await selectProject(selected, true, runtimeReady);
+      await loadRecentThreads();
     } catch (error) { startupError = `Could not load projects: ${errorText(error)}`; }
+  }
+  async function loadRecentThreads() {
+    try { recentThreads = await api.listRecentThreads(RECENT_THREAD_LIMIT); }
+    catch { recentThreads = []; }
+  }
+  /** Leaves the current project and thread and shows the welcome screen. */
+  function goHome() {
+    leaveCurrentThread();
+    ++projectSelectionToken; ++threadSelectionToken;
+    activeProject = null; activeThread = null; activeSession = null; selectedThreadId = null;
+    loadingThread = false; rightPanel = null; diffPath = undefined; errorDetailsOpen = false;
+    renaming = null; threadMenu = null; renameText = '';
+    localStorage.removeItem('lastProject'); localStorage.removeItem('lastThread');
+    void loadRecentThreads();
   }
   async function refreshThreads(projectId: string, selectionToken?: number): Promise<Thread[] | null> {
     try {
@@ -587,6 +701,7 @@
     if (failures.length) startupError = `Could not stop ${failures.length === 1 ? 'a thread' : `${failures.length} threads`}: ${failures[0]}`;
   }
   async function openThreadById(threadId: string, projectId: string) {
+    if (threadId === 'pidesk-intern') { internStarted = true; internOpen = true; return; }
     const project = projects.find(candidate => candidate.id === projectId);
     if (!project) return;
     let thread = threadsByProject[projectId]?.find(candidate => candidate.id === threadId);
@@ -617,20 +732,9 @@
     localStorage.setItem('lastProject', project.id);
     return selectionToken;
   }
-  async function selectProject(project: Project, restore = false, runtimeReady?: Promise<void>) {
+  async function selectProject(project: Project) {
     const selectionToken = beginProjectSelection(project);
-    const restoreToken = threadSelectionToken;
-    const threads = await refreshThreads(project.id, selectionToken);
-    if (invalidatedProjects.has(project.id) || selectionToken !== projectSelectionToken) return;
-    if (selectionToken !== projectSelectionToken || !threads) return;
-    if (restore && restoreToken === threadSelectionToken) {
-      const savedId = localStorage.getItem('lastThread');
-      const remembered = threads.find(thread => thread.id === savedId);
-      if (remembered) {
-        await runtimeReady;
-        if (selectionToken === projectSelectionToken && restoreToken === threadSelectionToken) void selectThread(remembered);
-      }
-    }
+    await refreshThreads(project.id, selectionToken);
   }
   function clearProjectCache(projectId: string) {
     const threadIds = new Set((threadsByProject[projectId] ?? []).map(thread => thread.id));
@@ -684,10 +788,8 @@
       }
       clearProjectCache(project.id);
       projects = projects.filter(candidate => candidate.id !== project.id);
-      if (removingActiveProject) {
-        if (projects[0]) await selectProject(projects[0]);
-        else localStorage.removeItem('lastProject');
-      }
+      recentThreads = recentThreads.filter(thread => thread.projectId !== project.id);
+      if (removingActiveProject) goHome();
     } catch (error) { startupError = `Could not remove project: ${errorText(error)}`; }
   }
   async function createThread(project: Project) {
@@ -696,8 +798,8 @@
     const threadToken = threadSelectionToken;
     beginPendingAction();
     try {
-      const activePeer = (threadsByProject[project.id] ?? []).some(thread => thread.status === 'active' || thread.status === 'waiting');
-      const isolated = activePeer && project.isGit;
+      // Every new thread in a Git project gets its own worktree.
+      const isolated = project.isGit;
       const thread = await api.createThread(project.id, 'pi', isolated);
       if (!invalidatedProjects.has(project.id)) {
         threadsByProject[project.id] = [thread, ...(threadsByProject[project.id] ?? []).filter(candidate => candidate.id !== thread.id)];
@@ -775,6 +877,16 @@
     if (rightPanel === panel) rightPanel = null;
     else void openPanel(panel);
   }
+  /** Feedback is steered into the running turn before the plan is answered. */
+  async function answerPlan(choice: 'approve' | 'decline' | 'feedback', feedback?: string) {
+    const thread = activeThread;
+    const request = planRequest;
+    if (!thread || !request) return;
+    try {
+      if (choice === 'feedback' && feedback) await api.sendPrompt(thread.id, feedback, 'steer');
+      await respond(request.id, { value: choice === 'approve' ? PLAN_APPROVE : choice === 'feedback' ? PLAN_FEEDBACK : PLAN_DECLINE });
+    } catch (error) { startupError = `Could not answer the plan: ${errorText(error)}`; }
+  }
   function showChanges(path?: string) {
     if (path && activeThread) {
       const cwd = activeThread.cwd.replace(/\/+$/, '');
@@ -783,7 +895,91 @@
     diffPath = path;
     void openPanel('changes');
   }
+  /**
+   * Pi's built-in terminal commands don't exist over RPC (sent as a prompt
+   * they'd reach the model as text), so πDesk runs them. Returns false for
+   * everything else, which goes to Pi: extension commands, skills, prompts.
+   */
+  async function runBuiltin(message: string): Promise<boolean> {
+    const slash = parseSlash(message);
+    const thread = activeThread;
+    const session = activeSession;
+    if (!slash || !thread || !session) return false;
+    const { name, args } = slash;
+    const say = (text: string, level: 'info' | 'warn' | 'error' = 'info') => session.notify(level, text);
+    if (TERMINAL_ONLY.has(name)) {
+      say(`/${name} only exists in Pi's own terminal UI. Open the Pi terminal, run pi, then /${name}.`, 'warn');
+      return true;
+    }
+    switch (name) {
+      case 'model': {
+        if (!args) { document.querySelector<HTMLButtonElement>('button[aria-label="Select model"]')?.click(); return true; }
+        const want = args.toLowerCase();
+        const models = session.view.models;
+        const match = models.find(model => modelKey(model).toLowerCase() === want)
+          ?? models.find(model => model.id.toLowerCase() === want)
+          ?? models.find(model => model.id.toLowerCase().includes(want) || model.name.toLowerCase().includes(want));
+        if (!match) { say(`No model matches “${args}”. Type /model to choose from the list.`, 'warn'); return true; }
+        await setModel(modelKey(match));
+        say(`Switched to ${match.name} (${match.provider}).`);
+        return true;
+      }
+      case 'thinking': {
+        const levels = session.view.levels;
+        if (!args) { say(`Effort is ${session.view.effort ?? 'the default'}. Choose one of: ${levels.join(', ') || 'none offered by this model'}.`); return true; }
+        if (!levels.includes(args.toLowerCase())) { say(`“${args}” isn't an effort level here. Choose one of: ${levels.join(', ')}.`, 'warn'); return true; }
+        await setEffort(args.toLowerCase());
+        say(`Effort set to ${args.toLowerCase()}.`);
+        return true;
+      }
+      case 'compact':
+        say('Compacting the conversation…');
+        try { await api.compactThread(thread.id, args || undefined); say('Compacted: older context is now a summary.'); }
+        catch (error) { say(`Could not compact: ${errorText(error)}`, 'error'); }
+        return true;
+      case 'new':
+        if (activeProject) await createThread(activeProject);
+        return true;
+      case 'name':
+        if (!args) { say('Give the new name, for example /name Fix login bug.', 'warn'); return true; }
+        await renameThread(thread, args.split('\n')[0].slice(0, 120));
+        say(`Renamed to “${args.split('\n')[0].slice(0, 120)}”.`);
+        return true;
+      case 'plan':
+      case 'auto':
+        await setMode(name);
+        say(name === 'plan' ? 'Plan mode: read-only until you approve a plan.' : 'Auto mode: full tools.');
+        return true;
+      case 'session': {
+        try {
+          const usage = await api.getUsage(thread.id);
+          const context = usage.contextUsage?.percent != null ? ` · context ${Math.round(usage.contextUsage.percent)}% full` : '';
+          say(`${usage.tokens.total.toLocaleString()} tokens (${usage.tokens.input.toLocaleString()} in, ${usage.tokens.output.toLocaleString()} out) · $${usage.cost.toFixed(4)}${context}`);
+        } catch (error) { say(`Could not read session stats: ${errorText(error)}`, 'error'); }
+        return true;
+      }
+      case 'copy': {
+        const last = [...session.view.items].reverse().find(item => item.kind === 'text' && item.text.trim());
+        if (!last || last.kind !== 'text') { say('There is no reply to copy yet.', 'warn'); return true; }
+        try { await navigator.clipboard.writeText(last.text); say('Copied the last reply.'); }
+        catch { say('Could not reach the clipboard.', 'error'); }
+        return true;
+      }
+      case 'reload':
+        say("Restarting this thread's Pi to reload extensions and settings…");
+        await restart();
+        return true;
+      case 'login':
+        openTerminal('pi');
+        say('In the Pi terminal, type /login and pick your provider.');
+        return true;
+      default:
+        return false;
+    }
+  }
+
   async function send(message: string, mode: 'prompt' | 'steer' | 'follow_up') {
+    if (await runBuiltin(message)) return;
     const targetThread = activeThread;
     if (!targetThread) return;
     const projectId = targetThread.projectId;
@@ -791,7 +987,7 @@
     try {
       await api.sendPrompt(targetThread.id, message, mode);
       if (activeThread?.id === targetThread.id && threadSelectionToken === selectionToken && !invalidatedProjects.has(projectId)) startupError = '';
-      if (!invalidatedProjects.has(projectId) && !invalidatedThreads.has(targetThread.id) && (!targetThread.title || targetThread.title === 'New thread')) {
+      if (!message.trim().startsWith('/') && !invalidatedProjects.has(projectId) && !invalidatedThreads.has(targetThread.id) && (!targetThread.title || targetThread.title === 'New thread')) {
         const title = message.trim().split('\n')[0].slice(0, 70);
         if (title) await renameThread(targetThread, title, selectionToken);
       }
@@ -943,6 +1139,18 @@
       if (projectToken === projectSelectionToken && threadToken === threadSelectionToken && !invalidatedProjects.has(projectId)) startupError = errorText(error);
     }
   }
+  async function setMode(mode: ThreadMode) {
+    const thread = activeThread;
+    if (!thread || thread.mode === mode) return;
+    const projectId = thread.projectId;
+    try {
+      const updated = await api.setThreadMode(thread.id, mode);
+      if (invalidatedProjects.has(projectId) || invalidatedThreads.has(thread.id)) return;
+      const row = threadsByProject[projectId]?.find(candidate => candidate.id === thread.id);
+      if (row) row.mode = updated.mode;
+      if (activeThread?.id === thread.id) activeThread.mode = updated.mode;
+    } catch (error) { startupError = `Could not change mode: ${errorText(error)}`; }
+  }
   async function setModel(value: string) {
     const targetThread = activeThread;
     const targetSession = activeSession;
@@ -993,11 +1201,52 @@
       installStatus = 'failed';
     } finally { installInProgress = false; }
   }
-  function openSettings() {
+  function openSettings(section?: SettingsSection) {
+    if (section) settingsSection = section;
+    else if (extensionUpdates) settingsSection = 'extensions';
     settingsOpen = true;
   }
-  function openTerminal() {
-    if (installation) terminalOpen = true;
+  async function checkExtensionUpdates() {
+    try { extensionUpdates = (await checkForUpdates()).filter(item => item.updateAvailable).length; }
+    catch { /* Offline or no packages: the badge simply stays off. */ }
+  }
+  /** Optional `run` is typed into the new shell, e.g. an MCP sign-in. */
+  let terminalRun = $state<string | undefined>();
+  function openTerminal(run?: unknown) {
+    if (!installation) return;
+    // Also used directly as a click handler, which passes the event.
+    terminalRun = typeof run === 'string' ? run : undefined;
+    terminalOpen = true;
+  }
+  function toggleIntern() { internStarted = true; internOpen = !internOpen; }
+  async function refreshInternState() {
+    const epoch = ++internRefreshEpoch;
+    const project = activeProject;
+    try {
+      const nextProjects = await api.listProjects();
+      const rows = project && nextProjects.some(row => row.id === project.id) ? await api.listThreads(project.id) : null;
+      if (epoch !== internRefreshEpoch) return;
+      for (const previous of projects) {
+        if (!nextProjects.some(row => row.id === previous.id)) { invalidatedProjects.add(previous.id); clearProjectCache(previous.id); }
+      }
+      projects = nextProjects;
+      if (activeProject?.id !== project?.id) return;
+      if (project && !rows) {
+        ++projectSelectionToken; ++threadSelectionToken;
+        activeProject = null; activeThread = null; activeSession = null; selectedThreadId = null; rightPanel = null; loadingThread = false;
+        localStorage.removeItem('lastProject'); localStorage.removeItem('lastThread');
+      } else if (project && rows) {
+        for (const previous of threadsByProject[project.id] ?? []) {
+          if (!rows.some(row => row.id === previous.id)) { addInvalidatedThread(previous.id); cancelIdleStop(previous.id); removeCachedSession(previous.id); delete crashDetails[previous.id]; }
+        }
+        threadsByProject[project.id] = rows;
+        if (activeThread) {
+          const updated = rows.find(row => row.id === activeThread?.id);
+          if (updated) activeThread = updated;
+          else { ++threadSelectionToken; activeThread = null; activeSession = null; selectedThreadId = null; rightPanel = null; loadingThread = false; localStorage.removeItem('lastThread'); }
+        }
+      }
+    } catch (error) { if (epoch === internRefreshEpoch) startupError = `Could not refresh Intern changes: ${errorText(error)}`; }
   }
   async function copyInstallPath() {
     if (!installation) return;
@@ -1048,6 +1297,7 @@
   <aside class="sidebar" aria-label="Projects and threads">
     <div class="sidebar-top" data-tauri-drag-region>
       <div class="sidebar-tools">
+        <button class="icon-button" class:pressed={!activeProject} title="Welcome" aria-label="Welcome" onclick={goHome}><House size={16} strokeWidth={1.8} /></button>
         <button class="icon-button" title="Search projects and threads (⌘K)" aria-label="Switch project or thread" onclick={() => void openSwitcher()}><Search size={16} strokeWidth={1.8} /></button>
         <button class="icon-button" title="New thread (⌘N)" aria-label="New thread" disabled={!activeProject || pendingAction || !harnesses.length} onclick={() => { if (activeProject) void createThread(activeProject); }}><SquarePen size={16} strokeWidth={1.8} /></button>
       </div>
@@ -1080,7 +1330,7 @@
                 <button class="new-thread" disabled={pendingAction || !harnesses.length} onclick={() => void createThread(project)}><Plus size={13} strokeWidth={2.2} /> New thread</button>
               </div>
               {#if visible.length}
-                <VList data={visible} getKey={thread => thread.id} style={`height: min(58vh, ${visible.length * 30}px);`}>
+                <VList data={visible} getKey={thread => thread.id} style={`height: min(58vh, ${visible.length * 46}px);`}>
                   {#snippet children(thread)}
                     <div class:active={selectedThreadId === thread.id} class="thread-row" oncontextmenu={event => { event.preventDefault(); threadMenu = null; showThreadMenu(thread, event.clientX, event.clientY); }} role="group" aria-label={`${thread.title || 'New thread'} thread`}>
                       {#if renaming === thread.id}
@@ -1092,10 +1342,27 @@
                           }}
                           onblur={() => { if (renaming === thread.id) void renameThread(thread, renameText); }} />
                       {:else}
+                        {@const waiting = waitingLabel(thread)}
+                        {@const stats = rowStats[thread.id]}
                         <button class="thread-link" onclick={() => { cancelPrewarm(); void selectThread(thread); }} ondblclick={() => startRename(thread)} onpointerenter={() => prewarmSoon(thread)} onpointerleave={cancelPrewarm} onfocus={() => prewarmSoon(thread)} onblur={cancelPrewarm} title={thread.title}>
                           <span class={`status-dot ${thread.status}`} role="img" aria-label={thread.status}></span>
-                          <span class="thread-title">{thread.title || 'New thread'}</span>
-                          {#if thread.pinned}<Pin size={10} strokeWidth={2.2} class="pin-mark" aria-label="Pinned" />{/if}
+                          <span class="thread-text">
+                            <span class="thread-line">
+                              <span class="thread-title">{thread.title || 'New thread'}</span>
+                              {#if thread.pinned}<Pin size={10} strokeWidth={2.2} class="pin-mark" aria-label="Pinned" />{/if}
+                              {#if waiting}{#key waiting}<span class="row-pill" class:plan={waiting === 'Needs approval'}>{waiting}</span>{/key}{/if}
+                            </span>
+                            <span class="thread-meta">
+                              {#if thread.status === 'active'}<span class="meta-working">Working {clock(now - (activeSince[thread.id] ?? now))}</span>
+                              {:else if thread.status === 'failed'}<span class="meta-bad">Failed</span>
+                              {:else if thread.status === 'disconnected'}<span>Disconnected</span>
+                              {:else if thread.status === 'completed'}<span class="meta-done">Done</span>
+                              {:else if !waiting}<span>{ago(thread.lastViewedAt, now)}</span>{/if}
+                              {#if thread.mode === 'plan'}<span class="meta-chip">Plan</span>{/if}
+                              {#if thread.worktreePath}<span class="meta-chip mono" title={thread.worktreePath}>{stats?.branch ?? 'worktree'}</span>{/if}
+                              {#if stats && (stats.additions || stats.deletions)}<span class="meta-diff"><span class="add"><CountUp value={stats.additions} prefix="+" /></span> <span class="del"><CountUp value={stats.deletions} prefix="−" /></span></span>{/if}
+                            </span>
+                          </span>
                         </button>
                       {/if}
                       <button class="thread-more" title={`Actions for ${thread.title}`} aria-label={`Actions for ${thread.title}`} aria-haspopup="menu" aria-expanded={threadMenu?.id === thread.id} onclick={event => { const rect = event.currentTarget.getBoundingClientRect(); showThreadMenu(thread, rect.right - 200, rect.bottom + 4); }}><MoreHorizontal size={14} /></button>
@@ -1116,7 +1383,7 @@
       <button class="footer-button" disabled={pendingAction} onclick={() => void addProject()}><FolderPlus size={15} strokeWidth={1.8} /> Add project</button>
       <span class="grow"></span>
       {#if projects.length}<button class="icon-button" class:pressed={showArchived} title={showArchived ? 'Hide archived threads' : 'Show archived threads'} aria-label={showArchived ? 'Hide archived' : 'Show archived'} aria-pressed={showArchived} onclick={() => showArchived = !showArchived}><Archive size={15} strokeWidth={1.8}/></button>{/if}
-      <button class="icon-button" title="Settings (⌘,)" aria-label="Settings" onclick={() => void openSettings()}><Settings2 size={15} strokeWidth={1.8} /></button>
+      <button class="icon-button settings-button" title={extensionUpdates ? `Settings · ${extensionUpdates} extension update${extensionUpdates === 1 ? '' : 's'}` : 'Settings (⌘,)'} aria-label="Settings" onclick={() => void openSettings()}><Settings2 size={15} strokeWidth={1.8} />{#if extensionUpdates}<span class="gear-badge" aria-hidden="true"></span>{/if}</button>
     </div>
   </aside>
   {#if threadMenu}
@@ -1138,16 +1405,22 @@
       <div class="crumbs" data-tauri-drag-region>
         {#if activeProject}<span class="crumb-project">{activeProject.displayName}</span>{:else}<span class="crumb-project">πDesk</span>{/if}
         {#if visibleThread}<ChevronRight size={13} strokeWidth={2} class="crumb-sep" /><span class="top-thread">{visibleThread.title || 'New thread'}</span>{/if}
-        {#if visibleThread && currentView && currentView.status !== 'idle'}<span class={`status-pill ${currentView.status}`} title={STATUS_LABEL[currentView.status]}><span class={`status-dot ${currentView.status}`}></span><span class="pill-label">{STATUS_LABEL[currentView.status]}</span></span>{/if}
+        {#if visibleThread?.worktreePath}
+          {@const worktree = visibleThread.worktreePath}
+          <button class="worktree-chip" title={`Worktree: ${worktree}\nClick to show in Finder`} aria-label={`Worktree ${worktreeLabel(visibleThread)}, show in Finder`} onclick={() => void revealWorktree(worktree)}>
+            <GitFork size={12} strokeWidth={2} /><span>{worktreeLabel(visibleThread)}</span>
+          </button>
+        {/if}
+        {#if visibleThread && currentView && currentView.status !== 'idle'}<span class={`status-pill ${currentView.status}`} title={STATUS_LABEL[currentView.status]}><span class={`status-dot ${currentView.status}`}></span><span class="pill-label">{currentView.status === 'waiting' ? (planRequest ? 'Needs approval' : STATUS_LABEL.waiting) : STATUS_LABEL[currentView.status]}{#if currentView.status === 'active' && activeSince[visibleThread.id]}<span class="pill-clock">{clock(now - activeSince[visibleThread.id])}</span>{/if}</span></span>{/if}
       </div>
-      {#if visibleThread && currentView}
-        <div class="header-actions">
-          {#if visibleThread.worktreePath}<span class="badge" title={`Isolated worktree: ${visibleThread.worktreePath}`}><GitFork size={11} strokeWidth={2} /> Isolated</span>{/if}
+      <div class="header-actions">
+        <button class="toggle-button" class:pressed={internOpen} aria-label="Ask Pi Intern" aria-expanded={internOpen} title="Ask Pi Intern" onclick={toggleIntern}><Bot size={16}/><span>Intern{internPending ? ` (${internPending})` : ''}</span></button>
+        {#if visibleThread && currentView}
           <div class="panel-toggles">
             <button class:pressed={rightPanel === 'changes'} class="toggle-button" title="Changes (⌘⇧D)" aria-label="Toggle changes" aria-pressed={rightPanel === 'changes'} onclick={() => togglePanel('changes')}><GitCompareArrows size={14} strokeWidth={1.9} /><span>Changes</span></button>
           </div>
-        </div>
-      {/if}
+        {/if}
+      </div>
     </header>
 
     {#if startupError}<div class="error-banner" role="alert"><AlertTriangle size={14}/><span>{startupError}</span><button aria-label="Dismiss error" onclick={() => startupError = ''}><X size={14}/></button></div>{/if}
@@ -1155,14 +1428,14 @@
     {:else if onboarding || installerVisible}
       <PiSetup plan={installPlan} status={installStatus} busy={installInProgress} lines={installLog} error={installError || installPlanError} ready={installReady} checking={checkingRuntime} onInstall={() => void install()} onCheck={() => void checkPrivateRuntime()} onContinue={() => { installerVisible = false; installStatus = 'idle'; }} onOpenTerminal={openTerminal} />
     {:else if !activeProject}
-      <div class="main-empty"><div class="empty-graphic"><FolderOpen size={26} strokeWidth={1.5}/></div><h2>Start with a project</h2><p>Choose a local folder. Nothing is uploaded or copied.</p><button class="primary-button" onclick={() => void addProject()}><Plus size={15} strokeWidth={2.2}/> Add project</button></div>
+      <Welcome {projects} recent={recentThreads} busy={pendingAction} onOpenProject={project => void selectProject(project)} onOpenThread={thread => void openThreadById(thread.id, thread.projectId)} onAddProject={() => void addProject()} onOpenIntern={() => { internStarted = true; internOpen = true; }} />
     {:else if loadingThread}
       <div class="main-empty delayed"><LoaderCircle class="spin" size={24} strokeWidth={1.6}/><h2>Opening thread</h2><p>Restoring the conversation from Pi.</p></div>
     {:else if !visibleThread || !currentView}
       <div class="main-empty"><div class="empty-graphic"><SquarePen size={24} strokeWidth={1.5}/></div><h2>What shall we work on?</h2><p>Start a thread in <strong>{activeProject.displayName}</strong> to talk to your agent.</p><button class="primary-button" disabled={pendingAction || !harnesses.length} onclick={() => void createThread(activeProject!)}><Plus size={15} strokeWidth={2.2}/> New thread</button><div class="empty-hint"><kbd>⌘</kbd><kbd>N</kbd> new thread <span class="dot-sep"></span> <kbd>⌘</kbd><kbd>K</kbd> jump anywhere</div></div>
     {:else}
       {#if currentView.error}<div class="error-banner"><AlertTriangle size={14}/><span>{currentView.error}</span>{#if visibleThread && crashDetails[visibleThread.id]}<button onclick={() => errorDetailsOpen = true}>View details</button>{/if}<button class="banner-action" onclick={() => void restart()}><RefreshCw size={13}/> Restart session</button></div>{/if}
-      <Conversation view={currentView} onSend={send} onAbort={stop} onShowChanges={showChanges} onRespond={respond} onSetModel={setModel} onSetEffort={setEffort} {defaultModelKey} onMakeDefault={makeDefaultModel} />
+      <Conversation view={currentView} onSend={send} onAbort={stop} onShowChanges={showChanges} onRespond={respond} onSetModel={setModel} onSetEffort={setEffort} {defaultModelKey} onMakeDefault={makeDefaultModel} agentMode={visibleThread.mode ?? 'auto'} onSetMode={setMode} plan={planRequest ? { plan: planOf(planRequest) ?? '', onApprove: () => answerPlan('approve'), onDecline: () => answerPlan('decline'), onFeedback: text => answerPlan('feedback', text), onReview: () => rightPanel = 'plan' } : undefined} />
     {/if}
     {#if !detecting && !onboarding && !installerVisible}
       <footer class="status-bar">
@@ -1173,8 +1446,9 @@
 
   {#if rightPanel && visibleThread && currentView}
     <div class="resize-handle panel-handle" role="slider" tabindex="0" aria-orientation="vertical" aria-valuemin="320" aria-valuemax="850" aria-valuenow={panelWidth} aria-label="Resize detail panel" onmousedown={() => panelResizing = true} onkeydown={event => { if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); panelWidth = Math.max(320, Math.min(850, panelWidth + (event.key === 'ArrowLeft' ? 12 : -12))); localStorage.setItem('panelWidth', String(panelWidth)); } }}></div>
-    <aside class="details-pane" aria-label="Changes">
-      {#if ChangesPanel}<ChangesPanel thread={visibleThread} onClose={() => rightPanel = null} focusPath={diffPath} />
+    <aside class="details-pane" aria-label={rightPanel === 'plan' ? 'Plan' : 'Changes'}>
+      {#if rightPanel === 'plan' && planRequest}<PlanReview plan={planOf(planRequest) ?? ''} source={visibleThread.title || 'New thread'} onApprove={() => answerPlan('approve')} onDecline={() => answerPlan('decline')} onFeedback={text => answerPlan('feedback', text)} onClose={() => rightPanel = null} />
+      {:else if ChangesPanel}<ChangesPanel thread={visibleThread} onClose={() => rightPanel = null} focusPath={diffPath} />
       {:else}<div class="panel-loading"><LoaderCircle class="spin" size={16}/><span>Loading changes…</span></div>{/if}
     </aside>
   {/if}
@@ -1236,21 +1510,42 @@
 {/if}
 
 {#if settingsOpen}
-  <div class="overlay" role="presentation" onclick={event => { if (event.target === event.currentTarget) settingsOpen = false; }}>
-    <div class="settings dialog" role="dialog" aria-modal="true" aria-label="Settings">
-      <header><h2>Settings</h2><button class="icon-button" aria-label="Close settings" onclick={() => settingsOpen = false}><X size={16}/></button></header>
-      <section>
-        <h3>Appearance</h3>
-        <div class="setting-row"><span>Theme</span>
+  <div class="settings-page" role="dialog" aria-modal="true" aria-label="Settings">
+    <nav class="settings-nav" aria-label="Settings sections" data-tauri-drag-region>
+      <div class="settings-nav-title" data-tauri-drag-region>Settings</div>
+      {#each SETTINGS_SECTIONS as section (section.id)}
+        <button class="settings-nav-item" class:on={settingsSection === section.id} aria-current={settingsSection === section.id ? 'page' : undefined} onclick={() => settingsSection = section.id}>
+          <section.icon size={15} strokeWidth={1.8} /><span>{section.label}</span>
+          {#if section.id === 'extensions' && extensionUpdates}<span class="nav-badge" title={`${extensionUpdates} update${extensionUpdates === 1 ? '' : 's'} available`}>{extensionUpdates}</span>{/if}
+        </button>
+      {/each}
+      <span class="grow"></span>
+      <div class="settings-nav-foot">πDesk · Pi {installation?.version ?? 'not installed'}</div>
+    </nav>
+    <div class="settings-main">
+      <header class="settings-top" data-tauri-drag-region>
+        <button class="icon-button" aria-label="Close settings" title="Close (Esc)" onclick={() => settingsOpen = false}><X size={17}/></button>
+      </header>
+      <div class="settings-scroll">
+        {#key settingsSection}
+        <div class="settings-inner">
+          {#if settingsSection === 'general'}
+            <h1>General</h1><p class="lead">How πDesk looks, and what it keeps private.</p>
+            <h2>Appearance</h2>
+            <div class="settings-card">
+              <div class="setting-row"><span>Theme</span>
           <div class="segmented" role="radiogroup" aria-label="Theme">
             <button role="radio" aria-checked={theme === 'system'} class:on={theme === 'system'} onclick={() => setTheme('system')}><Monitor size={13}/> System</button>
             <button role="radio" aria-checked={theme === 'light'} class:on={theme === 'light'} onclick={() => setTheme('light')}><Sun size={13}/> Light</button>
             <button role="radio" aria-checked={theme === 'dark'} class:on={theme === 'dark'} onclick={() => setTheme('dark')}><Moon size={13}/> Dark</button>
           </div>
         </div>
-      </section>
-      <section>
-        <h3>New threads</h3><p>Every new thread starts with this model and effort. Existing threads keep their own.</p>
+            </div>
+            <h2>Privacy</h2>
+            <div class="settings-card prose"><p class="last">Pi stores its settings, extensions, credentials, and sessions inside πDesk’s private directory. Nothing is copied from your terminal Pi, and it is never modified. πDesk sends no product telemetry.</p></div>
+          {:else if settingsSection === 'models'}
+            <h1>Models</h1>
+            <p class="lead">Every new thread starts with this model and effort. Existing threads keep their own.</p>
         <div class="setting-group">
           <div class="setting-row"><span class="setting-name">Default model</span>
             {#if knownModels.length}
@@ -1267,9 +1562,9 @@
             </select>
           </div>
         </div>
-      </section>
-      <section>
-        <h3>Private Pi installation</h3><p>πDesk uses only its own copy under <code>~/.pidesk</code>. Your system Pi is never selected or modified.</p>
+          {:else if settingsSection === 'pi'}
+            <h1>Pi runtime</h1>
+            <p class="lead">πDesk uses only its own copy under <code>~/.pidesk</code>. Your system Pi is never selected or modified.</p>
         <div class="setting-group">
           <div class="setting-row"><span class="setting-name"><Terminal size={15} strokeWidth={1.8}/> Pi</span>
             {#if installation}<span class="version">{installation.version}</span>
@@ -1293,17 +1588,26 @@
         {/if}
         <button class="text-button" disabled={installInProgress || checkingRuntime} onclick={() => void checkPrivateRuntime()}><RefreshCw size={13}/> Check private installation</button>
         {#if installPlanError}<p role="alert">{installPlanError}</p>{/if}
-      </section>
-      {#if installation && installPlan}<section><PiSignIn command={installPlan.loginCommand} onOpenTerminal={openTerminal} /></section>{/if}
-      <section><h3>Privacy</h3><p class="last">Pi stores its settings, extensions, credentials, and sessions inside πDesk’s private directory. Nothing is copied from your terminal Pi, and it is never modified. πDesk sends no product telemetry.</p></section>
+            {#if installation && installPlan}<div class="settings-card signin"><PiSignIn command={installPlan.loginCommand} onOpenTerminal={openTerminal} /></div>{/if}
+          {:else if settingsSection === 'mcp'}
+            <h1>MCP servers</h1><p class="lead">Connect tools and data sources through the Model Context Protocol. πDesk's Pi reaches them with one <code>mcp</code> tool, and servers start only when a thread uses them.</p>
+            <McpServers onRunInTerminal={openTerminal} />
+          {:else}
+            <h1>Extensions</h1><p class="lead">Pi packages add tools, skills, prompts and themes to every thread. Search the <button class="text-link" onclick={() => void openExternal('https://pi.dev/packages')}>pi.dev gallery</button> or install one by name.</p>
+            <Extensions onUpdates={count => extensionUpdates = count} />
+          {/if}
+        </div>
+        {/key}
+      </div>
     </div>
   </div>
 {/if}
+{#if internStarted}<PiIntern open={internOpen} {projects} threadProjectId={visibleThread?.projectId ?? null} onClose={() => internOpen = false} onPending={count => internPending = count} onAttention={() => internOpen = true}/>{/if}
 {#if terminalOpen}
   <div class="overlay terminal-overlay" role="presentation">
     <div class="terminal-sheet dialog" role="dialog" aria-modal="true" aria-label="Pi terminal">
       <header><span><Terminal size={15}/> πDesk terminal</span><button class="icon-button" aria-label="Close terminal" onclick={() => terminalOpen = false}><X size={17}/></button></header>
-      <PiTerminal cwd={activeProject?.path} />
+      <PiTerminal cwd={activeProject?.path} run={terminalRun} />
     </div>
   </div>
 {/if}
@@ -1349,7 +1653,7 @@
   .new-thread { flex:1; display:flex; align-items:center; gap:8px; border:0; background:transparent; padding:5px 8px; border-radius:var(--radius-sm); color:var(--muted); font-size:12.5px; text-align:left; }
   .new-thread:hover:not(:disabled) { color:var(--text); background:color-mix(in srgb, var(--surface-2) 70%, transparent); }
   .new-thread :global(svg) { color:var(--accent); }
-  .thread-row { display:flex; align-items:center; border-radius:var(--radius-sm); height:28px; margin:1px 0; }
+  .thread-row { display:flex; align-items:center; border-radius:var(--radius-sm); min-height:44px; margin:1px 0; }
   .thread-row > .status-dot { margin:0 9px 0 8px; }
   .thread-row:hover { background:color-mix(in srgb, var(--surface-2) 70%, transparent); }
   .thread-row.active { background:var(--surface-2); }
@@ -1357,6 +1661,20 @@
   .thread-row:hover .thread-more, .thread-row.active .thread-more, .thread-more:focus-visible { opacity:1; }
   .thread-link { flex:1; min-width:0; display:flex; align-items:center; gap:9px; height:100%; border:0; background:none; color:var(--muted); text-align:left; padding:0 6px 0 8px; font-size:12.5px; }
   .thread-title { flex:1; min-width:0; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+  .thread-text { flex:1; min-width:0; display:flex; flex-direction:column; gap:2px; padding:5px 0; }
+  .thread-line { display:flex; align-items:center; gap:6px; min-width:0; }
+  .thread-meta { display:flex; align-items:center; gap:6px; min-width:0; overflow:hidden; white-space:nowrap; font-size:11px; color:var(--subtle); font-variant-numeric:tabular-nums; }
+  .meta-working { color:var(--accent); font-weight:500; }
+  .meta-bad { color:var(--bad); font-weight:500; }
+  .meta-done { color:var(--good); font-weight:500; }
+  .meta-chip { flex:none; height:16px; padding:0 5px; border-radius:4px; background:var(--surface-2); color:var(--muted); font-size:10.5px; font-weight:500; line-height:16px; max-width:110px; overflow:hidden; text-overflow:ellipsis; }
+  .meta-chip.mono { font-family:var(--mono); font-size:10px; }
+  .meta-diff { flex:none; } .meta-diff .add { color:var(--good); } .meta-diff .del { color:var(--bad); }
+  .row-pill { flex:none; position:relative; height:17px; padding:0 6px; border-radius:999px; background:var(--warn-bg); color:var(--warn); font-size:10px; font-weight:700; line-height:17px; animation:pill-pop .45s cubic-bezier(.34,1.36,.64,1) both; }
+  .row-pill.plan::after { content:""; position:absolute; inset:-1px; border-radius:inherit; border:1.5px solid var(--warn); animation:pill-ring 1.4s ease-out .2s 2 both; }
+  @keyframes pill-pop { from { transform:scale(.6); opacity:0; } }
+  @keyframes pill-ring { from { opacity:.9; transform:scale(1); } to { opacity:0; transform:scale(1.4, 1.8); } }
+  .pill-clock { margin-left:6px; opacity:.8; font-variant-numeric:tabular-nums; }
   .thread-link :global(.pin-mark) { color:var(--subtle); flex-shrink:0; }
   .threads-empty { padding:4px 8px 6px; color:var(--subtle); font-size:11.5px; }
   .thread-rename { flex:1; min-width:0; height:23px; padding:2px 5px; border:1px solid var(--line-strong); border-radius:5px; font-size:12px; background:var(--bg); color:var(--text); }
@@ -1393,6 +1711,10 @@
   .status-pill.completed { color:var(--good); background:var(--good-bg); }
   .status-pill.failed, .status-pill.disconnected { color:var(--bad); background:var(--bad-bg); }
   .header-actions { display:flex; align-items:center; gap:8px; flex-shrink:0; }
+  .worktree-chip { display:inline-flex; align-items:center; gap:5px; min-width:0; max-width:240px; height:22px; margin-left:4px; padding:0 8px; border:1px solid var(--line-strong); border-radius:999px; background:var(--surface); color:var(--muted); font:500 11.5px var(--mono); -webkit-app-region:no-drag; }
+  .worktree-chip span { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .worktree-chip :global(svg) { flex:none; color:var(--accent); }
+  .worktree-chip:hover { background:var(--surface-2); color:var(--text); }
   .badge { display:inline-flex; align-items:center; gap:4px; height:20px; padding:0 7px; border-radius:5px; border:1px solid var(--line-strong); color:var(--muted); font-size:10.5px; font-weight:600; letter-spacing:.03em; }
   .panel-toggles { display:flex; gap:2px; padding:2px; border-radius:8px; background:var(--surface); border:1px solid var(--line); }
   .toggle-button { display:inline-flex; align-items:center; gap:6px; height:26px; padding:0 10px; border:0; border-radius:6px; background:transparent; color:var(--muted); font-size:12px; font-weight:500; }
@@ -1430,7 +1752,7 @@
   .text-button:hover:not(:disabled) { color:var(--accent); }
 
   /* ---------- Dialogs ---------- */
-  .overlay { position:fixed; inset:0; background:rgb(0 0 0 / .35); z-index:30; display:flex; align-items:flex-start; justify-content:center; padding-top:14vh; backdrop-filter:blur(2px); animation:fade-in .12s ease-out; }
+  .overlay { position:fixed; inset:0; background:rgb(0 0 0 / .35); z-index:50; display:flex; align-items:flex-start; justify-content:center; padding-top:14vh; backdrop-filter:blur(2px); animation:fade-in .12s ease-out; }
   @keyframes fade-in { from { opacity:0; } to { opacity:1; } }
   .dialog { width:min(580px, calc(100vw - 48px)); background:var(--elevated); border-radius:var(--radius-lg); box-shadow:var(--shadow); overflow:hidden; animation:ui-pop .16s var(--ease); }
   .switch-search { height:54px; display:flex; align-items:center; gap:11px; padding:0 16px; border-bottom:1px solid var(--line); color:var(--subtle); }
@@ -1449,15 +1771,34 @@
   .dialog-footer { display:flex; gap:16px; padding:8px 14px; border-top:1px solid var(--line); font-size:11px; color:var(--subtle); }
   .dialog-footer span { display:flex; align-items:center; gap:4px; }
 
-  .settings { max-height:76vh; overflow:auto; }
-  .settings header { display:flex; align-items:center; justify-content:space-between; padding:14px 14px 14px 20px; border-bottom:1px solid var(--line); position:sticky; top:0; background:var(--elevated); z-index:1; }
-  .settings h2 { font-size:15px; font-weight:600; margin:0; }
-  .settings section { padding:16px 20px 18px; }
-  .settings section + section { border-top:1px solid var(--line); }
-  .settings h3 { font-size:12.5px; font-weight:600; margin:0 0 3px; }
-  .settings p { color:var(--muted); font-size:12px; line-height:1.55; margin:0 0 12px; }
-  .settings p.last { margin:0; }
-  .setting-group { border:1px solid var(--line); border-radius:var(--radius); padding:0 12px; margin-bottom:10px; background:var(--bg); }
+  .settings-page { position:fixed; inset:0; z-index:40; display:flex; background:var(--bg); animation:settings-in .22s var(--ease); }
+  @keyframes settings-in { from { opacity:0; transform:scale(.985); } }
+  .settings-nav { width:230px; flex:none; display:flex; flex-direction:column; gap:2px; padding:56px 12px 14px; background:var(--sidebar); border-right:1px solid var(--line); }
+  .settings-nav-title { padding:0 10px 12px; font-size:18px; font-weight:650; letter-spacing:-.02em; }
+  .settings-nav-item { display:flex; align-items:center; gap:10px; height:34px; padding:0 10px; border:0; border-radius:var(--radius); background:none; color:var(--muted); font-size:13px; font-weight:500; text-align:left; transition:background .12s, color .12s; }
+  .settings-nav-item:hover { background:var(--surface-2); color:var(--text); }
+  .settings-nav-item.on { background:var(--surface-2); color:var(--text); }
+  .settings-nav-item.on :global(svg) { color:var(--accent); }
+  .settings-nav-item span:first-of-type { flex:1; }
+  .nav-badge { min-width:18px; height:18px; padding:0 5px; border-radius:999px; background:var(--warn-bg); color:var(--warn); font-size:11px; font-weight:700; line-height:18px; text-align:center; }
+  .settings-nav-foot { padding:0 10px; color:var(--subtle); font-size:11px; }
+  .settings-main { flex:1; min-width:0; display:flex; flex-direction:column; }
+  .settings-top { height:var(--header-height); flex:none; display:flex; align-items:center; justify-content:flex-end; padding:0 14px; }
+  .settings-scroll { flex:1; min-height:0; overflow:auto; }
+  .settings-inner { max-width:760px; margin:0 auto; padding:8px 40px 56px; animation:ui-rise .2s var(--ease); }
+  .settings-inner h1 { margin:0 0 6px; font-size:24px; font-weight:650; letter-spacing:-.025em; }
+  .settings-inner h2 { margin:28px 0 8px; font-size:12px; font-weight:600; letter-spacing:.04em; text-transform:uppercase; color:var(--subtle); }
+  .settings-inner .lead { margin:0 0 22px; color:var(--muted); font-size:13.5px; line-height:1.55; max-width:62ch; }
+  .settings-inner p { color:var(--muted); font-size:12.5px; line-height:1.55; }
+  .settings-card { padding:4px 16px; border:1px solid var(--line); border-radius:12px; background:var(--panel); }
+  .settings-card.prose { padding:14px 16px; }
+  .settings-card.prose p { margin:0; }
+  .settings-card.signin { margin-top:16px; padding:16px; }
+  .text-link { border:0; padding:0; background:none; color:var(--accent); font:inherit; }
+  .text-link:hover { text-decoration:underline; }
+  .settings-button { position:relative; }
+  .gear-badge { position:absolute; top:5px; right:5px; width:7px; height:7px; border-radius:50%; background:var(--warn); box-shadow:0 0 0 2px var(--sidebar); }
+  .setting-group { border:1px solid var(--line); border-radius:12px; padding:4px 16px; margin-bottom:12px; background:var(--panel); }
   .setting-row { display:flex; align-items:center; gap:12px; min-height:44px; }
   .setting-row > span:first-child { display:flex; align-items:center; gap:9px; margin-right:auto; white-space:nowrap; font-size:12.5px; }
   .setting-name :global(svg) { color:var(--subtle); }

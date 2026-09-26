@@ -19,6 +19,10 @@ const MAX_PROBE_BYTES: u64 = 1024 * 1024;
 const MAX_LOG_LINE_BYTES: usize = 4096;
 const MAX_LOG_LINES: usize = 5000;
 const INSTALL_TIMEOUT_SECS: u64 = 600;
+/// Pi packages every new private installation starts with. πDesk's MCP
+/// servers settings manage this adapter's configuration.
+pub const DEFAULT_PACKAGES: &[&str] = &["npm:pi-mcp-adapter"];
+const DEFAULT_PACKAGE_TIMEOUT_SECS: u64 = 300;
 type Emit = Arc<dyn Fn(BackendEvent) + Send + Sync>;
 
 fn executable_in(root: &Path) -> PathBuf {
@@ -68,8 +72,14 @@ pub(crate) fn private_pi_invocation(root: &Path) -> String {
     let sessions = shell_quote(&root.join("agent/sessions").to_string_lossy());
     let bin = shell_quote(&root.join("runtime/node_modules/.bin").to_string_lossy());
     let executable = shell_quote(&executable_in(root).to_string_lossy());
-    let home = shell_quote(&util::home_dir().to_string_lossy());
-    format!("/usr/bin/env -i HOME={home} USER=\"${{USER:-}}\" PATH={bin}:\"$PATH\" TERM=\"${{TERM:-xterm-256color}}\" PI_CODING_AGENT_DIR={agent} PI_CODING_AGENT_SESSION_DIR={sessions} PI_SKIP_VERSION_CHECK=1 PI_TELEMETRY=0 {executable} --no-approve --session-dir {sessions}")
+    let real_home = shell_quote(&util::home_dir().to_string_lossy());
+    let private_home = util::private_home_env(root)
+        .iter()
+        .map(|(key, value)| format!("{key}={}", shell_quote(&value.to_string_lossy())))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let modes = shell_quote(&root.join("extensions/pidesk-modes.mjs").to_string_lossy());
+    format!("/usr/bin/env -i {private_home} {}={real_home} USER=\"${{USER:-}}\" PATH={bin}:\"$PATH\" TERM=\"${{TERM:-xterm-256color}}\" PI_CODING_AGENT_DIR={agent} PI_CODING_AGENT_SESSION_DIR={sessions} PI_SKIP_VERSION_CHECK=1 PI_TELEMETRY=0 {executable} --no-approve --session-dir {sessions} --extension {modes}", util::REAL_HOME_ENV)
 }
 
 fn install_plan(root: &Path) -> HarnessInstallCommand {
@@ -378,6 +388,12 @@ impl HarnessRegistry {
         }
     }
 
+    pub(crate) fn cancel_current_install(&self) {
+        if self.installing.load(Ordering::SeqCst) {
+            self.stop_install.notify_one();
+        }
+    }
+
     pub async fn shutdown(&self) {
         self.closing.store(true, Ordering::SeqCst);
         self.stop_install.notify_one();
@@ -464,6 +480,7 @@ impl HarnessRegistry {
             return Err(AppError::new("Pi installation is already running."));
         }
         let _activity = InstallActivity(self);
+        let _ = tokio::time::timeout(std::time::Duration::ZERO, self.stop_install.notified()).await;
         let result = self.perform_install(&emit).await;
         let error = result
             .as_ref()
@@ -589,6 +606,7 @@ impl HarnessRegistry {
             stage: InstallStage::Installing,
         });
         self.check_open()?;
+        util::prepare_private_home(&self.root)?;
         let mut child = command_for(&self.root, npm)
             .args(install_args(&self.root))
             .current_dir(self.root.join("runtime"))
@@ -613,7 +631,7 @@ impl HarnessRegistry {
             _ = self.stop_install.notified() => {
                 stop_child(&mut child).await;
                 out_task.abort(); err_task.abort();
-                return Err(AppError::new("Installation stopped because πDesk is closing. Retry next time you open the app."));
+                return Err(AppError::new(if self.closing.load(Ordering::SeqCst) { "Installation stopped because πDesk is closing. Retry next time you open the app." } else { "Installation was cancelled. Retry when you are ready." }));
             }
         };
         let Ok(status) = status else {
@@ -654,6 +672,10 @@ impl HarnessRegistry {
         let installation = self.validated_installation().await?;
         self.check_open()?;
         std::fs::remove_file(marker)?;
+        // The terminal's sign-in command loads it, so it must exist now.
+        crate::threads::write_modes_extension(&self.root)?;
+        self.install_default_packages(emit, Path::new(&installation.path))
+            .await;
         emit(BackendEvent::InstallProgress {
             kind: HarnessKind::Pi,
             line: format!(
@@ -662,6 +684,41 @@ impl HarnessRegistry {
             ),
         });
         Ok(())
+    }
+
+    /// Add πDesk's default packages to a fresh private Pi. Best effort: a
+    /// failure is reported in the log and never fails the runtime install.
+    async fn install_default_packages(&self, emit: &Emit, executable: &Path) {
+        let declared = crate::pi_settings::read_packages(&self.root).unwrap_or_default();
+        for source in DEFAULT_PACKAGES {
+            if declared.iter().any(|existing| existing == source) {
+                continue;
+            }
+            let line = |line: String| {
+                emit(BackendEvent::InstallProgress {
+                    kind: HarnessKind::Pi,
+                    line,
+                })
+            };
+            line(format!("Adding {source} so πDesk can manage MCP servers…"));
+            let mut command = Command::new(executable);
+            util::configure_private_command(&mut command, &self.root);
+            command
+                .current_dir(&self.root)
+                .args(["install", source, "--no-approve"])
+                .kill_on_drop(true);
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(DEFAULT_PACKAGE_TIMEOUT_SECS),
+                command.output(),
+            )
+            .await;
+            match result {
+                Ok(Ok(output)) if output.status.success() => line(format!("Added {source}.")),
+                _ => line(format!(
+                    "Could not add {source}. Pi still works; add it later from Settings → MCP servers."
+                )),
+            }
+        }
     }
 }
 
@@ -822,40 +879,55 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_stops_fake_installer_and_keeps_incomplete_marker() {
-        let root = root();
-        fake_private_pi(&root);
-        let node = root.join("fake-node");
-        let npm = root.join("fake-npm");
-        std::fs::write(&node, "#!/bin/sh\necho v22.19.0\n").unwrap();
-        std::fs::write(&npm, "#!/bin/sh\necho started\nexec /bin/sleep 60\n").unwrap();
-        for bin in [&node, &npm] {
-            std::fs::set_permissions(bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let started = parking_lot::Mutex::new(Some(tx));
-        let emit: Emit = Arc::new(move |event| {
-            if matches!(event, BackendEvent::InstallProgress { ref line, .. } if line == "started")
-            {
-                if let Some(tx) = started.lock().take() {
-                    let _ = tx.send(());
-                }
+        for closing in [true, false] {
+            let root = root();
+            fake_private_pi(&root);
+            let node = root.join("fake-node");
+            let npm = root.join("fake-npm");
+            std::fs::write(&node, "#!/bin/sh\necho v22.19.0\n").unwrap();
+            std::fs::write(&npm, "#!/bin/sh\necho started\nexec /bin/sleep 60\n").unwrap();
+            for bin in [&node, &npm] {
+                std::fs::set_permissions(bin, std::fs::Permissions::from_mode(0o755)).unwrap();
             }
-        });
-        let registry = Arc::new(HarnessRegistry::at_root(root.clone()));
-        let running = registry.clone();
-        let job = tokio::spawn(async move { running.install_package(&emit, &node, &npm).await });
-        tokio::time::timeout(std::time::Duration::from_secs(10), rx)
-            .await
-            .unwrap()
-            .unwrap();
-        registry.shutdown().await;
-        let result = tokio::time::timeout(std::time::Duration::from_secs(5), job)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(result.unwrap_err().to_string().contains("closing"));
-        assert!(root.join("runtime").join(INCOMPLETE_MARKER).exists());
-        std::fs::remove_dir_all(root).unwrap();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let started = parking_lot::Mutex::new(Some(tx));
+            let emit: Emit = Arc::new(move |event| {
+                if matches!(event, BackendEvent::InstallProgress { ref line, .. } if line == "started")
+                {
+                    if let Some(tx) = started.lock().take() {
+                        let _ = tx.send(());
+                    }
+                }
+            });
+            let registry = Arc::new(HarnessRegistry::at_root(root.clone()));
+            let running = registry.clone();
+            let job =
+                tokio::spawn(async move { running.install_package(&emit, &node, &npm).await });
+            tokio::time::timeout(std::time::Duration::from_secs(10), rx)
+                .await
+                .unwrap()
+                .unwrap();
+            if closing {
+                registry.shutdown().await;
+            } else {
+                registry.installing.store(true, Ordering::SeqCst);
+                registry.cancel_current_install();
+            }
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), job)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(result.unwrap_err().to_string().contains(if closing {
+                "closing"
+            } else {
+                "cancelled"
+            }));
+            if !closing {
+                assert!(registry.check_open().is_ok());
+            }
+            assert!(root.join("runtime").join(INCOMPLETE_MARKER).exists());
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]

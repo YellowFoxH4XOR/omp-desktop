@@ -40,7 +40,7 @@
     return [...byProject.entries()]
       .map(([projectId, list]) => ({
         projectId,
-        name: projects.find((project) => project.id === projectId)?.displayName ?? 'Unknown project',
+        name: projects.find((project) => project.id === projectId)?.displayName ?? (projectId === 'pidesk-intern-project' ? 'Pi Intern' : 'Unknown project'),
         bytes: list.reduce((sum, thread) => sum + (thread.memoryBytes ?? 0), 0),
         threads: list,
       }))

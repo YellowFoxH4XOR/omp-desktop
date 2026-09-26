@@ -27,6 +27,8 @@ pub struct ThreadRow {
     pub created_at: String,
     pub last_viewed_at: String,
     pub worktree_path: Option<String>,
+    /// `auto` (default) or `plan`; see `pidesk-modes.mjs`.
+    pub mode: String,
 }
 
 impl ThreadRow {
@@ -45,6 +47,7 @@ impl ThreadRow {
             created_at: self.created_at,
             last_viewed_at: self.last_viewed_at,
             worktree_path: self.worktree_path,
+            mode: self.mode,
         }
     }
 }
@@ -99,6 +102,13 @@ impl Store {
                key TEXT PRIMARY KEY,
                value TEXT NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS thread_modes (
+               thread_id TEXT PRIMARY KEY REFERENCES threads(id) ON DELETE CASCADE,
+               mode TEXT NOT NULL CHECK (mode IN ('plan', 'auto'))
+             );
+             CREATE TABLE IF NOT EXISTS intern_threads (
+               thread_id TEXT PRIMARY KEY REFERENCES threads(id) ON DELETE CASCADE
+             );
              DROP TABLE IF EXISTS hidden_projects;",
         )?;
         Ok(())
@@ -111,6 +121,7 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT id, path, display_name, preferred_harness, is_git, created_at, last_opened_at
              FROM projects
+             WHERE id != 'pidesk-intern-project'
              ORDER BY last_opened_at DESC",
         )?;
         let rows = stmt
@@ -221,6 +232,115 @@ impl Store {
         Ok(())
     }
 
+    /// Intern's coordinator uses the same session/lifecycle machinery but is
+    /// not a user project. No external Pi profile or session is imported.
+    pub fn ensure_intern(&self, cwd: &str) -> AppResult<ThreadRow> {
+        let now = now_iso();
+        self.conn.lock().execute(
+            "INSERT OR IGNORE INTO projects(id,path,display_name,preferred_harness,is_git,created_at,last_opened_at) VALUES('pidesk-intern-project',?1,'Pi Intern','pi',0,?2,?2)",
+            params![cwd, now],
+        )?;
+        let id = crate::intern::COORDINATOR_ID;
+        if self.get_thread(id).is_err() {
+            self.upsert_thread(
+                id,
+                "pidesk-intern-project",
+                HarnessKind::Pi,
+                "",
+                "",
+                cwd,
+                "Pi Intern",
+                "idle",
+                None,
+                None,
+            )?;
+        }
+        self.mark_intern_thread(id)?;
+        self.get_thread(id)
+    }
+
+    pub fn create_thread_metadata(
+        &self,
+        id: &str,
+        project_id: &str,
+        harness: HarnessKind,
+        cwd: &str,
+        worktree: Option<&str>,
+        guarded: bool,
+    ) -> AppResult<ThreadRow> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let now = now_iso();
+        tx.execute("INSERT INTO threads(id,project_id,harness,cwd,created_at,last_viewed_at,worktree_path) VALUES(?1,?2,?3,?4,?5,?5,?6)",params![id,project_id,harness.as_str(),cwd,now,worktree])?;
+        if guarded {
+            tx.execute(
+                "INSERT INTO intern_threads(thread_id) VALUES(?1)",
+                params![id],
+            )?;
+        }
+        tx.commit()?;
+        drop(conn);
+        self.get_thread(id)
+    }
+
+    pub fn mark_intern_thread(&self, id: &str) -> AppResult<()> {
+        self.conn.lock().execute(
+            "INSERT OR IGNORE INTO intern_threads(thread_id) VALUES(?1)",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    /// Threads Intern starts are ordinary project threads with full Pi.
+    /// Release any guarded workers left by earlier builds so only the
+    /// coordinator keeps the Intern guard.
+    /// Threads default to Auto; only a Plan choice is stored.
+    pub fn set_thread_mode(&self, id: &str, mode: &str) -> AppResult<ThreadRow> {
+        if !matches!(mode, "plan" | "auto") {
+            return Err(AppError::new("Thread mode must be plan or auto."));
+        }
+        self.get_thread(id)?;
+        {
+            let conn = self.conn.lock();
+            if mode == "auto" {
+                conn.execute("DELETE FROM thread_modes WHERE thread_id = ?1", params![id])?;
+            } else {
+                conn.execute(
+                    "INSERT INTO thread_modes(thread_id, mode) VALUES(?1, ?2)
+                     ON CONFLICT(thread_id) DO UPDATE SET mode = excluded.mode",
+                    params![id, mode],
+                )?;
+            }
+        }
+        self.get_thread(id)
+    }
+
+    pub fn release_intern_workers(&self) -> AppResult<()> {
+        self.conn.lock().execute(
+            "DELETE FROM intern_threads WHERE thread_id != ?1",
+            params![crate::intern::COORDINATOR_ID],
+        )?;
+        Ok(())
+    }
+
+    pub fn is_intern_thread(&self, id: &str) -> AppResult<bool> {
+        Ok(self.conn.lock().query_row(
+            "SELECT EXISTS(SELECT 1 FROM intern_threads WHERE thread_id=?1)",
+            params![id],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn intern_thread_ids(&self) -> AppResult<Vec<String>> {
+        let conn = self.conn.lock();
+        let mut statement =
+            conn.prepare("SELECT thread_id FROM intern_threads ORDER BY thread_id")?;
+        let ids = statement
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<String>, _>>()?;
+        Ok(ids)
+    }
+
     // ---- threads ----
 
     fn row_to_thread(r: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadRow> {
@@ -238,11 +358,14 @@ impl Store {
             created_at: r.get(10)?,
             last_viewed_at: r.get(11)?,
             worktree_path: r.get(12)?,
+            mode: r
+                .get::<_, Option<String>>(13)?
+                .unwrap_or_else(|| "auto".into()),
         })
     }
 
     const THREAD_COLS: &'static str =
-        "id, project_id, harness, session_id, session_file, cwd, title, pinned, archived, status, created_at, last_viewed_at, worktree_path";
+        "id, project_id, harness, session_id, session_file, cwd, title, pinned, archived, status, created_at, last_viewed_at, worktree_path, (SELECT mode FROM thread_modes WHERE thread_id = threads.id)";
 
     /// Session files already mapped to a thread, so discovery never imports a
     /// second thread for the same journal.
@@ -266,6 +389,23 @@ impl Store {
         ))?;
         let rows = stmt
             .query_map(params![project_id], Self::row_to_thread)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Most recently opened, unarchived threads across registered projects,
+    /// for the welcome screen. Read-only: never touches project timestamps.
+    pub fn list_recent_threads(&self, limit: usize) -> AppResult<Vec<ThreadRow>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM threads
+             WHERE archived = 0 AND project_id != 'pidesk-intern-project'
+               AND project_id IN (SELECT id FROM projects)
+             ORDER BY last_viewed_at DESC LIMIT ?1",
+            Self::THREAD_COLS
+        ))?;
+        let rows = stmt
+            .query_map(params![limit.min(50) as i64], Self::row_to_thread)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -332,6 +472,22 @@ impl Store {
         conn.execute(
             "UPDATE threads SET status = ?2 WHERE id = ?1",
             params![id, status],
+        )?;
+        Ok(())
+    }
+
+    /// Replace a thread's session mapping outright (a host-initiated fresh
+    /// conversation), including clearing a file Pi has not assigned yet.
+    pub fn replace_thread_session(
+        &self,
+        id: &str,
+        session_id: &str,
+        session_file: &str,
+    ) -> AppResult<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE threads SET session_id = ?2, session_file = ?3 WHERE id = ?1",
+            params![id, session_id, session_file],
         )?;
         Ok(())
     }
@@ -461,6 +617,120 @@ mod tests {
         }
         assert_eq!(std::fs::read_to_string(source).unwrap(), "keep me");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn recent_threads_span_projects_skip_archived_and_intern_and_keep_project_order() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let intern = store.ensure_intern("/tmp/private-intern").unwrap();
+        let a = store
+            .add_project("/tmp/recent-a", "A", HarnessKind::Pi, true)
+            .unwrap();
+        let b = store
+            .add_project("/tmp/recent-b", "B", HarnessKind::Pi, true)
+            .unwrap();
+        let before = store.list_projects().unwrap();
+        for (id, project, viewed) in [
+            ("old", &a.id, "2026-01-01T00:00:00Z"),
+            ("new", &b.id, "2026-03-01T00:00:00Z"),
+            ("archived", &a.id, "2026-04-01T00:00:00Z"),
+        ] {
+            store
+                .upsert_thread(
+                    id,
+                    project,
+                    HarnessKind::Pi,
+                    "",
+                    "",
+                    "/tmp",
+                    id,
+                    "idle",
+                    None,
+                    None,
+                )
+                .unwrap();
+            store
+                .conn
+                .lock()
+                .execute(
+                    "UPDATE threads SET last_viewed_at = ?2 WHERE id = ?1",
+                    params![id, viewed],
+                )
+                .unwrap();
+        }
+        store
+            .set_thread_flags("archived", None, Some(true))
+            .unwrap();
+        store.touch_thread(&intern.id).unwrap();
+        let ids = store
+            .list_recent_threads(10)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["new", "old"]);
+        assert_eq!(store.list_recent_threads(1).unwrap().len(), 1);
+        let after = store.list_projects().unwrap();
+        assert_eq!(
+            before.iter().map(|p| &p.last_opened_at).collect::<Vec<_>>(),
+            after.iter().map(|p| &p.last_opened_at).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn intern_coordinator_is_hidden_and_guards_are_persistent_metadata() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let one = store.ensure_intern("/tmp/private-intern").unwrap();
+        let two = store.ensure_intern("/tmp/private-intern").unwrap();
+        assert_eq!(one.id, two.id);
+        assert!(store.list_projects().unwrap().is_empty());
+        assert!(store.is_intern_thread(&one.id).unwrap());
+        assert_eq!(store.intern_thread_ids().unwrap(), vec![one.id.clone()]);
+        store.delete_thread(&one.id).unwrap();
+        assert!(store.intern_thread_ids().unwrap().is_empty());
+    }
+
+    #[test]
+    fn thread_mode_defaults_to_auto_persists_plan_and_rejects_unknown_modes() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let project = store
+            .add_project("/tmp/modes", "M", HarnessKind::Pi, true)
+            .unwrap();
+        let row = store
+            .create_thread_metadata("t", &project.id, HarnessKind::Pi, "/tmp", None, false)
+            .unwrap();
+        assert_eq!(row.mode, "auto");
+        assert_eq!(store.set_thread_mode("t", "plan").unwrap().mode, "plan");
+        assert_eq!(store.list_threads(&project.id).unwrap()[0].mode, "plan");
+        assert!(store.set_thread_mode("t", "yolo").is_err());
+        assert_eq!(store.get_thread("t").unwrap().mode, "plan");
+        assert_eq!(store.set_thread_mode("t", "auto").unwrap().mode, "auto");
+        assert!(store.set_thread_mode("missing", "plan").is_err());
+        store.set_thread_mode("t", "plan").unwrap();
+        store.delete_thread("t").unwrap();
+        let count: i64 = store
+            .conn
+            .lock()
+            .query_row("SELECT COUNT(*) FROM thread_modes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn startup_releases_guarded_workers_but_keeps_the_coordinator_guarded() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let coordinator = store.ensure_intern("/tmp/private-intern").unwrap();
+        let project = store
+            .add_project("/tmp/release-workers", "W", HarnessKind::Pi, true)
+            .unwrap();
+        let worker = store
+            .create_thread_metadata("worker", &project.id, HarnessKind::Pi, "/tmp", None, true)
+            .unwrap();
+        assert!(store.is_intern_thread(&worker.id).unwrap());
+        store.release_intern_workers().unwrap();
+        assert!(!store.is_intern_thread(&worker.id).unwrap());
+        assert!(store.get_thread(&worker.id).is_ok());
+        assert_eq!(store.intern_thread_ids().unwrap(), vec![coordinator.id]);
     }
 
     #[test]

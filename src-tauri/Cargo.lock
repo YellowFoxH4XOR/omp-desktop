@@ -2663,6 +2663,7 @@ dependencies = [
 name = "pidesk"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "libc",
  "notify",
  "parking_lot",

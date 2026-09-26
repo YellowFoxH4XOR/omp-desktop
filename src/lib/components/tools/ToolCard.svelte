@@ -2,6 +2,9 @@
   import CommandCard from './CommandCard.svelte';
   import EditCard from './EditCard.svelte';
   import GenericCard from './GenericCard.svelte';
+  import PlanCard from './PlanCard.svelte';
+  import McpCard from './McpCard.svelte';
+  import { loadMcpServers, mcpCall } from './mcp-tools.svelte';
   import ReadCard from './ReadCard.svelte';
   import SearchCard from './SearchCard.svelte';
   import TodoCard from './TodoCard.svelte';
@@ -15,7 +18,11 @@
 
   let { item, onShowChanges }: Props = $props();
 
-  type Category = 'command' | 'read' | 'search' | 'edit' | 'write' | 'web' | 'todo' | 'generic';
+  // MCP calls (the adapter's tools, or `<server>_<tool>` direct tools) get their own card.
+  void loadMcpServers();
+  const mcp = $derived(mcpCall(item));
+
+  type Category = 'command' | 'read' | 'search' | 'edit' | 'write' | 'web' | 'todo' | 'plan-approval' | 'generic';
 
   const CATEGORY_BY_NAME: Record<string, Category> = {
     bash: 'command',
@@ -87,6 +94,7 @@
     plan: 'todo',
     updateplan: 'todo',
     update_plan: 'todo',
+    request_auto: 'plan-approval',
   };
 
   function normalize(name: string): string {
@@ -100,7 +108,9 @@
   });
 </script>
 
-{#if category === 'command'}
+{#if mcp}
+  <McpCard {item} call={mcp} />
+{:else if category === 'command'}
   <CommandCard {item} />
 {:else if category === 'read'}
   <ReadCard {item} />
@@ -114,6 +124,8 @@
   <WebCard {item} />
 {:else if category === 'todo'}
   <TodoCard {item} />
+{:else if category === 'plan-approval'}
+  <PlanCard {item} />
 {:else}
   <GenericCard {item} />
 {/if}

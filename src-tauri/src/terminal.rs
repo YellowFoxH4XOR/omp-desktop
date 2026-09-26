@@ -120,6 +120,9 @@ impl TerminalManager {
             .canonicalize()
             .map_err(|_| AppError::new("Terminal working directory does not exist."))?;
         let root = util::pidesk_root();
+        // `pi` here uses the same private home and modes extension as threads.
+        util::prepare_private_home(&root)?;
+        crate::threads::write_modes_extension(&root)?;
         let (shell, args, zdotdir) = shell_command(&root)?;
         let mut command = CommandBuilder::new(shell);
         command.args(args);
@@ -203,12 +206,21 @@ impl TerminalManager {
         std::thread::spawn(move || {
             let mut reader = reader;
             let mut buf = [0u8; OUTPUT_CHUNK];
-            while flow.wait_until_writable() {
+            loop {
+                // Keep draining after close. On macOS a dying slave can wait
+                // for queued terminal output; stopping the reader before
+                // waiting for the child deadlocks a saturated PTY's teardown.
+                let forwarding = flow.wait_until_writable();
                 match reader.read(&mut buf) {
                     Ok(len) if len > 0 => {
-                        flow.sent(len);
-                        if !send(buf[..len].to_vec()) {
-                            break;
+                        if forwarding {
+                            flow.sent(len);
+                            if !send(buf[..len].to_vec()) {
+                                flow.close();
+                                let cleanup = manager.clone();
+                                let id = read_id.clone();
+                                std::thread::spawn(move || cleanup.close(&id));
+                            }
                         }
                     }
                     _ => break,
@@ -708,6 +720,39 @@ mod tests {
         manager.close(&id);
         assert!(closing.elapsed() < Duration::from_secs(3));
         assert!(manager.sessions.lock().open.is_empty());
+    }
+
+    #[test]
+    fn failed_consumer_still_drains_saturated_pty_during_teardown() {
+        let manager = TerminalManager::new();
+        let (sender, receiver) = mpsc::channel();
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.args(["-c", "echo $$; exec /usr/bin/yes"]);
+        let id = manager
+            .open_command(PtySize::default(), command, move |bytes| {
+                let _ = sender.send(bytes);
+                std::thread::sleep(Duration::from_millis(50));
+                false
+            })
+            .unwrap();
+        let output = receiver.recv_timeout(Duration::from_secs(3)).unwrap();
+        let pid: i32 = String::from_utf8_lossy(&output)
+            .lines()
+            .next()
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while unsafe { libc::kill(pid, 0) } == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            -1,
+            "failed output consumer left its process alive"
+        );
+        assert!(!manager.sessions.lock().open.contains_key(&id));
     }
 
     #[test]

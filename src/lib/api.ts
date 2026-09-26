@@ -1,9 +1,15 @@
 import { invoke, type Channel } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { z } from 'zod';
-import type { BackendEvent, ChangesSummary, GitFile, HarnessInstallation, HarnessInstallCommand, HarnessKind, ModelInfo, Project, SessionSnapshot, SessionState, Thread, ThreadDeletePreview, UiResponse, Usage, RuntimeStats, ModelDefaults } from './types';
+import type { BackendEvent, CatalogPage, ChangesSummary, InstalledPackage, McpOverview, GitFile, HarnessInstallation, HarnessInstallCommand, HarnessKind, ModelInfo, Project, SessionSnapshot, SessionState, Thread, ThreadDeletePreview, ThreadMode, UiResponse, Usage, RuntimeStats, ModelDefaults, InternImage, InternPlan } from './types';
 
 export const api = {
+  internSnapshot: () => invoke<SessionSnapshot>('intern_snapshot'),
+  internPrompt: (message: string, projectId: string | undefined, images: InternImage[]) => invoke<void>('intern_prompt', { message, projectId, images }),
+  internPlans: () => invoke<InternPlan[]>('intern_plans'),
+  internApprove: (planId: string, approved: boolean) => invoke<void>('intern_approve', { planId, approved }),
+  internStop: () => invoke<void>('intern_stop'),
+  internClear: () => invoke<SessionSnapshot>('intern_clear'),
   detectHarnesses: () => invoke<HarnessInstallation[]>('detect_harnesses'),
   installHarness: (kind: HarnessKind) => invoke<void>('install_harness', { kind }),
   harnessInstallCommands: () => invoke<HarnessInstallCommand[]>('harness_install_commands'),
@@ -11,6 +17,7 @@ export const api = {
   addProject: (path: string, harness: HarnessKind) => invoke<Project>('add_project', { path, harness }),
   removeProject: (projectId: string) => invoke<void>('remove_project', { projectId }),
   listThreads: (projectId: string) => invoke<Thread[]>('list_threads', { projectId }),
+  listRecentThreads: (limit: number) => invoke<Thread[]>('list_recent_threads', { limit }),
   createThread: (projectId: string, harness: HarnessKind, isolated = false) => invoke<Thread>('create_thread', { projectId, harness, isolated }),
   openThread: (threadId: string) => invoke<SessionSnapshot>('open_thread', { threadId }),
   stopThread: (threadId: string) => invoke<void>('stop_thread', { threadId }),
@@ -29,7 +36,24 @@ export const api = {
   getModels: (threadId: string) => invoke<ModelInfo[]>('get_models', { threadId }),
   getEffortLevels: (threadId: string) => invoke<string[]>('get_effort_levels', { threadId }),
   getUsage: (threadId: string) => invoke<Usage>('get_usage', { threadId }),
+  compactThread: (threadId: string, instructions?: string) => invoke<void>('compact_thread', { threadId, instructions }),
+  listThreadFiles: (threadId: string) => invoke<{ files: string[]; truncated: boolean }>('list_thread_files', { threadId }),
   renameThread: (threadId: string, title: string) => invoke<Thread>('rename_thread', { threadId, title }),
+  setThreadMode: (threadId: string, mode: ThreadMode) => invoke<Thread>('set_thread_mode', { threadId, mode }),
+  extensionsCatalog: (query: string, kind: string, sort: string, page: number) => invoke<CatalogPage>('extensions_catalog', { query, kind, sort, page }),
+  extensionsInstalled: () => invoke<InstalledPackage[]>('extensions_installed'),
+  extensionsCheckUpdates: () => invoke<InstalledPackage[]>('extensions_check_updates'),
+  extensionsInstall: (source: string) => invoke<string>('extensions_install', { source }),
+  extensionsUpdate: (source: string) => invoke<void>('extensions_update', { source }),
+  extensionsRemove: (source: string) => invoke<void>('extensions_remove', { source }),
+  mcpOverview: () => invoke<McpOverview>('mcp_overview'),
+  mcpSaveServer: (original: string | null, name: string, config: Record<string, unknown>) => invoke<void>('mcp_save_server', { original, name, config }),
+  mcpRemoveServer: (name: string) => invoke<void>('mcp_remove_server', { name }),
+  mcpSetEnabled: (name: string, enabled: boolean) => invoke<void>('mcp_set_enabled', { name, enabled }),
+  mcpSetApproveTools: (all: boolean) => invoke<void>('mcp_set_approve_tools', { all }),
+  mcpSaveRaw: (text: string) => invoke<void>('mcp_save_raw', { text }),
+  mcpImport: (source: string, names: string[]) => invoke<string[]>('mcp_import', { source, names }),
+  mcpInstallAdapter: () => invoke<void>('mcp_install_adapter'),
   setThreadFlags: (threadId: string, pinned?: boolean, archived?: boolean) => invoke<Thread>('set_thread_flags', { threadId, pinned, archived }),
   respondUi: (threadId: string, requestId: string, response: UiResponse) => invoke<void>('respond_ui', { threadId, requestId, response }),
   terminalOpen: (cols: number, rows: number, cwd: string | undefined, output: Channel<ArrayBuffer>) => invoke<string>('terminal_open', { cols, rows, cwd, output }),
@@ -45,6 +69,7 @@ export const api = {
 };
 
 const eventSchema = z.discriminatedUnion('type', [
+  z.object({ type: z.literal('intern_changed') }),
   z.object({ type: z.literal('rpc'), threadId: z.string(), frame: z.record(z.string(), z.unknown()) }),
   z.object({ type: z.literal('exited'), threadId: z.string(), code: z.number().nullish().transform(value => value ?? undefined), stderr: z.string(), expected: z.boolean() }),
   z.object({ type: z.literal('git_changed'), threadId: z.string() }),

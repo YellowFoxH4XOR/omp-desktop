@@ -22,6 +22,21 @@
   // svelte-ignore state_referenced_locally
   let open = $state(initiallyOpen);
 
+  // A step that finishes while you watch flashes once; history stays calm.
+  let justDone = $state(false);
+  // svelte-ignore state_referenced_locally
+  let previous = status;
+  $effect(() => {
+    const next = status;
+    if (previous === 'running' && next === 'completed' && !failed) {
+      justDone = true;
+      const timer = setTimeout(() => (justDone = false), 700);
+      previous = next;
+      return () => clearTimeout(timer);
+    }
+    previous = next;
+  });
+
   const statusLabel: Record<ToolStatus, string> = {
     queued: 'Queued',
     running: 'Running',
@@ -39,6 +54,7 @@
   class:running={status === 'running'}
   class:queued={status === 'queued'}
   class:cancelled={status === 'cancelled'}
+  class:just-done={justDone}
 >
   <button
     type="button"
@@ -116,6 +132,23 @@
   }
   .head:hover .node {
     background: var(--surface);
+  }
+  .tool.just-done .node {
+    color: var(--good);
+    animation: node-done 0.7s var(--ease);
+  }
+  @keyframes node-done {
+    0% {
+      transform: scale(0.85);
+      box-shadow: inset 0 0 0 1px var(--good), 0 0 0 0 var(--good-bg);
+    }
+    45% {
+      transform: scale(1.12);
+      box-shadow: inset 0 0 0 1px var(--good), 0 0 0 5px var(--good-bg);
+    }
+    100% {
+      transform: none;
+    }
   }
   .tool.running .node {
     color: var(--accent);
