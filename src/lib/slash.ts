@@ -37,3 +37,37 @@ export function parseSlash(message: string): { name: string; args: string } | nu
   const match = /^\/([A-Za-z0-9][\w:.-]*)(?:\s+([\s\S]*))?$/.exec(message.trim());
   return match ? { name: match[1], args: (match[2] ?? '').trim() } : null;
 }
+
+/** Built-ins that apply to Pi Intern: it's always in Plan and has no title. */
+export const INTERN_COMMANDS: SlashCommand[] = BUILTIN_COMMANDS
+  .filter(command => !['name', 'plan', 'auto'].includes(command.name))
+  .map(command => command.name === 'new' ? { ...command, description: 'Start a new Intern conversation' } : command);
+
+/**
+ * Menu entries for `/…` typed at the start of a message: built-ins first,
+ * then Pi's own commands (never πDesk's `pidesk-*` host controls). Names
+ * starting with the query come before names or descriptions containing it.
+ */
+export function slashSuggestions(
+  text: string,
+  commands: Array<{ name: string; description?: string; source?: 'extension' | 'skill' | 'prompt' }>,
+  builtins: SlashCommand[] = BUILTIN_COMMANDS,
+  limit = 10,
+): SlashCommand[] {
+  if (!text.startsWith('/') || /\s/.test(text)) return [];
+  const own = new Set(builtins.map(command => command.name));
+  const all: SlashCommand[] = [
+    ...builtins,
+    ...commands
+      .filter(command => !command.name.startsWith('pidesk-') && !own.has(command.name))
+      .map(command => ({ name: command.name, description: command.description, source: command.source ?? 'extension' }) as SlashCommand),
+  ];
+  const needle = text.slice(1).toLowerCase();
+  const starts = all.filter(command => command.name.toLowerCase().startsWith(needle));
+  const contains = needle
+    ? all.filter(command => !command.name.toLowerCase().startsWith(needle) && (command.name.toLowerCase().includes(needle) || command.description?.toLowerCase().includes(needle)))
+    : [];
+  return [...starts, ...contains].slice(0, limit);
+}
+
+export const SOURCE_LABEL: Record<SlashSource, string> = { pidesk: 'πDesk', extension: 'Extension', skill: 'Skill', prompt: 'Prompt', terminal: 'Terminal' };

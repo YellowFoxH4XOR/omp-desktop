@@ -34,6 +34,8 @@ export const api = {
   setThreadModel: (threadId: string, provider: string, modelId: string) => invoke<SessionState>('set_thread_model', { threadId, provider, modelId }),
   setThreadEffort: (threadId: string, level: string) => invoke<SessionState>('set_thread_effort', { threadId, level }),
   getModels: (threadId: string) => invoke<ModelInfo[]>('get_models', { threadId }),
+  /** Every model the private Pi offers; starts a short-lived Pi. */
+  listModels: () => invoke<ModelInfo[]>('list_models'),
   getEffortLevels: (threadId: string) => invoke<string[]>('get_effort_levels', { threadId }),
   getUsage: (threadId: string) => invoke<Usage>('get_usage', { threadId }),
   compactThread: (threadId: string, instructions?: string) => invoke<void>('compact_thread', { threadId, instructions }),

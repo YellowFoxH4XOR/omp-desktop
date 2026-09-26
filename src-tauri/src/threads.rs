@@ -1631,6 +1631,60 @@ impl ThreadManager {
         Ok(self.fetch_models(&client).await)
     }
 
+    /// Every model the private Pi offers (all signed-in providers, including
+    /// ones extensions register), without needing an open thread: a short-lived
+    /// Pi with no session, in πDesk's private folder, stopped once it answers.
+    /// Callers are serialized so opening Settings never stacks Pi processes.
+    pub async fn catalogue_models(&self) -> AppResult<Vec<ModelInfo>> {
+        static QUERY: AsyncMutex<()> = AsyncMutex::const_new(());
+        const MAX_MODELS: usize = 2000;
+        let _one = QUERY.lock().await;
+        let exe = self.registry.executable_path(HarnessKind::Pi).await?;
+        let root = util::pidesk_root();
+        util::prepare_private_home(&root)?;
+        let cwd = root.join("home");
+        let mut command = Command::new(&exe);
+        util::configure_private_command(&mut command, &root);
+        #[cfg(unix)]
+        command.process_group(0);
+        let mut child = command
+            .args(["--mode", "rpc", "--no-session", "--no-approve"])
+            .current_dir(&cwd)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|_| AppError::new("Could not start the private Pi to list models."))?;
+        let stdout = child.stdout.take().expect("stdout piped");
+        let stderr = child.stderr.take().expect("stderr piped");
+        let client = RpcClient::attach(
+            child,
+            stdout,
+            stderr,
+            RpcHandlers {
+                on_event: Box::new(|_| {}),
+                on_exit: Box::new(|_, _, _| {}),
+            },
+        );
+        let reply = client
+            .call_with_timeout("get_available_models", Map::new(), 30)
+            .await;
+        client.shutdown().await;
+        let models = reply?
+            .get("models")
+            .and_then(Value::as_array)
+            .map(|models| {
+                models
+                    .iter()
+                    .filter_map(value_to_model)
+                    .take(MAX_MODELS)
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(models)
+    }
+
     pub async fn get_levels(&self, thread_id: &str) -> AppResult<Vec<String>> {
         let client = self.client_for(thread_id).await?;
         Ok(self.fetch_levels(&client).await)

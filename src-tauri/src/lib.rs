@@ -91,6 +91,7 @@ pub fn run() {
             commands::set_thread_model,
             commands::set_thread_effort,
             commands::get_models,
+            commands::list_models,
             commands::get_effort_levels,
             commands::get_usage,
             commands::rename_thread,

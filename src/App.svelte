@@ -4,7 +4,7 @@
   import { open } from '@tauri-apps/plugin-dialog';
   import { revealItemInDir } from '@tauri-apps/plugin-opener';
   import { VList } from 'virtua/svelte';
-  import { Bot, Cpu, House, Plug, Puzzle, SlidersHorizontal, Plus, Settings2, GitCompareArrows, Search, ChevronRight, X, Pin, Archive, MoreHorizontal, RefreshCw, Terminal, FolderPlus, Folder, AlertTriangle, LoaderCircle, Check, SquarePen, GitFork, Trash2, MessageSquare, Monitor, Sun, Moon } from '@lucide/svelte';
+  import { Bot, Cpu, PanelLeftOpen, Plug, Puzzle, SlidersHorizontal, Plus, Settings2, GitCompareArrows, Search, ChevronRight, X, Pin, Archive, MoreHorizontal, RefreshCw, Terminal, FolderPlus, Folder, AlertTriangle, LoaderCircle, Check, SquarePen, GitFork, Trash2, MessageSquare, Monitor, Sun, Moon } from '@lucide/svelte';
   import { api, onBackendEvent } from '$lib/api';
   import { SessionModel } from '$lib/session.svelte';
   import Conversation from '$lib/components/conversation/Conversation.svelte';
@@ -22,7 +22,7 @@
   import McpServers from '$lib/components/settings/McpServers.svelte';
   import { openExternal } from '$lib/components/conversation/links';
   import { checkForUpdates } from '$lib/extension-updates.svelte';
-  import { parseSlash, TERMINAL_ONLY } from '$lib/slash';
+  import { runBuiltin as runSlashBuiltin } from '$lib/slash-actions';
   import { ago, clock } from '$lib/time';
   import { planOf, PLAN_APPROVE, PLAN_DECLINE, PLAN_FEEDBACK } from '$lib/plan';
   import ConfirmDialog from '$lib/components/diff/ConfirmDialog.svelte';
@@ -77,6 +77,7 @@
   let diffPath = $state<string | undefined>(undefined);
   let sidebarWidth = $state(256);
   let panelWidth = $state(405);
+  let windowWidth = $state(1280);
   let settingsOpen = $state(false);
   type SettingsSection = 'general' | 'models' | 'pi' | 'extensions' | 'mcp';
   let settingsSection = $state<SettingsSection>('general');
@@ -206,6 +207,11 @@
     ...(installation ? [{ kind: 'terminal' as const, label: 'Open Pi terminal', subtitle: 'Private Pi shell' }] : []),
   ].filter(entry => `${entry.label} ${entry.subtitle}`.toLowerCase().includes(switchQuery.toLowerCase())).slice(0, 40));
   const visibleThread = $derived(activeThread && activeProject && activeThread.projectId === activeProject.id ? activeThread : null);
+  const detailsVisible = $derived(!!rightPanel && !!visibleThread && !!currentView);
+  // Keep at least 480px for the conversation, including at the minimum window size.
+  const maxPanelWidth = $derived(Math.max(320, Math.min(850, windowWidth - 481)));
+  const visiblePanelWidth = $derived(Math.min(panelWidth, maxPanelWidth));
+  const sidebarCollapsed = $derived(detailsVisible && windowWidth - sidebarWidth - visiblePanelWidth - 2 < 480);
   const installReady = $derived(eventsReady && installPlan !== null);
 
   function utf8Bytes(value: string): number {
@@ -441,11 +447,34 @@
     try { modelDefaults = await api.setDefaultThinkingLevel(level); }
     catch (error) { startupError = `Could not set the default effort: ${errorText(error)}`; }
   }
+  function rememberModels(models: ModelInfo[]) {
+    if (!models.length) return;
+    knownModels = models;
+    try { localStorage.setItem(MODEL_CACHE_KEY, JSON.stringify(models.slice(0, 500))); } catch { /* best effort */ }
+  }
+  /** Pi saves the last model picked in any thread as its default, and signing
+   *  in adds providers, so Settings re-reads both each time Models is shown:
+   *  every model from every signed-in provider, straight from the private Pi. */
+  let modelsLoading = $state(false);
+  let modelsError = $state('');
+  async function refreshModelSettings() {
+    void loadModelDefaults();
+    if (modelsLoading || !installation) return;
+    modelsLoading = true;
+    modelsError = '';
+    try {
+      const models = await api.listModels();
+      if (models.length) rememberModels(models);
+      else modelsError = 'Pi has no models yet. Sign in to a provider in Pi runtime.';
+    } catch (error) { modelsError = `Could not load models from Pi: ${errorText(error)}`; }
+    finally { modelsLoading = false; }
+  }
+  $effect(() => {
+    // Also once Pi is detected, if Settings opened first.
+    if (settingsOpen && settingsSection === 'models' && installation) untrack(() => void refreshModelSettings());
+  });
   function rememberSessionMeta(snapshot: SessionSnapshot) {
-    if (snapshot.models.length) {
-      knownModels = snapshot.models;
-      try { localStorage.setItem(MODEL_CACHE_KEY, JSON.stringify(snapshot.models.slice(0, 500))); } catch { /* best effort */ }
-    }
+    rememberModels(snapshot.models);
     sessionMeta = {
       models: snapshot.models,
       levels: snapshot.levels,
@@ -557,8 +586,8 @@
     installLog = [...installLog, ...truncateUtf8(line, 4096).split(/\r?\n/)].slice(-200);
   }
   onMount(() => {
-    sidebarWidth = Number(localStorage.getItem('sidebarWidth')) || 256;
-    panelWidth = Number(localStorage.getItem('panelWidth')) || 405;
+    sidebarWidth = Math.max(205, Math.min(390, Number(localStorage.getItem('sidebarWidth')) || 256));
+    panelWidth = Math.max(320, Math.min(850, Number(localStorage.getItem('panelWidth')) || 405));
     const savedTheme = localStorage.getItem('theme');
     if (savedTheme === 'light' || savedTheme === 'dark') theme = savedTheme;
     applyTheme();
@@ -593,7 +622,7 @@
     window.addEventListener('keydown', onKey);
     const move = (event: MouseEvent) => {
       if (sidebarResizing) sidebarWidth = Math.max(205, Math.min(390, event.clientX));
-      if (panelResizing) panelWidth = Math.max(320, Math.min(850, innerWidth - event.clientX));
+      if (panelResizing) panelWidth = Math.max(320, Math.min(maxPanelWidth, innerWidth - event.clientX));
     };
     const up = () => {
       if (sidebarResizing) localStorage.setItem('sidebarWidth', String(sidebarWidth));
@@ -895,87 +924,23 @@
     diffPath = path;
     void openPanel('changes');
   }
-  /**
-   * Pi's built-in terminal commands don't exist over RPC (sent as a prompt
-   * they'd reach the model as text), so πDesk runs them. Returns false for
-   * everything else, which goes to Pi: extension commands, skills, prompts.
-   */
+  /** Pi's built-in terminal commands, run by πDesk for the open thread. */
   async function runBuiltin(message: string): Promise<boolean> {
-    const slash = parseSlash(message);
     const thread = activeThread;
     const session = activeSession;
-    if (!slash || !thread || !session) return false;
-    const { name, args } = slash;
-    const say = (text: string, level: 'info' | 'warn' | 'error' = 'info') => session.notify(level, text);
-    if (TERMINAL_ONLY.has(name)) {
-      say(`/${name} only exists in Pi's own terminal UI. Open the Pi terminal, run pi, then /${name}.`, 'warn');
-      return true;
-    }
-    switch (name) {
-      case 'model': {
-        if (!args) { document.querySelector<HTMLButtonElement>('button[aria-label="Select model"]')?.click(); return true; }
-        const want = args.toLowerCase();
-        const models = session.view.models;
-        const match = models.find(model => modelKey(model).toLowerCase() === want)
-          ?? models.find(model => model.id.toLowerCase() === want)
-          ?? models.find(model => model.id.toLowerCase().includes(want) || model.name.toLowerCase().includes(want));
-        if (!match) { say(`No model matches “${args}”. Type /model to choose from the list.`, 'warn'); return true; }
-        await setModel(modelKey(match));
-        say(`Switched to ${match.name} (${match.provider}).`);
-        return true;
-      }
-      case 'thinking': {
-        const levels = session.view.levels;
-        if (!args) { say(`Effort is ${session.view.effort ?? 'the default'}. Choose one of: ${levels.join(', ') || 'none offered by this model'}.`); return true; }
-        if (!levels.includes(args.toLowerCase())) { say(`“${args}” isn't an effort level here. Choose one of: ${levels.join(', ')}.`, 'warn'); return true; }
-        await setEffort(args.toLowerCase());
-        say(`Effort set to ${args.toLowerCase()}.`);
-        return true;
-      }
-      case 'compact':
-        say('Compacting the conversation…');
-        try { await api.compactThread(thread.id, args || undefined); say('Compacted: older context is now a summary.'); }
-        catch (error) { say(`Could not compact: ${errorText(error)}`, 'error'); }
-        return true;
-      case 'new':
-        if (activeProject) await createThread(activeProject);
-        return true;
-      case 'name':
-        if (!args) { say('Give the new name, for example /name Fix login bug.', 'warn'); return true; }
-        await renameThread(thread, args.split('\n')[0].slice(0, 120));
-        say(`Renamed to “${args.split('\n')[0].slice(0, 120)}”.`);
-        return true;
-      case 'plan':
-      case 'auto':
-        await setMode(name);
-        say(name === 'plan' ? 'Plan mode: read-only until you approve a plan.' : 'Auto mode: full tools.');
-        return true;
-      case 'session': {
-        try {
-          const usage = await api.getUsage(thread.id);
-          const context = usage.contextUsage?.percent != null ? ` · context ${Math.round(usage.contextUsage.percent)}% full` : '';
-          say(`${usage.tokens.total.toLocaleString()} tokens (${usage.tokens.input.toLocaleString()} in, ${usage.tokens.output.toLocaleString()} out) · $${usage.cost.toFixed(4)}${context}`);
-        } catch (error) { say(`Could not read session stats: ${errorText(error)}`, 'error'); }
-        return true;
-      }
-      case 'copy': {
-        const last = [...session.view.items].reverse().find(item => item.kind === 'text' && item.text.trim());
-        if (!last || last.kind !== 'text') { say('There is no reply to copy yet.', 'warn'); return true; }
-        try { await navigator.clipboard.writeText(last.text); say('Copied the last reply.'); }
-        catch { say('Could not reach the clipboard.', 'error'); }
-        return true;
-      }
-      case 'reload':
-        say("Restarting this thread's Pi to reload extensions and settings…");
-        await restart();
-        return true;
-      case 'login':
-        openTerminal('pi');
-        say('In the Pi terminal, type /login and pick your provider.');
-        return true;
-      default:
-        return false;
-    }
+    if (!thread || !session) return false;
+    return runSlashBuiltin(message, {
+      threadId: thread.id,
+      session,
+      setModel,
+      setEffort,
+      reload: reloadPi,
+      openModelPicker: () => document.querySelector<HTMLButtonElement>('.composer button[aria-label="Select model"]')?.click(),
+      startNew: async () => { if (activeProject) await createThread(activeProject); },
+      rename: title => renameThread(thread, title),
+      setMode,
+      login: () => openTerminal('pi'),
+    });
   }
 
   async function send(message: string, mode: 'prompt' | 'steer' | 'follow_up') {
@@ -1020,15 +985,16 @@
       throw error;
     }
   }
-  async function restart() {
+  /** Restart the open thread's Pi; resolves true when it came back. */
+  async function restart(): Promise<boolean> {
     const targetThread = activeThread;
     const targetSession = activeSession;
-    if (!targetThread) return;
+    if (!targetThread) return false;
     const projectId = targetThread.projectId;
     const selectionToken = threadSelectionToken;
     try {
       const snapshot = await api.restartThread(targetThread.id);
-      if (invalidatedProjects.has(projectId) || invalidatedThreads.has(targetThread.id)) return;
+      if (invalidatedProjects.has(projectId) || invalidatedThreads.has(targetThread.id)) return false;
       const existing = liveSessions.get(targetThread.id) ?? targetSession;
       const model = existing ?? new SessionModel(snapshot);
       model.reconnect(snapshot);
@@ -1042,8 +1008,24 @@
         activeSession = model;
       }
       delete crashDetails[targetThread.id];
+      return true;
     } catch (error) {
       if (activeThread?.id === targetThread.id && activeSession === targetSession && threadSelectionToken === selectionToken && !invalidatedProjects.has(projectId)) startupError = `Could not restart session: ${errorText(error)}`;
+      return false;
+    }
+  }
+  /** Restart this thread's Pi so new extensions, MCP servers and settings
+   *  load; the conversation resumes from the same session. */
+  let reloadingPi = $state(false);
+  async function reloadPi() {
+    const session = activeSession;
+    if (!activeThread || reloadingPi) return;
+    if (session?.view.status === 'active' && !window.confirm('Pi is working on this thread. Reload now? The current run stops.')) return;
+    reloadingPi = true;
+    try {
+      if (await restart()) activeSession?.notify('info', 'Reloaded Pi: new extensions, MCP servers and settings are loaded.');
+    } finally {
+      reloadingPi = false;
     }
   }
   async function renameThread(thread: Thread, title: string, expectedSelectionToken?: number) {
@@ -1288,16 +1270,21 @@
     if (threadMenu && !(event.target as Element | null)?.closest('.thread-menu, .thread-more')) threadMenu = null;
   }
   function focusInput(node: HTMLInputElement) { node.focus(); node.select(); }
+  async function showProjectNavigation() {
+    rightPanel = null;
+    await tick();
+    document.querySelector<HTMLButtonElement>('.thread-row.active .thread-link')?.focus();
+  }
 </script>
 
-<svelte:window onclick={onWindowClick} />
+<svelte:window onclick={onWindowClick} bind:innerWidth={windowWidth} />
 
 <svelte:boundary>
-<div class="app-shell" style={`--sidebar-width:${sidebarWidth}px; --panel-width:${panelWidth}px`}>
-  <aside class="sidebar" aria-label="Projects and threads">
+<div class="app-shell" class:sidebar-collapsed={sidebarCollapsed} style={`--sidebar-width:${sidebarWidth}px; --panel-width:${visiblePanelWidth}px`}>
+  <aside class="sidebar" id="project-sidebar" aria-label="Projects and threads">
     <div class="sidebar-top" data-tauri-drag-region>
       <div class="sidebar-tools">
-        <button class="icon-button" class:pressed={!activeProject} title="Welcome" aria-label="Welcome" onclick={goHome}><House size={16} strokeWidth={1.8} /></button>
+        <button class="icon-button brand-home" class:pressed={!activeProject} title="Welcome to πDesk" aria-label="Welcome" onclick={goHome}><img src="/app-icon.svg" alt="" width="22" height="22" /></button>
         <button class="icon-button" title="Search projects and threads (⌘K)" aria-label="Switch project or thread" onclick={() => void openSwitcher()}><Search size={16} strokeWidth={1.8} /></button>
         <button class="icon-button" title="New thread (⌘N)" aria-label="New thread" disabled={!activeProject || pendingAction || !harnesses.length} onclick={() => { if (activeProject) void createThread(activeProject); }}><SquarePen size={16} strokeWidth={1.8} /></button>
       </div>
@@ -1330,7 +1317,7 @@
                 <button class="new-thread" disabled={pendingAction || !harnesses.length} onclick={() => void createThread(project)}><Plus size={13} strokeWidth={2.2} /> New thread</button>
               </div>
               {#if visible.length}
-                <VList data={visible} getKey={thread => thread.id} style={`height: min(58vh, ${visible.length * 46}px);`}>
+                <VList data={visible} getKey={thread => thread.id} style={`height: min(58vh, ${visible.length * 52}px);`}>
                   {#snippet children(thread)}
                     <div class:active={selectedThreadId === thread.id} class="thread-row" oncontextmenu={event => { event.preventDefault(); threadMenu = null; showThreadMenu(thread, event.clientX, event.clientY); }} role="group" aria-label={`${thread.title || 'New thread'} thread`}>
                       {#if renaming === thread.id}
@@ -1398,12 +1385,13 @@
       </div>
     {/if}
   {/if}
-  <div class="resize-handle" role="slider" tabindex="0" aria-orientation="vertical" aria-valuemin="205" aria-valuemax="390" aria-valuenow={sidebarWidth} aria-label="Resize project sidebar" onmousedown={() => sidebarResizing = true} onkeydown={event => { if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); sidebarWidth = Math.max(205, Math.min(390, sidebarWidth + (event.key === 'ArrowRight' ? 12 : -12))); localStorage.setItem('sidebarWidth', String(sidebarWidth)); } }}></div>
+  <div class="resize-handle sidebar-handle" role="slider" tabindex="0" aria-orientation="vertical" aria-valuemin="205" aria-valuemax="390" aria-valuenow={sidebarWidth} aria-label="Resize project sidebar" onmousedown={() => sidebarResizing = true} onkeydown={event => { if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); sidebarWidth = Math.max(205, Math.min(390, sidebarWidth + (event.key === 'ArrowRight' ? 12 : -12))); localStorage.setItem('sidebarWidth', String(sidebarWidth)); } }}></div>
 
   <main class="main-pane">
     <header class="main-header" data-tauri-drag-region>
+      {#if sidebarCollapsed}<button class="navigation-return" title="Show projects and threads (closes the review panel)" aria-label="Show projects and threads" aria-controls="project-sidebar" onclick={() => void showProjectNavigation()}><PanelLeftOpen size={16} strokeWidth={1.8}/><span>Projects</span></button>{/if}
       <div class="crumbs" data-tauri-drag-region>
-        {#if activeProject}<span class="crumb-project">{activeProject.displayName}</span>{:else}<span class="crumb-project">πDesk</span>{/if}
+        {#if activeProject}<span class="crumb-project">{activeProject.displayName}</span>{:else}<span class="brand-title">πDesk</span>{/if}
         {#if visibleThread}<ChevronRight size={13} strokeWidth={2} class="crumb-sep" /><span class="top-thread">{visibleThread.title || 'New thread'}</span>{/if}
         {#if visibleThread?.worktreePath}
           {@const worktree = visibleThread.worktreePath}
@@ -1416,6 +1404,7 @@
       <div class="header-actions">
         <button class="toggle-button" class:pressed={internOpen} aria-label="Ask Pi Intern" aria-expanded={internOpen} title="Ask Pi Intern" onclick={toggleIntern}><Bot size={16}/><span>Intern{internPending ? ` (${internPending})` : ''}</span></button>
         {#if visibleThread && currentView}
+          <button class="icon-button" title="Reload Pi: restart this thread's Pi to load new extensions, MCP servers and settings" aria-label="Reload Pi" disabled={reloadingPi} onclick={() => void reloadPi()}><RefreshCw size={14} strokeWidth={1.9} class={reloadingPi ? 'spin' : ''} /></button>
           <div class="panel-toggles">
             <button class:pressed={rightPanel === 'changes'} class="toggle-button" title="Changes (⌘⇧D)" aria-label="Toggle changes" aria-pressed={rightPanel === 'changes'} onclick={() => togglePanel('changes')}><GitCompareArrows size={14} strokeWidth={1.9} /><span>Changes</span></button>
           </div>
@@ -1445,7 +1434,7 @@
   </main>
 
   {#if rightPanel && visibleThread && currentView}
-    <div class="resize-handle panel-handle" role="slider" tabindex="0" aria-orientation="vertical" aria-valuemin="320" aria-valuemax="850" aria-valuenow={panelWidth} aria-label="Resize detail panel" onmousedown={() => panelResizing = true} onkeydown={event => { if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); panelWidth = Math.max(320, Math.min(850, panelWidth + (event.key === 'ArrowLeft' ? 12 : -12))); localStorage.setItem('panelWidth', String(panelWidth)); } }}></div>
+    <div class="resize-handle panel-handle" role="slider" tabindex="0" aria-orientation="vertical" aria-valuemin="320" aria-valuemax={maxPanelWidth} aria-valuenow={visiblePanelWidth} aria-label="Resize detail panel" onmousedown={() => panelResizing = true} onkeydown={event => { if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); panelWidth = Math.max(320, Math.min(maxPanelWidth, visiblePanelWidth + (event.key === 'ArrowLeft' ? 12 : -12))); localStorage.setItem('panelWidth', String(panelWidth)); } }}></div>
     <aside class="details-pane" aria-label={rightPanel === 'plan' ? 'Plan' : 'Changes'}>
       {#if rightPanel === 'plan' && planRequest}<PlanReview plan={planOf(planRequest) ?? ''} source={visibleThread.title || 'New thread'} onApprove={() => answerPlan('approve')} onDecline={() => answerPlan('decline')} onFeedback={text => answerPlan('feedback', text)} onClose={() => rightPanel = null} />
       {:else if ChangesPanel}<ChangesPanel thread={visibleThread} onClose={() => rightPanel = null} focusPath={diffPath} />
@@ -1548,12 +1537,15 @@
             <p class="lead">Every new thread starts with this model and effort. Existing threads keep their own.</p>
         <div class="setting-group">
           <div class="setting-row"><span class="setting-name">Default model</span>
-            {#if knownModels.length}
-              <ModelPicker models={knownModels} current={knownModels.find(model => modelKey(model) === defaultModelKey) ?? null} defaultKey={defaultModelKey} placement="down" label="Default model for new threads"
-                onSelect={key => { const model = knownModels.find(candidate => modelKey(candidate) === key); if (model) void makeDefaultModel(model); }} />
-            {:else}
-              <span class="missing">Open a thread once to load models</span>
-            {/if}
+            <span class="model-default">
+              {#if knownModels.length}
+                <ModelPicker models={knownModels} current={knownModels.find(model => modelKey(model) === defaultModelKey) ?? null} defaultKey={defaultModelKey} placement="down" label="Default model for new threads"
+                  onSelect={key => { const model = knownModels.find(candidate => modelKey(candidate) === key); if (model) void makeDefaultModel(model); }} />
+              {:else if !modelsLoading}
+                <span class="missing">{modelsError || 'No models yet'}</span>
+              {/if}
+              <button class="icon-button" title="Reload models from Pi" aria-label="Reload models" disabled={modelsLoading} onclick={() => void refreshModelSettings()}><RefreshCw size={14} class={modelsLoading ? 'spin' : ''}/></button>
+            </span>
           </div>
           <div class="setting-row"><span class="setting-name">Default effort</span>
             <select class="setting-select" aria-label="Default effort for new threads" value={modelDefaults?.thinkingLevel ?? ''} onchange={event => void setDefaultEffort(event.currentTarget.value)}>
@@ -1602,7 +1594,7 @@
     </div>
   </div>
 {/if}
-{#if internStarted}<PiIntern open={internOpen} {projects} threadProjectId={visibleThread?.projectId ?? null} onClose={() => internOpen = false} onPending={count => internPending = count} onAttention={() => internOpen = true}/>{/if}
+{#if internStarted}<PiIntern open={internOpen} {projects} threadProjectId={visibleThread?.projectId ?? null} onClose={() => internOpen = false} onPending={count => internPending = count} onAttention={() => internOpen = true} onOpenTerminal={() => openTerminal('pi')}/>{/if}
 {#if terminalOpen}
   <div class="overlay terminal-overlay" role="presentation">
     <div class="terminal-sheet dialog" role="dialog" aria-modal="true" aria-label="Pi terminal">
@@ -1620,11 +1612,13 @@
   .sidebar { background:var(--sidebar); width:var(--sidebar-width); min-width:205px; max-width:390px; display:flex; flex-direction:column; flex-shrink:0; overflow:hidden; user-select:none; }
   .sidebar-top { height:var(--header-height); min-height:var(--header-height); display:flex; align-items:center; justify-content:flex-end; padding:0 10px 0 84px; }
   .sidebar-tools { display:flex; gap:2px; }
+  .brand-home img { border-radius:6px; }
+  .brand-title { font-size:14px; font-weight:650; letter-spacing:-.025em; }
   .icon-button, .mini-button { border:0; background:transparent; color:var(--muted); display:inline-flex; align-items:center; justify-content:center; border-radius:var(--radius-sm); width:28px; height:28px; flex-shrink:0; transition:background .12s, color .12s; }
   .mini-button { width:22px; height:22px; }
   .icon-button:hover:not(:disabled), .mini-button:hover, .icon-button.pressed { background:var(--surface-2); color:var(--text); }
   .project-list { flex:1; overflow:auto; padding:4px 8px 12px; }
-  .section-label { display:flex; align-items:center; justify-content:space-between; height:28px; padding:0 4px 0 10px; color:var(--subtle); font-size:11px; font-weight:600; }
+  .section-label { display:flex; align-items:center; justify-content:space-between; height:32px; padding:0 4px 0 10px; color:var(--subtle); font-size:12px; font-weight:600; }
   .section-label .mini-button { opacity:0; }
   .project-list:hover .section-label .mini-button, .section-label .mini-button:focus-visible { opacity:1; }
   .project-section { margin-bottom:2px; }
@@ -1653,24 +1647,24 @@
   .new-thread { flex:1; display:flex; align-items:center; gap:8px; border:0; background:transparent; padding:5px 8px; border-radius:var(--radius-sm); color:var(--muted); font-size:12.5px; text-align:left; }
   .new-thread:hover:not(:disabled) { color:var(--text); background:color-mix(in srgb, var(--surface-2) 70%, transparent); }
   .new-thread :global(svg) { color:var(--accent); }
-  .thread-row { display:flex; align-items:center; border-radius:var(--radius-sm); min-height:44px; margin:1px 0; }
+  .thread-row { display:flex; align-items:center; border-radius:var(--radius-sm); min-height:50px; margin:1px 0; }
   .thread-row > .status-dot { margin:0 9px 0 8px; }
   .thread-row:hover { background:color-mix(in srgb, var(--surface-2) 70%, transparent); }
-  .thread-row.active { background:var(--surface-2); }
+  .thread-row.active { background:color-mix(in srgb, var(--accent-bg) 40%, var(--surface-2)); box-shadow:inset 2px 0 0 var(--accent); }
   .thread-row.active .thread-title { color:var(--text); font-weight:500; }
   .thread-row:hover .thread-more, .thread-row.active .thread-more, .thread-more:focus-visible { opacity:1; }
-  .thread-link { flex:1; min-width:0; display:flex; align-items:center; gap:9px; height:100%; border:0; background:none; color:var(--muted); text-align:left; padding:0 6px 0 8px; font-size:12.5px; }
+  .thread-link { flex:1; min-width:0; display:flex; align-items:center; gap:9px; height:100%; border:0; background:none; color:var(--muted); text-align:left; padding:0 6px 0 8px; font-size:13px; }
   .thread-title { flex:1; min-width:0; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
   .thread-text { flex:1; min-width:0; display:flex; flex-direction:column; gap:2px; padding:5px 0; }
   .thread-line { display:flex; align-items:center; gap:6px; min-width:0; }
-  .thread-meta { display:flex; align-items:center; gap:6px; min-width:0; overflow:hidden; white-space:nowrap; font-size:11px; color:var(--subtle); font-variant-numeric:tabular-nums; }
+  .thread-meta { display:flex; align-items:center; gap:6px; min-width:0; overflow:hidden; white-space:nowrap; font-size:12px; color:var(--subtle); font-variant-numeric:tabular-nums; }
   .meta-working { color:var(--accent); font-weight:500; }
   .meta-bad { color:var(--bad); font-weight:500; }
   .meta-done { color:var(--good); font-weight:500; }
-  .meta-chip { flex:none; height:16px; padding:0 5px; border-radius:4px; background:var(--surface-2); color:var(--muted); font-size:10.5px; font-weight:500; line-height:16px; max-width:110px; overflow:hidden; text-overflow:ellipsis; }
-  .meta-chip.mono { font-family:var(--mono); font-size:10px; }
+  .meta-chip { flex:none; height:18px; padding:0 5px; border-radius:4px; background:var(--surface-2); color:var(--muted); font-size:11px; font-weight:500; line-height:18px; max-width:110px; overflow:hidden; text-overflow:ellipsis; }
+  .meta-chip.mono { font-family:var(--mono); font-size:11px; }
   .meta-diff { flex:none; } .meta-diff .add { color:var(--good); } .meta-diff .del { color:var(--bad); }
-  .row-pill { flex:none; position:relative; height:17px; padding:0 6px; border-radius:999px; background:var(--warn-bg); color:var(--warn); font-size:10px; font-weight:700; line-height:17px; animation:pill-pop .45s cubic-bezier(.34,1.36,.64,1) both; }
+  .row-pill { flex:none; position:relative; height:20px; padding:0 6px; border-radius:999px; background:var(--warn-bg); color:var(--warn); font-size:11px; font-weight:600; line-height:20px; animation:pill-pop .45s cubic-bezier(.34,1.36,.64,1) both; }
   .row-pill.plan::after { content:""; position:absolute; inset:-1px; border-radius:inherit; border:1.5px solid var(--warn); animation:pill-ring 1.4s ease-out .2s 2 both; }
   @keyframes pill-pop { from { transform:scale(.6); opacity:0; } }
   @keyframes pill-ring { from { opacity:.9; transform:scale(1); } to { opacity:0; transform:scale(1.4, 1.8); } }
@@ -1700,11 +1694,15 @@
   /* ---------- Main ---------- */
   .main-pane { flex:1; min-width:0; display:flex; flex-direction:column; overflow:hidden; position:relative; background:var(--bg); container:main / inline-size; }
   .main-header { height:var(--header-height); min-height:var(--header-height); display:flex; align-items:center; gap:12px; padding:0 14px 0 20px; border-bottom:1px solid var(--line); user-select:none; }
+  .sidebar-collapsed .sidebar, .sidebar-collapsed .sidebar-handle { display:none; }
+  .sidebar-collapsed .main-header { padding-left:84px; }
+  .navigation-return { display:inline-flex; align-items:center; gap:7px; flex:none; height:30px; padding:0 8px; border:0; border-radius:var(--radius-sm); background:var(--surface); color:var(--muted); font-size:12px; }
+  .navigation-return:hover { background:var(--surface-2); color:var(--text); }
   .crumbs { flex:1; min-width:0; display:flex; align-items:center; gap:6px; font-size:13px; white-space:nowrap; }
   .crumb-project { color:var(--muted); flex-shrink:0; }
   .crumbs :global(.crumb-sep) { color:var(--subtle); flex-shrink:0; }
   .top-thread { font-weight:600; overflow:hidden; text-overflow:ellipsis; min-width:0; }
-  .status-pill { display:inline-flex; align-items:center; gap:6px; margin-left:6px; padding:2px 8px 2px 7px; border-radius:999px; background:var(--surface-2); color:var(--muted); font-size:11px; font-weight:500; flex-shrink:0; }
+  .status-pill { display:inline-flex; align-items:center; gap:6px; margin-left:6px; padding:2px 8px 2px 7px; border-radius:999px; background:var(--surface-2); color:var(--muted); font-size:12px; font-weight:500; flex-shrink:0; }
   .status-pill .status-dot { width:6px; height:6px; box-shadow:none; }
   .status-pill.active { color:var(--accent); background:var(--accent-bg); }
   .status-pill.waiting { color:var(--warn); background:var(--warn-bg); }
@@ -1722,7 +1720,7 @@
   .toggle-button.pressed { background:var(--elevated); color:var(--text); box-shadow:var(--shadow-sm), 0 0 0 1px var(--line); }
 
   .status-bar { flex:none; display:flex; justify-content:flex-end; align-items:center; height:36px; padding:0 12px; }
-  .details-pane { width:var(--panel-width); min-width:320px; max-width:850px; display:flex; flex-direction:column; overflow:hidden; background:var(--panel); animation:panel-arrive .16s var(--ease); }
+  .details-pane { width:var(--panel-width); min-width:320px; max-width:850px; flex:none; display:flex; flex-direction:column; overflow:hidden; background:var(--panel); animation:panel-arrive .16s var(--ease); }
   @keyframes panel-arrive { from { opacity:.4; transform:translateX(8px); } to { opacity:1; transform:none; } }
   .panel-loading { display:flex; align-items:center; justify-content:center; flex:1; gap:9px; color:var(--muted); font-size:12px; }
 
@@ -1815,6 +1813,7 @@
   .terminal-sheet header { display:flex; align-items:center; justify-content:space-between; padding:10px 16px; border-bottom:1px solid var(--line); }
   .terminal-sheet header span { display:flex; align-items:center; gap:8px; font-size:13px; font-weight:600; }
   .missing { color:var(--subtle); font-size:12px; }
+  .model-default { display:inline-flex; align-items:center; gap:6px; min-width:0; }
   .setting-select { height:26px; padding:0 8px; border:1px solid var(--line-strong); border-radius:var(--radius-sm); background:var(--elevated); color:var(--text); font-size:12px; }
   .error-details { white-space:pre-wrap; overflow:auto; max-height:52vh; padding:16px 20px; margin:0; font:11.5px/1.6 var(--mono); color:var(--muted); }
 

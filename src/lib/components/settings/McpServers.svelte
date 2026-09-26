@@ -53,7 +53,7 @@
     try {
       await run();
       await load();
-      if (done) notice = { kind: 'ok', text: `${done} New threads use it; restart running threads to pick it up.` };
+      if (done) notice = { kind: 'ok', text: `${done} New threads use it; press Reload Pi (⟳) in an open thread or in Intern to load it there.` };
       return true;
     } catch (error) {
       notice = { kind: 'error', text: errorText(error) };
@@ -156,7 +156,7 @@
     const ok = await act(async () => { copied = await api.mcpImport(source.id, [...picked]); });
     if (ok) {
       importing = null;
-      notice = { kind: 'ok', text: copied.length ? `Copied ${copied.join(', ')} into πDesk. New threads use them; restart running threads to pick them up.` : 'Nothing new to copy.' };
+      notice = { kind: 'ok', text: copied.length ? `Copied ${copied.join(', ')} into πDesk. New threads use them; press Reload Pi (⟳) in an open thread or in Intern to load them there.` : 'Nothing new to copy.' };
     }
   }
 

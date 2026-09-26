@@ -14,7 +14,8 @@
   import { slide } from 'svelte/transition';
   import { backOut } from 'svelte/easing';
   import { planFacts, type PlanActions } from '../../plan';
-  import { BUILTIN_COMMANDS, type SlashCommand } from '../../slash';
+  import { slashSuggestions, SOURCE_LABEL } from '../../slash';
+  import ContextRing from './ContextRing.svelte';
   import { modelKey } from './model-utils';
 
   type SendMode = 'prompt' | 'steer' | 'follow_up';
@@ -80,10 +81,6 @@
 
   // Session state carries a slim model; the catalogue entry has context and traits.
   const currentModel = $derived(model ? (models.find((entry) => modelKey(entry) === modelKey(model)) ?? model) : null);
-  const contextPercent = $derived(
-    contextUsage?.percent != null ? Math.max(0, Math.min(100, Math.round(contextUsage.percent))) : null,
-  );
-  const RING = 2 * Math.PI * 6;
   function capitalize(value: string): string {
     return value ? value[0].toUpperCase() + value.slice(1) : value;
   }
@@ -110,27 +107,7 @@
   const disabled = $derived(status === 'disconnected');
   const canSend = $derived(text.trim().length > 0 && !disabled && !submitting);
 
-  // πDesk's built-ins first, then Pi's own (extensions, skills, prompts).
-  const allCommands = $derived.by((): SlashCommand[] => {
-    const own = new Set(BUILTIN_COMMANDS.map(command => command.name));
-    return [
-      ...BUILTIN_COMMANDS,
-      ...commands
-        // pidesk-* commands are host controls, not user commands.
-        .filter(command => !command.name.startsWith('pidesk-') && !own.has(command.name))
-        .map(command => ({ name: command.name, description: command.description, source: command.source ?? 'extension' }) as SlashCommand),
-    ];
-  });
-  const SOURCE_LABEL: Record<SlashCommand['source'], string> = { pidesk: 'πDesk', extension: 'Extension', skill: 'Skill', prompt: 'Prompt', terminal: 'Terminal' };
-  const suggestions = $derived.by(() => {
-    if (cmdDismissed || !text.startsWith('/') || text.includes(' ') || text.includes('\n')) {
-      return [] as SlashCommand[];
-    }
-    const needle = text.slice(1).toLowerCase();
-    const starts = allCommands.filter(command => command.name.toLowerCase().startsWith(needle));
-    const contains = needle ? allCommands.filter(command => !command.name.toLowerCase().startsWith(needle) && (command.name.toLowerCase().includes(needle) || command.description?.toLowerCase().includes(needle))) : [];
-    return [...starts, ...contains].slice(0, 10);
-  });
+  const suggestions = $derived(cmdDismissed ? [] : slashSuggestions(text, commands));
 
   // Focus the composer on mount and whenever a different thread is shown,
   // unless the user is typing somewhere else (e.g. renaming that thread).
@@ -445,7 +422,7 @@
           <span class="pill model static" title={`${model.name} · ${model.provider}`}><Cpu size={12} strokeWidth={2} />{model.name}</span>
         {/if}
         {#if levels.length > 0 && onSetEffort}
-          <label class="pill" title="Reasoning effort">
+          <label class="pill effort" title="Reasoning effort">
             <Brain size={12} strokeWidth={2} />
             <select value={effort ?? ''} onchange={(e) => void onSetEffort(e.currentTarget.value)} aria-label="Select effort">
               {#if !effort}<option value="">Default effort</option>{/if}
@@ -457,19 +434,7 @@
       </div>
 
       <div class="right">
-        {#if contextPercent !== null}
-          <span
-            class="context"
-            class:high={contextPercent >= 80}
-            title={`Context ${contextUsage?.tokens?.toLocaleString() ?? '?'} / ${contextUsage?.contextWindow.toLocaleString()} tokens`}
-          >
-            <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
-              <circle cx="8" cy="8" r="6" class="ring-track" />
-              <circle cx="8" cy="8" r="6" class="ring-fill" stroke-dasharray={`${(RING * contextPercent) / 100} ${RING}`} />
-            </svg>
-            <span class="context-pct">{contextPercent}%</span>
-          </span>
-        {/if}
+        <ContextRing usage={contextUsage} />
         <button
           type="button"
           class="icon toggle"
@@ -680,12 +645,12 @@
   .box {
     display: flex;
     flex-direction: column;
-    gap: 6px;
+    gap: 14px;
     border: 1px solid var(--line-strong);
     border-radius: var(--radius-xl);
     background: var(--elevated);
-    padding: 12px 10px 8px 14px;
-    box-shadow: 0 6px 24px rgb(0 0 0 / 0.12), var(--shadow-sm);
+    padding: 16px 14px 12px;
+    box-shadow: 0 4px 18px rgb(0 0 0 / 0.08), var(--shadow-sm);
     transition: border-color 0.15s, box-shadow 0.15s;
   }
   .box.asking {
@@ -696,8 +661,8 @@
     display: flex;
     flex-direction: column;
     gap: 10px;
-    margin: -12px -10px 4px -14px;
-    padding: 12px 14px;
+    margin: -16px -14px 0;
+    padding: 14px;
     border-bottom: 1px solid var(--line);
   }
   .approval-head {
@@ -808,11 +773,11 @@
   }
   .input {
     width: 100%;
-    min-height: 22px;
+    min-height: 26px;
     border: 0;
     background: transparent;
     color: var(--text);
-    font-size: 14px;
+    font-size: 14.5px;
     line-height: 1.5;
     resize: none;
     outline: none;
@@ -828,37 +793,40 @@
   }
   .toolbar {
     display: flex;
-    align-items: center;
+    align-items: flex-end;
     justify-content: space-between;
-    gap: 8px;
-    margin-left: -6px;
+    flex-wrap: wrap;
+    gap: 10px 12px;
+    padding-top: 10px;
+    border-top: 1px solid var(--line);
   }
   .left,
   .right {
     display: flex;
     align-items: center;
-    gap: 4px;
+    gap: 8px;
     min-width: 0;
   }
   .left {
-    flex: 1;
-    overflow: hidden;
+    flex: 1 1 360px;
+    flex-wrap: wrap;
   }
   .right {
     flex: none;
+    margin-left: auto;
   }
   .pill {
     position: relative;
     display: inline-flex;
     align-items: center;
-    gap: 5px;
-    height: 26px;
-    padding: 0 8px;
+    gap: 6px;
+    height: 32px;
+    padding: 0 10px;
     border: 0;
     border-radius: 999px;
     background: transparent;
     color: var(--muted);
-    font-size: 12px;
+    font-size: 13px;
     font-weight: 500;
     flex-shrink: 0;
     white-space: nowrap;
@@ -873,14 +841,14 @@
   .agent-mode button {
     display: inline-flex;
     align-items: center;
-    gap: 4px;
-    height: 22px;
-    padding: 0 8px;
+    gap: 6px;
+    height: 28px;
+    padding: 0 10px;
     border: 0;
     border-radius: 999px;
     background: transparent;
     color: var(--muted);
-    font-size: 11.5px;
+    font-size: 12px;
     font-weight: 500;
   }
   .agent-mode button:hover:not(.on) {
@@ -898,6 +866,7 @@
   .pill.model {
     flex-shrink: 1;
     min-width: 0;
+    max-width: 100%;
     overflow: hidden;
   }
   .picker-slot {
@@ -974,44 +943,18 @@
   }
   .mi span {
     color: var(--muted);
-    font-size: 11.5px;
+    font-size: 12px;
   }
   .mi:hover,
   .mi[aria-checked='true'] {
     background: var(--accent-bg);
   }
-  .context {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    padding: 0 6px;
-    color: var(--subtle);
-    font-size: 11.5px;
-    font-variant-numeric: tabular-nums;
-  }
-  .context svg {
-    transform: rotate(-90deg);
-  }
-  .ring-track {
-    fill: none;
-    stroke: var(--surface-3);
-    stroke-width: 2.2;
-  }
-  .ring-fill {
-    fill: none;
-    stroke: var(--accent);
-    stroke-width: 2.2;
-    stroke-linecap: round;
-  }
-  .context.high .ring-fill {
-    stroke: var(--warn);
-  }
   .icon {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 28px;
-    height: 28px;
+    width: 32px;
+    height: 32px;
     border: 0;
     border-radius: 999px;
     background: transparent;
@@ -1036,8 +979,8 @@
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 30px;
-    height: 30px;
+    width: 34px;
+    height: 34px;
     margin-left: 2px;
     border: 0;
     border-radius: 999px;
@@ -1049,21 +992,38 @@
     filter: brightness(1.1);
   }
   @container composer (max-width: 560px) {
-    .pill > :global(svg:first-child),
-    .context-pct {
-      display: none;
+    .left {
+      flex-basis: 220px;
     }
-    .pill select {
-      max-width: 96px;
+    .toolbar:has(.pill.model) {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr);
+      gap: 8px;
     }
-  }
-  @container composer (max-width: 420px) {
-    .toggle,
+    .toolbar:has(.pill.model) .left {
+      display: contents;
+    }
+    .agent-mode {
+      grid-area: 1 / 1;
+      justify-self: start;
+    }
     .pill.model {
-      display: none;
+      grid-area: 1 / 2;
+      justify-self: end;
+    }
+    .effort {
+      grid-area: 2 / 1;
+      justify-self: start;
     }
     .pill select {
-      max-width: 72px;
+      max-width: 112px;
+    }
+    .right {
+      grid-area: 2 / 2;
+      justify-self: end;
+      justify-content: flex-end;
+      flex-wrap: wrap;
+      gap: 6px;
     }
   }
   .send:disabled {

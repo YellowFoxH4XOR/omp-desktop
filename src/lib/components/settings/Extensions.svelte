@@ -74,7 +74,7 @@
       else await api.extensionsRemove(source);
       await checkUpdates();
       const verb = action === 'install' ? 'Installed' : action === 'update' ? 'Updated' : 'Removed';
-      notice = { kind: 'ok', text: `${verb} ${label.replace(/^npm:/, '')}. New threads use it right away; restart running threads to pick it up.` };
+      notice = { kind: 'ok', text: `${verb} ${label.replace(/^npm:/, '')}. New threads use it right away; press Reload Pi (⟳) in an open thread or in Intern to load it there.` };
       if (action === 'install') sourceInput = '';
     } catch (error) {
       notice = { kind: 'error', text: errorText(error) };
