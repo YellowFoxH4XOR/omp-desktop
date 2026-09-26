@@ -287,24 +287,24 @@
     letter-spacing: 0.02em;
   }
   .mono.small {
-    width: 16px;
-    height: 16px;
-    border-radius: 4px;
-    font-size: 7.5px;
+    width: 20px;
+    height: 20px;
+    border-radius: 5px;
+    font-size: 9px;
   }
 
   .trigger {
     display: inline-flex;
     align-items: center;
-    gap: 6px;
+    gap: 8px;
     max-width: 100%;
-    height: 26px;
-    padding: 0 8px 0 5px;
+    height: 32px;
+    padding: 0 10px 0 6px;
     border: 0;
     border-radius: 999px;
     background: transparent;
     color: var(--muted);
-    font-size: 12px;
+    font-size: 13px;
     font-weight: 500;
     white-space: nowrap;
   }
@@ -327,7 +327,7 @@
     border-radius: 4px;
     background: var(--surface-2);
     color: var(--subtle);
-    font-size: 10.5px;
+    font-size: 11.5px;
     font-variant-numeric: tabular-nums;
   }
   .trigger:hover .trigger-context,

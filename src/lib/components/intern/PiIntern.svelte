@@ -9,11 +9,14 @@
   import PlanReview from '$lib/components/plan/PlanReview.svelte';
   import { planOf, PLAN_APPROVE, PLAN_DECLINE, PLAN_FEEDBACK } from '$lib/plan';
   import ModelPicker from '$lib/components/conversation/ModelPicker.svelte';
+  import ContextRing from '$lib/components/conversation/ContextRing.svelte';
   import { screenshot, MAX_ATTACHMENTS, type Screenshot } from './attachments';
+  import { INTERN_COMMANDS, slashSuggestions, SOURCE_LABEL } from '$lib/slash';
+  import { runBuiltin } from '$lib/slash-actions';
 
   // Intern is app-wide. It only sees a project when one is attached here;
   // opening it from a thread attaches that thread's project.
-  let { open, projects, threadProjectId, onClose, onPending, onAttention }: { open: boolean; projects: Project[]; threadProjectId: string | null; onClose: () => void; onPending: (count: number) => void; onAttention?: () => void } = $props();
+  let { open, projects, threadProjectId, onClose, onPending, onAttention, onOpenTerminal }: { open: boolean; projects: Project[]; threadProjectId: string | null; onClose: () => void; onPending: (count: number) => void; onAttention?: () => void; onOpenTerminal?: () => void } = $props();
   let attachedId = $state<string | null>(null);
   let wasOpen = false;
   $effect(() => {
@@ -30,6 +33,7 @@
   let attaching = $state(false);
   let stopping = $state(false);
   let clearing = $state(false);
+  let reloading = $state(false);
   let text = $state('');
   let error = $state('');
   let attachments = $state<Screenshot[]>([]);
@@ -43,6 +47,36 @@
   const busy = $derived(submitting || model?.view.status === 'active' || model?.view.status === 'waiting');
   const ready = $derived(model && !loading && !stopping && !clearing && model.view.status !== 'disconnected');
   let refreshGeneration = 0;
+  let panel: HTMLDivElement;
+
+  // `/` commands: πDesk's built-ins that make sense for Intern, then Pi's own.
+  let cmdIndex = $state(0);
+  let cmdDismissed = $state(false);
+  const suggestions = $derived(cmdDismissed || !model ? [] : slashSuggestions(text, model.view.commands, INTERN_COMMANDS));
+  $effect(() => { suggestions.length; cmdIndex = 0; });
+  // Escape hides the menu until the text changes.
+  $effect(() => { text; cmdDismissed = false; });
+  function pickSuggestion(name: string) {
+    text = `/${name} `;
+    textarea?.focus();
+  }
+  function onKey(event: KeyboardEvent) {
+    if (suggestions.length) {
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+        event.preventDefault();
+        cmdIndex = (cmdIndex + (event.key === 'ArrowDown' ? 1 : suggestions.length - 1)) % suggestions.length;
+        return;
+      }
+      if (event.key === 'Tab' || (event.key === 'Enter' && !event.shiftKey && !event.isComposing)) {
+        event.preventDefault();
+        pickSuggestion(suggestions[Math.min(cmdIndex, suggestions.length - 1)].name);
+        return;
+      }
+      // Close the menu, not the panel.
+      if (event.key === 'Escape') { event.stopPropagation(); cmdDismissed = true; return; }
+    }
+    if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) { event.preventDefault(); void send(); }
+  }
 
   async function refreshPlans() {
     const generation = ++refreshGeneration;
@@ -80,6 +114,8 @@
         } else buffered.push(event.frame);
       }
     } else if (event.type === 'exited') {
+      // A reload stops Pi on purpose and immediately starts a new one.
+      if (event.expected && reloading) return;
       model?.setError(event.expected ? 'Intern stopped. Reopen to continue.' : 'Private Pi stopped unexpectedly. Reopen to continue.');
       void refreshPlans();
     }
@@ -105,12 +141,29 @@
     } catch (reason) { error = reason instanceof Error ? reason.message : String(reason); }
     finally { attaching = false; }
   }
+  /** Built-ins run in πDesk; any other `/command` goes to Pi as typed. */
+  async function runCommand(message: string): Promise<boolean> {
+    if (!model || attachments.length || !message.startsWith('/')) return false;
+    return runBuiltin(message, {
+      threadId: 'pidesk-intern',
+      session: model,
+      setModel: selectModel,
+      setEffort: async level => {
+        const state = await api.setThreadEffort('pidesk-intern', level);
+        if (model) model.view.effort = state.thinkingLevel ?? level;
+      },
+      reload: reloadPi,
+      startNew: clear,
+      openModelPicker: () => panel?.querySelector<HTMLButtonElement>('button[aria-label="Select model"]')?.click(),
+      login: onOpenTerminal,
+    });
+  }
   async function send() {
     if (!ready || busy || attaching || (!text.trim() && !attachments.length)) return;
     submitting = true; error = '';
     const message = `${text.trim() || 'Please inspect these screenshots.'}${attachments.length ? `\n\nAttached screenshots: ${attachments.map(file => file.name).join(', ')}` : ''}`;
     try {
-      await api.internPrompt(message, project?.id, attachments.map(({ data, mimeType }) => ({ data, mimeType })));
+      if (!(await runCommand(message))) await api.internPrompt(message, project?.id, attachments.map(({ data, mimeType }) => ({ data, mimeType })));
       text = ''; attachments = [];
     } catch (reason) { error = String(reason); }
     finally { submitting = false; }
@@ -129,6 +182,25 @@
     finally { stopping = false; }
   }
   /** Fresh conversation in the same Pi; the attached project and draft stay. */
+  /** Restart Intern's Pi so new extensions, MCP servers and settings load.
+   *  The conversation resumes; pending approvals can't carry over. */
+  async function reloadPi() {
+    if (reloading || loading) return;
+    if (busy && !window.confirm('Pi Intern is working. Reload now? The current run stops.')) return;
+    reloading = true;
+    error = '';
+    try {
+      await api.internStop();
+      await load();
+      model?.notify('info', 'Reloaded Pi: new extensions, MCP servers and settings are loaded.');
+    } catch (reason) {
+      if (!disposed) error = String(reason);
+    } finally {
+      // Let the stop's exit event arrive before listening for real exits again.
+      setTimeout(() => { reloading = false; }, 1000);
+    }
+  }
+
   async function clear() {
     if (clearing || loading) return;
     if (busy && !window.confirm('Pi Intern is working. Stop it and clear the conversation?')) return;
@@ -179,8 +251,8 @@
 
 <!-- Non-modal: the project and other threads remain usable while Intern works. -->
 <svelte:window onclick={event => { if (pickerOpen && !(event.target as Element | null)?.closest('.picker')) pickerOpen = false; }} />
-<div class="intern" role="dialog" aria-modal="false" tabindex="-1" class:hidden={!open} aria-label="Pi Intern" onkeydown={event => { event.stopPropagation(); if (event.key === 'Escape') { if (pickerOpen) pickerOpen = false; else onClose(); } }}>
-  <header><span class="title"><Bot size={18}/> Pi Intern</span><span class="scope" title={project?.path ?? 'Not attached to a project'}>{project ? project.displayName : 'All of πDesk'}</span><button title="New conversation (clears this chat, keeps Pi running)" aria-label="Clear Pi Intern conversation" disabled={loading || clearing || stopping || !model} onclick={() => void clear()}><Eraser size={15}/></button><button title="Hide Intern (work continues)" aria-label="Hide Pi Intern" onclick={onClose}><X size={16}/></button></header>
+<div bind:this={panel} class="intern" role="dialog" aria-modal="false" tabindex="-1" class:hidden={!open} aria-label="Pi Intern" onkeydown={event => { event.stopPropagation(); if (event.key === 'Escape') { if (pickerOpen) pickerOpen = false; else onClose(); } }}>
+  <header><span class="title"><Bot size={18}/> Pi Intern</span><span class="scope" title={project?.path ?? 'Not attached to a project'}>{project ? project.displayName : 'All of πDesk'}</span><button title="Reload Pi: restart Intern's Pi to load new extensions, MCP servers and settings" aria-label="Reload Pi Intern" disabled={loading || clearing || stopping || reloading} onclick={() => void reloadPi()}><RefreshCw size={15} class={reloading ? 'spin' : ''}/></button><button title="New conversation (clears this chat, keeps Pi running)" aria-label="Clear Pi Intern conversation" disabled={loading || clearing || stopping || !model} onclick={() => void clear()}><Eraser size={15}/></button><button title="Hide Intern (work continues)" aria-label="Hide Pi Intern" onclick={onClose}><X size={16}/></button></header>
   <div class="policy"><ShieldCheck size={13}/> Plan mode · read-only until you approve a plan · πDesk actions need approval</div>
   {#if error || model?.view.error}<div class="error" role="alert">{error || model?.view.error}<button disabled={loading || busy} onclick={() => void load()}><RefreshCw size={12}/> Reopen</button></div>{/if}
   {#if loading}<div class="empty" role="status">Opening Pi Intern…</div>
@@ -215,10 +287,23 @@
   {/if}
   <div class="composer">
     {#if project}<div class="attached"><Folder size={12}/><span title={project.path}>{project.displayName}</span><button aria-label={`Detach ${project.displayName}`} title="Detach project" onclick={() => attachedId = null}><X size={11}/></button></div>{/if}
+    {#if suggestions.length}
+      <div class="suggest" id="intern-command-suggestions" role="listbox" aria-label="Commands">
+        {#each suggestions as command, i (command.name)}
+          <button id={`intern-command-${i}`} type="button" role="option" aria-selected={i === cmdIndex} class="sug" class:active={i === cmdIndex}
+            onmousedown={event => { event.preventDefault(); pickSuggestion(command.name); }}>
+            <span class="sug-name">/{command.name}{#if command.args}<span class="sug-args"> {command.args}</span>{/if}</span>
+            {#if command.description}<span class="sug-desc">{command.description}</span>{/if}
+            <span class="sug-source" data-source={command.source}>{SOURCE_LABEL[command.source]}</span>
+          </button>
+        {/each}
+      </div>
+    {/if}
     {#if attachments.length}<div class="attachments">{#each attachments as file, index}<div><img src={`data:${file.mimeType};base64,${file.data}`} alt={file.name}/><button aria-label={`Remove ${file.name}`} onclick={() => attachments = attachments.filter((_, i) => i !== index)}><X size={12}/></button></div>{/each}</div>{/if}
     <textarea bind:this={textarea} bind:value={text} aria-label="Message Pi Intern" placeholder={project ? `Ask about ${project.displayName}, or attach a screenshot…` : 'Ask about Pi or πDesk, attach a project or a screenshot…'} rows="2" maxlength="32000" disabled={!ready || busy}
       onpaste={event => { const files = Array.from(event.clipboardData?.files ?? []); if (files.length) { event.preventDefault(); void addFiles(files); } }}
-      onkeydown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) { event.preventDefault(); void send(); } }}></textarea>
+      aria-controls={suggestions.length ? 'intern-command-suggestions' : undefined} aria-activedescendant={suggestions.length ? `intern-command-${cmdIndex}` : undefined}
+      onkeydown={onKey}></textarea>
     <input bind:this={fileInput} type="file" accept="image/png,image/jpeg,image/webp" multiple aria-label="Attach screenshots" onchange={event => { void addFiles(Array.from(event.currentTarget.files ?? [])); event.currentTarget.value = ''; }} hidden />
     <div class="toolbar">
       <button aria-label="Attach screenshots" title="Attach screenshots (or paste)" disabled={!ready || busy || attaching || attachments.length>=MAX_ATTACHMENTS || model?.view.model?.images===false} onclick={() => fileInput.click()}><Paperclip size={15}/></button>
@@ -237,6 +322,7 @@
       </div>
       {#if model?.view.models.length}<ModelPicker models={model.view.models} current={model.view.model ?? null} onSelect={selectModel}/>{/if}
       <span class="grow"></span>
+      <ContextRing usage={model?.view.contextUsage} />
       <button aria-label="Stop Intern" title="Stop Intern (threads it started keep running)" disabled={stopping || loading} onclick={() => void stop()}><Square size={13}/></button>
       <button class="send" aria-label="Send to Pi Intern" disabled={!ready || busy || attaching || (!text.trim() && !attachments.length)} onclick={() => void send()}><ArrowUp size={16}/></button>
     </div>
@@ -272,7 +358,15 @@
   pre { font:11px/1.5 var(--mono); white-space:pre-wrap; overflow-wrap:anywhere; max-height:240px; overflow:auto; padding:8px; background:var(--bg); border-radius:6px; }
   .plan-actions { display:flex; justify-content:flex-end; gap:7px; }
   .approve,.send { background:var(--accent-strong); color:var(--on-accent); }
-  .composer { flex:none; padding:10px 12px; border-top:1px solid var(--line); }
+  .composer { position:relative; flex:none; padding:10px 12px; border-top:1px solid var(--line); }
+  .suggest { position:absolute; left:12px; right:12px; bottom:calc(100% - 4px); z-index:3; display:flex; flex-direction:column; max-height:260px; overflow-y:auto; padding:4px; border:1px solid var(--line); border-radius:var(--radius-lg); background:var(--elevated); box-shadow:var(--shadow); animation:ui-pop .12s var(--ease); }
+  .sug { display:flex; gap:10px; align-items:baseline; justify-content:flex-start; padding:6px 10px; border:0; border-radius:var(--radius-sm); background:transparent; color:var(--text); font-size:12.5px; text-align:left; }
+  .sug.active, .sug:hover { background:var(--accent-bg); }
+  .sug-name { flex:none; color:var(--accent); font:12px var(--mono); }
+  .sug-args { color:var(--subtle); }
+  .sug-desc { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--muted); font-size:12px; }
+  .sug-source { flex:none; align-self:center; height:17px; padding:0 6px; border-radius:5px; background:var(--surface-2); color:var(--subtle); font-size:10.5px; font-weight:600; line-height:17px; }
+  .sug-source[data-source='pidesk'] { background:var(--accent-bg); color:var(--accent); }
   textarea { display:block; resize:vertical; width:100%; max-height:140px; min-height:56px; border:1px solid var(--line-strong); border-radius:8px; background:var(--surface); color:var(--text); padding:9px; font:13px/1.5 var(--font); }
   .toolbar { display:flex; gap:7px; align-items:center; margin-top:8px; }
   .grow { flex:1; }

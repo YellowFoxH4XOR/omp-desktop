@@ -158,7 +158,7 @@ async function installDesktopMock(page: Page, scenario: Scenario = {}) {
         if (command === 'intern_snapshot') {
           if (!installed) throw new Error('Private Pi is missing. Install Pi in Settings.');
           const view = snapshot('a');
-          return { ...view, thread: { ...view.thread, id: 'pidesk-intern', title: 'Pi Intern' }, messages: [{role:'assistant',content:[{type:'text',text:'I can inspect Pi or coordinate your project. Changes require approval.'}]}] };
+          return { ...view, state: { ...view.state, contextUsage: { tokens: 42000, contextWindow: 200000, percent: 21 } }, thread: { ...view.thread, id: 'pidesk-intern', title: 'Pi Intern' }, messages: [{role:'assistant',content:[{type:'text',text:'I can inspect Pi or coordinate your project. Changes require approval.'}]}] };
         }
         if (command === 'intern_clear') {
           internPlans = internPlans.filter(plan => plan.threadId !== 'pidesk-intern');
@@ -253,6 +253,7 @@ async function installDesktopMock(page: Page, scenario: Scenario = {}) {
           return;
         }
         if (command === 'get_model_defaults') return clone(defaults);
+        if (command === 'get_models' || command === 'list_models') return clone(catalogue);
         if (command === 'set_default_model') { defaults = { ...defaults, provider: String(args.provider), modelId: String(args.modelId) }; return clone(defaults); }
         if (command === 'set_default_thinking_level') { defaults = { ...defaults, thinkingLevel: String(args.level) }; return clone(defaults); }
         if (command === 'set_thread_model') {
@@ -318,6 +319,8 @@ async function installDesktopMock(page: Page, scenario: Scenario = {}) {
       emit,
       finishInstall(error?: string) { finishInstall?.(error); },
       connectEvents() { connectEvents?.(); },
+      /** Pi rewrote its default (a thread switched models) or signed in to a provider. */
+      piChangedModels(provider: string, modelId: string, added?: any) { defaults = { ...defaults, provider, modelId }; if (added) catalogue.push(added); },
       proposeInternPlan(plan: any) { internPlans.push(plan); emit({type:'intern_changed'}); },
       setWorktree(id: string, changedFiles: number) {
         const row = threads.find(candidate => candidate.id === id);
@@ -759,7 +762,10 @@ test('launch shows the welcome screen and reopens a last-used thread in one clic
   await expect(projects.getByRole('button', { name: /desktop-e2e/ })).toBeVisible();
   const lastUsed = page.getByRole('region', { name: 'Last used' });
   await expect(lastUsed.getByRole('button')).toHaveText([/Alpha/, /Beta/]);
-  await page.screenshot({ path: testInfo.outputPath('welcome.png') });
+  await page.screenshot({ path: testInfo.outputPath('welcome.png'), animations: 'disabled' });
+  await page.emulateMedia({ colorScheme: 'dark' });
+  await page.screenshot({ path: testInfo.outputPath('welcome-dark.png'), animations: 'disabled' });
+  await page.emulateMedia({ colorScheme: 'light' });
   expect(await page.evaluate(() => (window as any).__mockDesktop.calls.filter((call: { command: string }) => call.command === 'open_thread' || call.command === 'list_threads'))).toHaveLength(0);
 
   await lastUsed.getByRole('button', { name: /Alpha/ }).click();
@@ -771,6 +777,103 @@ test('launch shows the welcome screen and reopens a last-used thread in one clic
   await expect(page.getByRole('heading', { name: 'Welcome to πDesk' })).toBeVisible();
   await projects.getByRole('button', { name: /desktop-e2e/ }).click();
   await expect(page.getByRole('heading', { name: 'What shall we work on?' })).toBeVisible();
+});
+
+test('review panels keep conversation controls accessible at the minimum window width', async ({ page }, testInfo) => {
+  await installDesktopMock(page, { models: true });
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await page.goto('/');
+  await openProject(page);
+  await page.locator('.thread-link[title="Alpha"]').click();
+  const message = page.getByRole('combobox', { name: 'Message' });
+  await message.fill('Keep this draft while I review changes');
+  await page.screenshot({ path: testInfo.outputPath('conversation.png'), animations: 'disabled' });
+  await page.emulateMedia({ colorScheme: 'dark' });
+  await page.screenshot({ path: testInfo.outputPath('conversation-dark.png'), animations: 'disabled' });
+  await page.emulateMedia({ colorScheme: 'light' });
+  await page.getByRole('button', { name: 'Toggle changes' }).click();
+  const sidebar = page.getByRole('complementary', { name: 'Projects and threads' });
+  await expect(sidebar).toBeVisible();
+
+  await page.setViewportSize({ width: 900, height: 600 });
+  await expect(sidebar).toBeHidden();
+  await expect(page.getByRole('slider', { name: 'Resize project sidebar' })).toBeHidden();
+  const assertReadableConversation = async () => {
+    const pane = await page.locator('.main-pane').boundingBox();
+    expect(pane!.width).toBeGreaterThanOrEqual(480);
+    const composer = await page.locator('.composer').boundingBox();
+    for (const control of [
+      message,
+      page.getByRole('radiogroup', { name: 'Agent mode' }),
+      page.getByRole('button', { name: 'Select model' }),
+      page.getByRole('combobox', { name: 'Select effort' }),
+      page.getByRole('button', { name: 'Send message', exact: true }),
+    ]) {
+      await expect(control).toBeInViewport();
+      const bounds = await control.boundingBox();
+      expect(bounds!.x).toBeGreaterThanOrEqual(composer!.x);
+      expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(composer!.x + composer!.width);
+    }
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(900);
+    await expect(message).toHaveValue('Keep this draft while I review changes');
+  };
+  await assertReadableConversation();
+  await page.getByRole('button', { name: 'Select model' }).click();
+  await expect(page.getByRole('dialog', { name: 'Choose a model' })).toBeInViewport();
+  await page.getByRole('combobox', { name: 'Search models' }).press('Escape');
+  await page.screenshot({ path: testInfo.outputPath('changes-narrow.png'), animations: 'disabled' });
+
+  await page.getByRole('button', { name: 'Show projects and threads' }).click();
+  await expect(sidebar).toBeVisible();
+  await expect(page.getByRole('complementary', { name: 'Changes', exact: true })).toHaveCount(0);
+  await expect(page.locator('.thread-row.active .thread-link')).toBeFocused();
+  await expect(message).toHaveValue('Keep this draft while I review changes');
+
+  await page.evaluate(frame => (window as any).__mockDesktop.emit({ type: 'rpc', threadId: 'a', frame }), PLAN_FRAME('narrow-plan'));
+  const review = page.getByRole('dialog', { name: 'Plan review' });
+  await expect(review).toBeVisible();
+  await expect(sidebar).toBeHidden();
+  await assertReadableConversation();
+  await expect(review.getByRole('button', { name: 'Approve & run' })).toBeInViewport();
+  await page.screenshot({ path: testInfo.outputPath('plan-narrow.png'), animations: 'disabled' });
+  await page.emulateMedia({ colorScheme: 'dark' });
+  await page.screenshot({ path: testInfo.outputPath('plan-narrow-dark.png'), animations: 'disabled' });
+
+  await page.setViewportSize({ width: 1440, height: 800 });
+  await expect(sidebar).toBeVisible();
+  await expect(review).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Show projects and threads' })).toHaveCount(0);
+  await page.setViewportSize({ width: 900, height: 600 });
+  await page.getByRole('button', { name: 'Show projects and threads' }).click();
+  await expect(sidebar).toBeVisible();
+  await expect(page.getByRole('group', { name: 'Plan approval' })).toBeVisible();
+  await expect(message).toHaveValue('Keep this draft while I review changes');
+  expect(await page.evaluate(() => (window as any).__mockDesktop.calls.filter((call: { command: string }) => call.command === 'respond_ui'))).toHaveLength(0);
+});
+
+test('a saved wide review panel fits smaller windows without losing its preferred width', async ({ page }) => {
+  await installDesktopMock(page);
+  await page.addInitScript(() => localStorage.setItem('panelWidth', '850'));
+  await page.setViewportSize({ width: 900, height: 600 });
+  await page.goto('/');
+  await openProject(page);
+  await page.locator('.thread-link[title="Alpha"]').click();
+  await page.getByRole('button', { name: 'Toggle changes' }).click();
+  const resize = page.getByRole('slider', { name: 'Resize detail panel' });
+  await expect(resize).toHaveAttribute('aria-valuenow', '419');
+  await expect(resize).toHaveAttribute('aria-valuemax', '419');
+  expect((await page.locator('.main-pane').boundingBox())!.width).toBeGreaterThanOrEqual(480);
+  await page.setViewportSize({ width: 1680, height: 900 });
+  await expect(resize).toHaveAttribute('aria-valuenow', '850');
+  await expect(page.getByRole('complementary', { name: 'Projects and threads' })).toBeVisible();
+  await page.setViewportSize({ width: 900, height: 600 });
+  await expect(resize).toHaveAttribute('aria-valuenow', '419');
+  await resize.focus();
+  await resize.press('ArrowRight');
+  await expect(resize).toHaveAttribute('aria-valuenow', '407');
+  await resize.press('ArrowLeft');
+  await resize.press('ArrowLeft');
+  await expect(resize).toHaveAttribute('aria-valuenow', '419');
 });
 
 test('thread popover closes after actions and rename saves or cancels in place', async ({ page }) => {
@@ -1015,7 +1118,8 @@ test('slash commands: Pi built-ins run in πDesk, Pi commands go to Pi, terminal
   await send('/mcp-auth eureka-db');
   await expect.poll(sent).toEqual([
     ['compact_thread', { threadId: 'a', instructions: 'keep the API notes' }],
-    ['get_usage', { threadId: 'a' }],
+    ['get_usage', { threadId: 'a' }], // /compact refreshes the context meter
+    ['get_usage', { threadId: 'a' }], // /session
     ['send_prompt', { threadId: 'a', message: '/mcp-auth eureka-db', mode: 'prompt' }],
   ]);
   // A slash command never becomes the thread title.
@@ -1154,6 +1258,39 @@ test('the top bar names the thread worktree: its branch, else a short name, and 
   await page.locator('.thread-link[title="Beta"]').click();
   await expect(page.getByText('History b')).toBeVisible();
   await expect(chip).toHaveCount(0);
+});
+
+test('Reload Pi restarts a thread or Intern so new extensions load, asking first mid-run', async ({ page }) => {
+  await installDesktopMock(page);
+  await page.goto('/');
+  await openProject(page);
+  await page.locator('.thread-link[title="Alpha"]').click();
+  await expect(page.getByText('History a')).toBeVisible();
+  const restarts = () => page.evaluate(() => (window as any).__mockDesktop.calls.filter((call: { command: string }) => call.command === 'restart_thread').length);
+
+  await page.getByRole('button', { name: 'Reload Pi', exact: true }).click();
+  await expect(page.getByText('Reloaded Pi: new extensions, MCP servers and settings are loaded.')).toBeVisible();
+  expect(await restarts()).toBe(1);
+
+  // Mid-run it asks; declining leaves the run alone, accepting reloads.
+  await page.evaluate(() => (window as any).__mockDesktop.emit({ type: 'rpc', threadId: 'a', frame: { type: 'agent_start' } }));
+  page.once('dialog', dialog => void dialog.dismiss());
+  await page.getByRole('button', { name: 'Reload Pi', exact: true }).click();
+  await page.waitForTimeout(200);
+  expect(await restarts()).toBe(1);
+  page.once('dialog', dialog => void dialog.accept());
+  await page.getByRole('button', { name: 'Reload Pi', exact: true }).click();
+  await expect.poll(restarts).toBe(2);
+
+  // Intern reloads in place without showing a stopped error.
+  await page.getByRole('button', { name: 'Ask Pi Intern' }).click();
+  const chat = page.getByRole('dialog', { name: 'Pi Intern', exact: true });
+  await expect(chat).toContainText('Changes require approval');
+  await chat.getByRole('button', { name: 'Reload Pi Intern' }).click();
+  await expect(chat).toContainText('Reloaded Pi: new extensions, MCP servers and settings are loaded.');
+  await expect(chat).not.toContainText('Intern stopped');
+  const internCalls = await page.evaluate(() => (window as any).__mockDesktop.calls.filter((call: { command: string }) => ['intern_stop', 'intern_snapshot'].includes(call.command)).map((call: { command: string }) => call.command));
+  expect(internCalls).toEqual(['intern_snapshot', 'intern_stop', 'intern_snapshot']);
 });
 
 test('a working thread shows a live clock and says what it is doing', async ({ page }) => {
@@ -1477,4 +1614,76 @@ test('model picker groups by provider, shows context, searches, and sets the def
   await page.locator('.new-thread').click();
   await expect(page.locator('.top-thread')).toHaveText('New thread');
   await expect(page.getByRole('button', { name: 'Select model' })).toContainText('GLM-5.1');
+});
+
+test('Pi Intern shows its context and runs / commands: built-ins in πDesk, Pi commands raw', async ({ page }) => {
+  await installDesktopMock(page);
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Ask Pi Intern' }).click();
+  const chat = page.getByRole('dialog', { name: 'Pi Intern', exact: true });
+  const input = chat.getByRole('textbox', { name: 'Message Pi Intern' });
+  await expect(chat.getByRole('meter', { name: 'Context used' })).toContainText('21%');
+  await expect(chat.getByRole('meter', { name: 'Context used' })).toHaveAttribute('title', /42,000 \/ 200,000 tokens/);
+
+  // Intern's menu: its built-ins and Pi's own commands, not thread-only ones.
+  await input.fill('/');
+  const menu = chat.getByRole('listbox', { name: 'Commands' });
+  await expect(menu.getByRole('option', { name: /\/compact/ })).toBeVisible();
+  await expect(menu.getByRole('option', { name: /\/new.*Intern conversation/ })).toBeVisible();
+  await expect(menu.getByRole('option', { name: /\/plan/ })).toHaveCount(0);
+  // Escape closes the menu, not Intern.
+  await input.press('Escape');
+  await expect(menu).toBeHidden();
+  await expect(chat).toBeVisible();
+
+  // A Pi extension command is sent as typed, without Intern's project preamble.
+  await input.fill('/mcp');
+  await expect(menu.getByRole('option', { name: /\/mcp-auth/ })).toBeVisible();
+  await input.press('Enter');
+  await expect(input).toHaveValue('/mcp-auth ');
+  await input.pressSequentially('github');
+  await input.press('Enter');
+  await expect.poll(() => page.evaluate(() => (window as any).__mockDesktop.calls.filter((call: any) => call.command === 'intern_prompt').map((call: any) => call.args.message))).toEqual(['/mcp-auth github']);
+
+  // /compact runs in πDesk against Intern's Pi and refreshes the meter.
+  await input.fill('/compact');
+  await input.press('Enter');
+  await input.press('Enter');
+  await expect(chat.getByRole('meter', { name: 'Context used' })).toContainText('1%');
+  const calls = await page.evaluate(() => (window as any).__mockDesktop.calls.filter((call: any) => ['compact_thread', 'get_usage'].includes(call.command)).map((call: any) => [call.command, call.args.threadId]));
+  expect(calls).toEqual([['compact_thread', 'pidesk-intern'], ['get_usage', 'pidesk-intern']]);
+  await expect(chat).toContainText('Compacted');
+
+  // /auto is a thread command (not offered here); Intern explains instead of sending it.
+  await input.fill('/auto');
+  await expect(menu).toBeHidden();
+  await input.press('Enter');
+  await expect(chat).toContainText('Pi Intern always runs in Plan mode');
+  expect(await page.evaluate(() => (window as any).__mockDesktop.calls.filter((call: any) => call.command === 'intern_prompt').length)).toBe(1);
+});
+
+test('Settings → Models lists every model Pi has and re-reads the default each time it is shown', async ({ page }) => {
+  await installDesktopMock(page, { models: true });
+  await page.goto('/');
+  // No thread needs to be open: the list comes straight from the private Pi.
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  const settings = page.getByRole('dialog', { name: 'Settings' });
+  await settings.getByRole('button', { name: 'Models' }).click();
+  const picker = settings.getByRole('button', { name: 'Default model for new threads' });
+  await expect(picker).toContainText('Kimi K2.6');
+  await picker.click();
+  await expect(page.getByRole('tab', { name: /OpenAI Codex/ })).toBeVisible();
+  await page.keyboard.press('Escape');
+
+  // Pi saved another default (a thread switched models) and a provider was added.
+  await page.evaluate(() => (window as any).__mockDesktop.piChangedModels('opencode-go', 'glm-5.1', { provider: 'anthropic', id: 'claude-sonnet-5', name: 'Claude Sonnet 5', contextWindow: 200000 }));
+  await settings.getByRole('button', { name: 'General' }).click();
+  await settings.getByRole('button', { name: 'Models' }).click();
+  await expect(picker).toContainText('GLM-5.1');
+  await picker.click();
+  await expect(page.getByRole('tab', { name: /Anthropic/ })).toBeVisible();
+  await page.keyboard.press('Escape');
+  await settings.getByRole('button', { name: 'Reload models' }).click();
+  await expect.poll(() => page.evaluate(() => (window as any).__mockDesktop.calls.filter((call: any) => call.command === 'list_models').length)).toBe(3);
+  expect(await page.evaluate(() => (window as any).__mockDesktop.calls.some((call: any) => call.command === 'get_models'))).toBe(false);
 });
