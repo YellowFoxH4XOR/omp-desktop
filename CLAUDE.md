@@ -69,6 +69,6 @@ Everything routes through `src-tauri/src/commands.rs`, the `#[tauri::command]` I
 
 - Only Pi is supported. The one-value `HarnessKind` wire type preserves IPC/schema compatibility and rejects unsupported agent values; it is not a selector. Do not advertise unverified Pi capabilities.
 - Size/count limits are pervasive by design (frame bytes, history messages/bytes, cached sessions, pending frames, stderr tail, live thread count) — this is a long-running desktop app talking to external processes, so unbounded growth is treated as a bug class. Preserve existing caps and add new ones for any new unbounded buffer.
-- New isolated worktrees live under `~/.pidesk/worktrees/`; saved legacy paths remain usable. Project removal only deletes metadata, never repo files, Git history, worktrees, or Pi session data.
-- Naming: user-facing text says `πDesk`; code, crates, and paths use `pidesk`. The only `omp`/`ompui` identifiers left are legacy-migration lookups and their tests—keep them.
-- New app identity: `dev.pidesk.desktop`, database `pidesk.sqlite3`. With no new database, reuse legacy `dev.ompui.desktop/omp-desktop.sqlite3` in place rather than copying SQLite/WAL files. Preserve legacy OMP/external-Pi rows but filter/reject them in every thread execution path; only explicitly managed-runtime threads may run. Keep projects and start fresh rather than copying credentials, extensions, or session files.
+- Isolated worktrees live under `~/.pidesk/worktrees/`. Project removal only deletes metadata, never repo files, Git history, worktrees, or Pi session data.
+- Naming: user-facing text says `πDesk`; code, crates, and paths use `pidesk`.
+- App identity: `dev.pidesk.desktop`, database `pidesk.sqlite3`. πDesk is in beta and intentionally has no migration from earlier builds. Never import credentials, extensions, or sessions from the user's terminal Pi.

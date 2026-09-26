@@ -1056,7 +1056,7 @@
         {#if installPlanError}<p role="alert">{installPlanError}</p>{/if}
       </section>
       {#if installation && installPlan}<section><PiSignIn command={installPlan.loginCommand} /></section>{/if}
-      <section><h3>Privacy</h3><p class="last">Pi stores its settings, extensions, credentials, and sessions inside πDesk’s private directory. Existing external-Pi threads are hidden, not deleted. No credentials are copied from your terminal Pi. πDesk sends no product telemetry.</p></section>
+      <section><h3>Privacy</h3><p class="last">Pi stores its settings, extensions, credentials, and sessions inside πDesk’s private directory. Nothing is copied from your terminal Pi, and it is never modified. πDesk sends no product telemetry.</p></section>
     </div>
   </div>
 {/if}

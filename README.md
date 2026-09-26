@@ -109,7 +109,7 @@ src-tauri/
     harness.rs                  Managed Pi validation and opt-in installation
     rpc.rs                      Bounded JSONL transport and correlation
     sessions.rs                 Pi session discovery
-    store.rs                    SQLite metadata and legacy compatibility
+    store.rs                    SQLite metadata for projects and threads
     threads.rs                  Process lifecycle and thread orchestration
   capabilities/                 Tauri permission allowlists
   tests/                        Transport and optional live Pi tests
@@ -123,16 +123,9 @@ src-tauri/
 - This is installation/configuration separation, not an OS sandbox: Pi still works on selected project files with your user account's permissions.
 - Git writes are restricted to changed paths and guarded by expected-content hashes.
 - Removing a project deletes app metadata only, not files, Git history, worktrees, or Pi sessions.
-- New isolated worktrees live under `~/.pidesk/worktrees/`; saved worktree paths remain usable.
-- Fresh installs use `pidesk.sqlite3` in the `dev.pidesk.desktop` app-data directory.
-
-### Existing installations
-
-Projects are preserved, but πDesk starts with fresh private threads. Existing external-Pi and OMP thread rows remain stored but hidden and cannot be resumed with the managed runtime. Their original session files, CLI installations, credentials, and extensions are not modified or uninstalled. New threads are explicitly marked as belonging to πDesk's runtime.
-
-When no new app database exists, πDesk can reuse the prior `dev.ompui.desktop/omp-desktop.sqlite3` metadata database in place to preserve projects, without copying live SQLite/WAL files. Session discovery only scans the private `~/.pidesk/agent/sessions` tree; external directory overrides are ignored.
-
-The new app identity may reset window placement and webview preferences. The `ompui`/`omp-desktop` names above remain only so existing installations can be found; everything else is named πDesk.
+- Isolated worktrees live under `~/.pidesk/worktrees/`.
+- App metadata lives in `pidesk.sqlite3` in the `dev.pidesk.desktop` app-data directory.
+- πDesk is in beta and does not import data from earlier builds or from your terminal Pi.
 
 ## License
 

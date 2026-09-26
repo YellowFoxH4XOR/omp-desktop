@@ -25,7 +25,7 @@ pub fn run() {
                 .path()
                 .app_data_dir()
                 .unwrap_or_else(|_| util::home_dir().join(".pidesk"));
-            let database = store::database_path(&data_dir);
+            let database = store::db_path(&data_dir);
             let store = Arc::new(store::Store::open(&database).map_err(|error| {
                 std::io::Error::other(format!(
                     "Could not open πDesk metadata at {}: {error}",
