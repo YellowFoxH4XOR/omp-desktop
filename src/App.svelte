@@ -26,7 +26,8 @@
   import { ago, clock } from '$lib/time';
   import { planOf, PLAN_APPROVE, PLAN_DECLINE, PLAN_FEEDBACK } from '$lib/plan';
   import ConfirmDialog from '$lib/components/diff/ConfirmDialog.svelte';
-  import type { BackendEvent, HarnessInstallation, HarnessInstallCommand, InstallStatus, ModelDefaults, ModelInfo, Project, SessionSnapshot, SessionState, Thread, ThreadDeletePreview, ThreadMode, ThreadStatus, UiResponse } from '$lib/types';
+  import { answerConfirm, askConfirm, confirmState } from '$lib/confirm.svelte';
+  import type { BackendEvent, HarnessInstallation, HarnessInstallCommand, InstallStatus, InternImage, ModelDefaults, ModelInfo, Project, SessionSnapshot, SessionState, Thread, ThreadDeletePreview, ThreadMode, ThreadStatus, UiResponse } from '$lib/types';
   type ChangesPanelComponent = (typeof import('$lib/components/diff/ChangesPanel.svelte'))['default'];
   type RpcFrame = Record<string, unknown>;
   interface OpenedSession {
@@ -601,7 +602,7 @@
     void loadModelDefaults();
     void Promise.allSettled([runtimeReady, refreshProjects()]).then(() => { detecting = false; if (installation) void checkExtensionUpdates(); });
     const onKey = (event: KeyboardEvent) => {
-      if (terminalOpen || deleteDialog) return; // Terminal and ConfirmDialog own their keys.
+      if (terminalOpen || deleteDialog || confirmState.request) return; // Terminal and ConfirmDialog own their keys.
       if (!event.metaKey && event.key !== 'Escape') return;
       const key = event.key.toLowerCase();
       if (event.metaKey && key === 'k') { event.preventDefault(); void openSwitcher(); }
@@ -800,7 +801,7 @@
     } finally { endPendingAction(); }
   }
   async function removeProject(project: Project) {
-    if (!window.confirm(`Remove “${project.displayName}” from πDesk?\n\nRepository files, Git history, and harness sessions will not be deleted.`)) return;
+    if (!(await askConfirm({ title: 'Remove project?', subject: project.displayName, detail: 'It leaves the πDesk sidebar. Repository files, Git history, worktrees and Pi sessions are not deleted.', confirmLabel: 'Remove project' }))) return;
     try {
       await api.removeProject(project.id);
       invalidatedProjects.add(project.id);
@@ -943,14 +944,14 @@
     });
   }
 
-  async function send(message: string, mode: 'prompt' | 'steer' | 'follow_up') {
-    if (await runBuiltin(message)) return;
+  async function send(message: string, mode: 'prompt' | 'steer' | 'follow_up', images: InternImage[] = []) {
+    if (!images.length && await runBuiltin(message)) return;
     const targetThread = activeThread;
     if (!targetThread) return;
     const projectId = targetThread.projectId;
     const selectionToken = threadSelectionToken;
     try {
-      await api.sendPrompt(targetThread.id, message, mode);
+      await api.sendPrompt(targetThread.id, message, mode, images);
       if (activeThread?.id === targetThread.id && threadSelectionToken === selectionToken && !invalidatedProjects.has(projectId)) startupError = '';
       if (!message.trim().startsWith('/') && !invalidatedProjects.has(projectId) && !invalidatedThreads.has(targetThread.id) && (!targetThread.title || targetThread.title === 'New thread')) {
         const title = message.trim().split('\n')[0].slice(0, 70);
@@ -1020,7 +1021,7 @@
   async function reloadPi() {
     const session = activeSession;
     if (!activeThread || reloadingPi) return;
-    if (session?.view.status === 'active' && !window.confirm('Pi is working on this thread. Reload now? The current run stops.')) return;
+    if (session?.view.status === 'active' && !(await askConfirm({ title: 'Reload Pi now?', subject: activeThread.title || 'New thread', detail: 'Pi is working on this thread. Reloading stops the current run.', confirmLabel: 'Stop and reload' }))) return;
     reloadingPi = true;
     try {
       if (await restart()) activeSession?.notify('info', 'Reloaded Pi: new extensions, MCP servers and settings are loaded.');
@@ -1453,6 +1454,10 @@
     </div>
   {/snippet}
 
+{#if confirmState.request}
+  {@const request = confirmState.request}
+  <ConfirmDialog title={request.title} path={request.subject} detail={request.detail} confirmLabel={request.confirmLabel} onConfirm={() => answerConfirm(true)} onCancel={() => answerConfirm(false)} />
+{/if}
 {#if deleteDialog}
   <ConfirmDialog title="Delete thread?" path={deleteDialog.thread.title || 'New thread'}
     detail={`Conversation history will be deleted.${deleteDialog.preview.worktreePath ? `\nIsolated worktree ${deleteDialog.preview.worktreePath} will be removed.` : ''}${deleteDialog.preview.changedFiles ? `\n${deleteDialog.preview.changedFiles} uncommitted files will be discarded.` : ''}`}

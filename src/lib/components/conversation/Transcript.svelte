@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onDestroy, untrack } from 'svelte';
   import { VList, type VListHandle } from 'virtua/svelte';
-  import { ArrowDown, Brain, ChevronRight, Code2, FileText, Globe, Info, Pencil, Plug, Puzzle, Search, Sparkles, SquareTerminal, TriangleAlert } from '@lucide/svelte';
+  import { ArrowDown, Brain, ChevronRight, Code2, FileText, Globe, Image as ImageIcon, Info, Pencil, Plug, Puzzle, Search, Sparkles, SquareTerminal, TriangleAlert } from '@lucide/svelte';
   import { mcpCall } from '../tools/mcp-tools.svelte';
   import type { ConversationItem } from '../../types';
   import CommandCard from '../tools/CommandCard.svelte';
@@ -263,7 +263,7 @@
 {#snippet entry(item: ConversationItem)}
   {#if item.kind === 'user'}
     <div class="user">
-      <div class="user-text">{item.text}</div>
+      <div class="user-text">{#if item.images}<span class="user-images"><ImageIcon size={12} strokeWidth={2} />{item.images} {item.images === 1 ? 'image' : 'images'}</span>{/if}{item.text}</div>
     </div>
   {:else if item.kind === 'text'}
     <div class="assistant" class:streaming={item.streaming}>
@@ -578,6 +578,15 @@
   .user {
     display: flex;
     justify-content: flex-end;
+  }
+  .user-images {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    margin-bottom: 4px;
+    font-size: 11.5px;
+    font-weight: 500;
+    opacity: 0.75;
   }
   .user-text {
     max-width: 82%;
