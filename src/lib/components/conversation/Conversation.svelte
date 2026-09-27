@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { SessionView, UiResponse } from '../../types';
+  import type { InternImage, SessionView, UiResponse } from '../../types';
   import Composer from './Composer.svelte';
   import RequestCard from './RequestCard.svelte';
   import Transcript from './Transcript.svelte';
@@ -7,7 +7,7 @@
 
   interface Props {
     view: SessionView;
-    onSend: (message: string, mode: 'prompt' | 'steer' | 'follow_up') => void | Promise<void>;
+    onSend: (message: string, mode: 'prompt' | 'steer' | 'follow_up', images?: InternImage[]) => void | Promise<void>;
     onAbort: () => void | Promise<void>;
     onShowChanges: (path?: string) => void;
     onRespond: (requestId: string, response: UiResponse) => void | Promise<void>;

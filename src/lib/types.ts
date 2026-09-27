@@ -110,7 +110,7 @@ export interface SessionSnapshot {
 }
 export interface ToolResult { content?: RpcContent[]; details?: unknown; isError?: boolean }
 export type ConversationItem =
-  | { id: string; kind: 'user' | 'text' | 'thinking'; text: string; streaming?: boolean; timestamp?: number }
+  | { id: string; kind: 'user' | 'text' | 'thinking'; text: string; streaming?: boolean; timestamp?: number; /** Images sent with a user message. */ images?: number }
   | { id: string; kind: 'tool'; toolCallId: string; toolName: string; args: Record<string, unknown>; intent?: string; status: ToolStatus; result?: ToolResult; partial?: ToolResult; timestamp?: number }
   | { id: string; kind: 'custom' | 'notice' | 'advisor'; text: string; customType?: string; details?: unknown; level?: string; timestamp?: number };
 export interface UiRequest {

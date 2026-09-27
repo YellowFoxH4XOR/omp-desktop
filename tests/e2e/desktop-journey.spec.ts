@@ -194,7 +194,8 @@ async function installDesktopMock(page: Page, scenario: Scenario = {}) {
           threads.push(row);
           return clone(row);
         }
-        if (command === 'list_projects') return [clone(project)];
+        if (command === 'list_projects') return (window as any).__projectRemoved ? [] : [clone(project)];
+        if (command === 'remove_project') { (window as any).__projectRemoved = true; return; }
         if (command === 'list_threads') return clone(threads);
         if (command === 'list_recent_threads') return clone(threads.filter(row => !row.archived).sort((x, y) => y.lastViewedAt.localeCompare(x.lastViewedAt)).slice(0, Number(args.limit)));
         if (command === 'open_thread' || command === 'restart_thread') {
@@ -400,6 +401,71 @@ test('opening Intern from a thread attaches that thread\'s project', async ({ pa
   await expect(chat).toContainText('I inspected the request');
   const prompt = await page.evaluate(() => (window as any).__mockDesktop.calls.find((call: any) => call.command === 'intern_prompt').args);
   expect(prompt.projectId).toBe('project-1');
+});
+
+test('Pi Intern can move, resize, restore its geometry and keep plan review in view', async ({ page }) => {
+  await installDesktopMock(page);
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Ask Pi Intern' }).click();
+  const chat = page.getByRole('dialog', { name: 'Pi Intern', exact: true });
+  await expect(chat).toBeVisible();
+  const initial = (await chat.boundingBox())!;
+
+  const handle = chat.getByRole('button', { name: /Move Pi Intern/ });
+  const header = (await handle.boundingBox())!;
+  await page.mouse.move(header.x + 80, header.y + header.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(header.x - 600, header.y + header.height / 2 + 90, { steps: 5 });
+  await page.mouse.up();
+  const moved = (await chat.boundingBox())!;
+  expect(moved.x).toBeLessThan(initial.x - 600);
+  expect(moved.y).toBeGreaterThan(initial.y + 30);
+
+  const grip = chat.getByRole('button', { name: 'Resize Pi Intern bottom right' });
+  const corner = (await grip.boundingBox())!;
+  await page.mouse.move(corner.x + corner.width / 2, corner.y + corner.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(corner.x + corner.width / 2 + 130, corner.y + corner.height / 2 - 90, { steps: 5 });
+  await page.mouse.up();
+  const resized = (await chat.boundingBox())!;
+  expect(resized.width).toBeGreaterThan(initial.width + 120);
+  expect(resized.height).toBeLessThan(initial.height - 80);
+  await expect(chat.getByRole('button', { name: 'Hide Pi Intern' })).toBeVisible();
+
+  await chat.getByRole('button', { name: 'Hide Pi Intern' }).click();
+  await page.getByRole('button', { name: 'Ask Pi Intern' }).click();
+  expect((await chat.boundingBox())!.x).toBeCloseTo(resized.x, 0);
+  await page.reload();
+  await page.getByRole('button', { name: 'Ask Pi Intern' }).click();
+  const restored = (await chat.boundingBox())!;
+  expect(restored.x).toBeCloseTo(resized.x, 0);
+  expect(restored.width).toBeCloseTo(resized.width, 0);
+
+  await page.evaluate(frame => (window as any).__mockDesktop.emit({ type: 'rpc', threadId: 'pidesk-intern', frame }), PLAN_FRAME('intern-move'));
+  const review = page.getByRole('dialog', { name: 'Plan review' });
+  await expect(review).toBeVisible();
+  const sheet = (await review.boundingBox())!;
+  expect(sheet.x).toBeGreaterThan(restored.x + restored.width);
+  expect(sheet.x + sheet.width).toBeLessThanOrEqual(1440);
+
+  await page.setViewportSize({ width: 900, height: 600 });
+  await expect.poll(async () => (await chat.boundingBox())!.height).toBeLessThanOrEqual(584);
+  const narrow = (await chat.boundingBox())!;
+  expect(narrow.x).toBeGreaterThanOrEqual(8);
+  expect(narrow.y).toBeGreaterThanOrEqual(8);
+  expect(narrow.x + narrow.width).toBeLessThanOrEqual(892);
+  expect(narrow.y + narrow.height).toBeLessThanOrEqual(592);
+  const overlaid = (await review.boundingBox())!;
+  expect(Math.abs(overlaid.x - narrow.x)).toBeLessThanOrEqual(1);
+  expect(Math.abs(overlaid.width - narrow.width)).toBeLessThanOrEqual(2);
+  await review.getByRole('button', { name: 'Hide plan review' }).click();
+  await grip.focus();
+  await grip.press('ArrowLeft');
+  expect((await chat.boundingBox())!.width).toBeLessThan(narrow.width);
+  await handle.focus();
+  await handle.press('Home');
+  expect((await chat.boundingBox())!.width).toBeCloseTo(620, 0);
 });
 
 test('clearing Intern starts a fresh conversation in place and drops its pending plans', async ({ page }) => {
@@ -1274,12 +1340,13 @@ test('Reload Pi restarts a thread or Intern so new extensions load, asking first
 
   // Mid-run it asks; declining leaves the run alone, accepting reloads.
   await page.evaluate(() => (window as any).__mockDesktop.emit({ type: 'rpc', threadId: 'a', frame: { type: 'agent_start' } }));
-  page.once('dialog', dialog => void dialog.dismiss());
+  const ask = page.getByRole('alertdialog', { name: 'Reload Pi now?' });
   await page.getByRole('button', { name: 'Reload Pi', exact: true }).click();
-  await page.waitForTimeout(200);
+  await ask.getByRole('button', { name: 'Cancel' }).click();
+  await expect(ask).toBeHidden();
   expect(await restarts()).toBe(1);
-  page.once('dialog', dialog => void dialog.accept());
   await page.getByRole('button', { name: 'Reload Pi', exact: true }).click();
+  await ask.getByRole('button', { name: 'Stop and reload' }).click();
   await expect.poll(restarts).toBe(2);
 
   // Intern reloads in place without showing a stopped error.
@@ -1686,4 +1753,55 @@ test('Settings → Models lists every model Pi has and re-reads the default each
   await settings.getByRole('button', { name: 'Reload models' }).click();
   await expect.poll(() => page.evaluate(() => (window as any).__mockDesktop.calls.filter((call: any) => call.command === 'list_models').length)).toBe(3);
   expect(await page.evaluate(() => (window as any).__mockDesktop.calls.some((call: any) => call.command === 'get_models'))).toBe(false);
+});
+
+test('removing a project asks in-app first and keeps it when cancelled', async ({ page }) => {
+  await installDesktopMock(page);
+  await page.goto('/');
+  const removed = () => page.evaluate(() => (window as any).__mockDesktop.calls.filter((call: any) => call.command === 'remove_project').length);
+  const remove = async () => {
+    await page.getByRole('button', { name: 'Actions for desktop-e2e' }).click();
+    await page.getByRole('menuitem', { name: 'Remove from app' }).click();
+  };
+  const ask = page.getByRole('alertdialog', { name: 'Remove project?' });
+  await remove();
+  await expect(ask).toContainText('desktop-e2e');
+  await expect(ask).toContainText('are not deleted');
+  await page.keyboard.press('Escape');
+  await expect(ask).toBeHidden();
+  expect(await removed()).toBe(0);
+  await remove();
+  await ask.getByRole('button', { name: 'Remove project' }).click();
+  await expect.poll(removed).toBe(1);
+  await expect(page.getByRole('button', { name: 'Actions for desktop-e2e' })).toHaveCount(0);
+});
+
+test('threads take image attachments and send them with the prompt', async ({ page }) => {
+  await installDesktopMock(page);
+  await page.goto('/');
+  await openProject(page);
+  await page.locator('.thread-link[title="Alpha"]').click();
+  await expect(page.getByText('History a')).toBeVisible();
+  const composer = page.getByRole('group', { name: 'Composer' });
+  const image = await page.screenshot();
+  await composer.locator('input[type="file"]').setInputFiles([{ name: 'bug.png', mimeType: 'image/png', buffer: image }, { name: 'notes.txt', mimeType: 'text/plain', buffer: Buffer.from('not an image') }]);
+  await expect(composer.getByAltText('bug.png')).toBeVisible();
+  await expect(composer.getByRole('img')).toHaveCount(1); // non-images are ignored
+
+  // Remove, then attach again; an image alone can be sent.
+  await composer.getByRole('button', { name: 'Remove bug.png' }).click();
+  await expect(composer.getByAltText('bug.png')).toHaveCount(0);
+  await composer.locator('input[type="file"]').setInputFiles({ name: 'bug.png', mimeType: 'image/png', buffer: image });
+  await expect(composer.getByAltText('bug.png')).toBeVisible();
+  await page.getByRole('button', { name: 'Send message' }).click();
+  await expect.poll(() => page.evaluate(() => (window as any).__mockDesktop.calls.filter((call: any) => call.command === 'send_prompt').map((call: any) => [call.args.message, call.args.images.length, call.args.images[0]?.mimeType]))).toEqual([['Please look at the attached image.', 1, 'image/jpeg']]);
+  await expect(composer.getByAltText('bug.png')).toHaveCount(0);
+
+  // The transcript notes images on the user's message.
+  await page.evaluate(() => (window as any).__mockDesktop.emit({ type: 'rpc', threadId: 'a', frame: { type: 'message_end', message: { role: 'user', content: [{ type: 'text', text: 'What is wrong here?' }, { type: 'image', data: 'AAAA', mimeType: 'image/jpeg' }], timestamp: 20 } } }));
+  await expect(page.locator('.user-text').filter({ hasText: 'What is wrong here?' })).toContainText('1 image');
+
+  // Too many images are refused with a reason.
+  await composer.locator('input[type="file"]').setInputFiles(Array.from({ length: 5 }, (_, i) => ({ name: `shot-${i}.png`, mimeType: 'image/png', buffer: image })));
+  await expect(composer.getByRole('alert')).toContainText('Attach at most 4 images');
 });

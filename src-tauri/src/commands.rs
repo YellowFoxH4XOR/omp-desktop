@@ -285,7 +285,10 @@ pub async fn send_prompt(
     thread_id: String,
     message: String,
     mode: Option<String>,
+    images: Option<Vec<crate::intern::ImageAttachment>>,
 ) -> CmdResult<()> {
+    let images = images.unwrap_or_default();
+    crate::intern::validate_images(&images).map_err(cmd_err)?;
     let mode = mode.as_deref().unwrap_or("prompt");
     if !matches!(mode, "prompt" | "steer" | "follow_up") {
         return Err("Invalid message mode.".to_string());
@@ -295,7 +298,7 @@ pub async fn send_prompt(
     }
     state
         .threads
-        .send_prompt(&thread_id, &message, mode)
+        .send_prompt_with_images(&thread_id, &message, mode, &images)
         .await
         .map_err(cmd_err)
 }

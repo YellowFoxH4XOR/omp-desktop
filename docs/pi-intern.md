@@ -2,6 +2,8 @@
 
 Pi Intern is a non-modal chat opened by **Intern** beside Changes. It floats above the resource monitor. Hiding it does not stop work; **Stop Intern** cancels pending approvals, drains in-flight app operations, and stops the coordinator. Project threads Intern started keep running; stop them like any thread. It starts only when explicitly opened. **Clear conversation** (eraser) aborts the coordinator's turn, revokes its pending plans, and starts a fresh Pi session in the same process (RPC `new_session`); project threads are untouched, and the old journal stays on disk unmapped.
 
+Drag the panel by its title to move it, or drag its edges and corners to resize. The position and size persist across restarts and stay within the window when it changes size. Double-click the title to reset the layout. Keyboard users can focus the title and use arrow keys to move it (Home resets it), or focus a resize edge/corner and use arrow keys to resize; Shift increases the step. An approval sheet follows the panel, appearing beside it when there is room or over it otherwise.
+
 Intern is app-wide. It sees a project only when one is attached in its picker, or when opened while a thread is showing (that thread's project is attached).
 
 ## Capabilities

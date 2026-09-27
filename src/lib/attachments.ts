@@ -2,7 +2,8 @@ import type { InternImage } from '$lib/types';
 export interface Screenshot extends InternImage { name: string }
 export const MAX_ATTACHMENTS = 4;
 
-/** Decode locally and downsize before any bytes cross IPC or reach a model. */
+/** Screenshots for a thread or Pi Intern prompt (Rust validates them again).
+ *  Decode locally and downsize before any bytes cross IPC or reach a model. */
 export async function screenshot(file: File): Promise<Screenshot> {
   if (!['image/png', 'image/jpeg', 'image/webp'].includes(file.type)) throw new Error('Use PNG, JPEG, or WebP screenshots.');
   if (file.size > 8 * 1024 * 1024) throw new Error('Screenshots must be under 8 MiB before resizing.');
