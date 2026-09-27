@@ -237,8 +237,9 @@ class ItemSink {
 
 	pushUser(msg: RpcMessage): void {
 		const text = contentToText(msg.content);
-		if (!text) return;
-		this.push({ id: nid(), kind: 'user', text, timestamp: msg.timestamp });
+		const images = Array.isArray(msg.content) ? msg.content.filter(b => isRec(b) && b.type === 'image').length : 0;
+		if (!text && !images) return;
+		this.push({ id: nid(), kind: 'user', text, timestamp: msg.timestamp, ...(images ? { images } : {}) });
 	}
 
 	/** Push one assistant content block. Returns the stored item, an existing

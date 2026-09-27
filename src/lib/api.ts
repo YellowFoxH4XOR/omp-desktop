@@ -29,7 +29,7 @@ export const api = {
   setDefaultThinkingLevel: (level: string) => invoke<ModelDefaults>('set_default_thinking_level', { level }),
   prewarmThread: (threadId: string) => invoke<void>('prewarm_thread', { threadId }),
   restartThread: (threadId: string) => invoke<SessionSnapshot>('restart_thread', { threadId }),
-  sendPrompt: (threadId: string, message: string, mode: 'prompt' | 'steer' | 'follow_up' = 'prompt') => invoke<void>('send_prompt', { threadId, message, mode }),
+  sendPrompt: (threadId: string, message: string, mode: 'prompt' | 'steer' | 'follow_up' = 'prompt', images: InternImage[] = []) => invoke<void>('send_prompt', { threadId, message, mode, ...(images.length ? { images } : {}) }),
   abortThread: (threadId: string) => invoke<void>('abort_thread', { threadId }),
   setThreadModel: (threadId: string, provider: string, modelId: string) => invoke<SessionState>('set_thread_model', { threadId, provider, modelId }),
   setThreadEffort: (threadId: string, level: string) => invoke<SessionState>('set_thread_effort', { threadId, level }),

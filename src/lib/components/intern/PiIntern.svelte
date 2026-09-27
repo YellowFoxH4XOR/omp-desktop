@@ -10,9 +10,10 @@
   import { planOf, PLAN_APPROVE, PLAN_DECLINE, PLAN_FEEDBACK } from '$lib/plan';
   import ModelPicker from '$lib/components/conversation/ModelPicker.svelte';
   import ContextRing from '$lib/components/conversation/ContextRing.svelte';
-  import { screenshot, MAX_ATTACHMENTS, type Screenshot } from './attachments';
+  import { screenshot, MAX_ATTACHMENTS, type Screenshot } from '$lib/attachments';
   import { INTERN_COMMANDS, slashSuggestions, SOURCE_LABEL } from '$lib/slash';
   import { runBuiltin } from '$lib/slash-actions';
+  import { askConfirm } from '$lib/confirm.svelte';
 
   // Intern is app-wide. It only sees a project when one is attached here;
   // opening it from a thread attaches that thread's project.
@@ -48,6 +49,98 @@
   const ready = $derived(model && !loading && !stopping && !clearing && model.view.status !== 'disconnected');
   let refreshGeneration = 0;
   let panel: HTMLDivElement;
+
+  type Geometry = { x: number; y: number; width: number; height: number };
+  type Edge = 'top' | 'right' | 'bottom' | 'left' | 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right';
+  const edges: Edge[] = ['top', 'right', 'bottom', 'left', 'top-left', 'top-right', 'bottom-left', 'bottom-right'];
+  const geometryKey = 'piInternGeometry';
+  let viewportWidth = $state(typeof window === 'undefined' ? 1280 : window.innerWidth);
+  let viewportHeight = $state(typeof window === 'undefined' ? 800 : window.innerHeight);
+  let savedGeometry = $state<Geometry | null>(null);
+  const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
+  const geometry = $derived.by(() => {
+    const width = clamp(savedGeometry?.width ?? Math.min(620, viewportWidth - 48), Math.min(360, viewportWidth - 16), viewportWidth - 16);
+    const height = clamp(savedGeometry?.height ?? Math.min(760, viewportHeight - 110), Math.min(320, viewportHeight - 16), viewportHeight - 16);
+    return {
+      width, height,
+      x: clamp(savedGeometry?.x ?? viewportWidth - width - 20, 8, viewportWidth - width - 8),
+      y: clamp(savedGeometry?.y ?? viewportHeight - height - 44, 8, viewportHeight - height - 8),
+    };
+  });
+  const planPlacement = $derived.by(() => {
+    const leftSpace = geometry.x - 24;
+    const rightSpace = viewportWidth - geometry.x - geometry.width - 24;
+    const width = Math.min(580, Math.max(leftSpace, rightSpace));
+    if (width >= 380) {
+      if (leftSpace >= rightSpace) return { x: geometry.x - width - 12, width, overlay: false };
+      return { x: geometry.x + geometry.width + 12, width, overlay: false };
+    }
+    return { x: geometry.x, width: geometry.width, overlay: true };
+  });
+  let interaction = $state<{ kind: 'move' | Edge; startX: number; startY: number; initial: Geometry } | null>(null);
+
+  function resize(initial: Geometry, edge: Edge, dx: number, dy: number): Geometry {
+    let { x, y, width, height } = initial;
+    const minWidth = Math.min(360, viewportWidth - 16);
+    const minHeight = Math.min(320, viewportHeight - 16);
+    if (edge.includes('left')) {
+      x = clamp(initial.x + dx, 8, initial.x + initial.width - minWidth);
+      width = initial.width + initial.x - x;
+    } else if (edge.includes('right')) {
+      width = clamp(initial.width + dx, minWidth, viewportWidth - initial.x - 8);
+    }
+    if (edge.includes('top')) {
+      y = clamp(initial.y + dy, 8, initial.y + initial.height - minHeight);
+      height = initial.height + initial.y - y;
+    } else if (edge.includes('bottom')) {
+      height = clamp(initial.height + dy, minHeight, viewportHeight - initial.y - 8);
+    }
+    return { x, y, width, height };
+  }
+  function startInteraction(event: PointerEvent, kind: 'move' | Edge) {
+    if (event.button !== 0 || (kind === 'move' && (event.target as Element).closest('button'))) return;
+    event.preventDefault();
+    interaction = { kind, startX: event.clientX, startY: event.clientY, initial: geometry };
+  }
+  function moveInteraction(event: PointerEvent) {
+    if (!interaction) return;
+    const { kind, startX, startY, initial } = interaction;
+    const dx = event.clientX - startX;
+    const dy = event.clientY - startY;
+    savedGeometry = kind === 'move'
+      ? { ...initial, x: clamp(initial.x + dx, 8, viewportWidth - initial.width - 8), y: clamp(initial.y + dy, 8, viewportHeight - initial.height - 8) }
+      : resize(initial, kind, dx, dy);
+  }
+  function endInteraction() {
+    if (!interaction) return;
+    interaction = null;
+    localStorage.setItem(geometryKey, JSON.stringify(geometry));
+  }
+  function keyboardResize(event: KeyboardEvent, edge: Edge) {
+    const step = event.shiftKey ? 40 : 12;
+    const dx = event.key === 'ArrowRight' ? step : event.key === 'ArrowLeft' ? -step : 0;
+    const dy = event.key === 'ArrowDown' ? step : event.key === 'ArrowUp' ? -step : 0;
+    if ((!dx && !dy) || (dx && !edge.includes('left') && !edge.includes('right')) || (dy && !edge.includes('top') && !edge.includes('bottom'))) return;
+    event.preventDefault();
+    event.stopPropagation();
+    savedGeometry = resize(geometry, edge, dx, dy);
+    localStorage.setItem(geometryKey, JSON.stringify(geometry));
+  }
+  function resetGeometry() {
+    savedGeometry = null;
+    localStorage.removeItem(geometryKey);
+  }
+  function keyboardMove(event: KeyboardEvent) {
+    if (event.target !== event.currentTarget) return;
+    if (event.key === 'Home') { event.preventDefault(); resetGeometry(); return; }
+    const step = event.shiftKey ? 40 : 12;
+    const dx = event.key === 'ArrowRight' ? step : event.key === 'ArrowLeft' ? -step : 0;
+    const dy = event.key === 'ArrowDown' ? step : event.key === 'ArrowUp' ? -step : 0;
+    if (!dx && !dy) return;
+    event.preventDefault();
+    savedGeometry = { ...geometry, x: clamp(geometry.x + dx, 8, viewportWidth - geometry.width - 8), y: clamp(geometry.y + dy, 8, viewportHeight - geometry.height - 8) };
+    localStorage.setItem(geometryKey, JSON.stringify(savedGeometry));
+  }
 
   // `/` commands: πDesk's built-ins that make sense for Intern, then Pi's own.
   let cmdIndex = $state(0);
@@ -121,6 +214,10 @@
     }
   }
   onMount(() => {
+    try {
+      const stored = JSON.parse(localStorage.getItem(geometryKey) ?? 'null');
+      if (stored && ['x', 'y', 'width', 'height'].every(key => typeof stored[key] === 'number' && Number.isFinite(stored[key]))) savedGeometry = stored;
+    } catch { /* Ignore corrupt saved geometry. */ }
     let unlisten: (() => void) | undefined;
     void onBackendEvent(event).then(listener => {
       if (disposed) { listener(); return; }
@@ -186,7 +283,7 @@
    *  The conversation resumes; pending approvals can't carry over. */
   async function reloadPi() {
     if (reloading || loading) return;
-    if (busy && !window.confirm('Pi Intern is working. Reload now? The current run stops.')) return;
+    if (busy && !(await askConfirm({ title: 'Reload Pi now?', subject: 'Pi Intern', detail: 'Pi Intern is working. Reloading stops the current run.', confirmLabel: 'Stop and reload' }))) return;
     reloading = true;
     error = '';
     try {
@@ -203,7 +300,7 @@
 
   async function clear() {
     if (clearing || loading) return;
-    if (busy && !window.confirm('Pi Intern is working. Stop it and clear the conversation?')) return;
+    if (busy && !(await askConfirm({ title: 'Clear the conversation?', subject: 'Pi Intern', detail: 'Pi Intern is working. Clearing stops the current run.', confirmLabel: 'Stop and clear' }))) return;
     clearing = true; error = '';
     try {
       const snapshot = await api.internClear();
@@ -250,9 +347,9 @@
 </script>
 
 <!-- Non-modal: the project and other threads remain usable while Intern works. -->
-<svelte:window onclick={event => { if (pickerOpen && !(event.target as Element | null)?.closest('.picker')) pickerOpen = false; }} />
-<div bind:this={panel} class="intern" role="dialog" aria-modal="false" tabindex="-1" class:hidden={!open} aria-label="Pi Intern" onkeydown={event => { event.stopPropagation(); if (event.key === 'Escape') { if (pickerOpen) pickerOpen = false; else onClose(); } }}>
-  <header><span class="title"><Bot size={18}/> Pi Intern</span><span class="scope" title={project?.path ?? 'Not attached to a project'}>{project ? project.displayName : 'All of πDesk'}</span><button title="Reload Pi: restart Intern's Pi to load new extensions, MCP servers and settings" aria-label="Reload Pi Intern" disabled={loading || clearing || stopping || reloading} onclick={() => void reloadPi()}><RefreshCw size={15} class={reloading ? 'spin' : ''}/></button><button title="New conversation (clears this chat, keeps Pi running)" aria-label="Clear Pi Intern conversation" disabled={loading || clearing || stopping || !model} onclick={() => void clear()}><Eraser size={15}/></button><button title="Hide Intern (work continues)" aria-label="Hide Pi Intern" onclick={onClose}><X size={16}/></button></header>
+<svelte:window bind:innerWidth={viewportWidth} bind:innerHeight={viewportHeight} onpointermove={moveInteraction} onpointerup={endInteraction} onpointercancel={endInteraction} onclick={event => { if (pickerOpen && !(event.target as Element | null)?.closest('.picker')) pickerOpen = false; }} />
+<div bind:this={panel} class="intern" role="dialog" aria-modal="false" tabindex="-1" class:hidden={!open} class:moving={interaction?.kind === 'move'} aria-label="Pi Intern" style={`left:${geometry.x}px;top:${geometry.y}px;width:${geometry.width}px;height:${geometry.height}px`} onkeydown={event => { event.stopPropagation(); if (event.key === 'Escape') { if (pickerOpen) pickerOpen = false; else onClose(); } }}>
+  <header><div class="drag-handle" role="button" tabindex="0" aria-label="Move Pi Intern (arrow keys; Home resets position and size)" title="Drag to move · double-click to reset size and position" onpointerdown={event => startInteraction(event, 'move')} ondblclick={resetGeometry} onkeydown={keyboardMove}><span class="title"><Bot size={18}/> Pi Intern</span><span class="scope" title={project?.path ?? 'Not attached to a project'}>{project ? project.displayName : 'All of πDesk'}</span></div><button title="Reload Pi: restart Intern's Pi to load new extensions, MCP servers and settings" aria-label="Reload Pi Intern" disabled={loading || clearing || stopping || reloading} onclick={() => void reloadPi()}><RefreshCw size={15} class={reloading ? 'spin' : ''}/></button><button title="New conversation (clears this chat, keeps Pi running)" aria-label="Clear Pi Intern conversation" disabled={loading || clearing || stopping || !model} onclick={() => void clear()}><Eraser size={15}/></button><button title="Hide Intern (work continues)" aria-label="Hide Pi Intern" onclick={onClose}><X size={16}/></button></header>
   <div class="policy"><ShieldCheck size={13}/> Plan mode · read-only until you approve a plan · πDesk actions need approval</div>
   {#if error || model?.view.error}<div class="error" role="alert">{error || model?.view.error}<button disabled={loading || busy} onclick={() => void load()}><RefreshCw size={12}/> Reopen</button></div>{/if}
   {#if loading}<div class="empty" role="status">Opening Pi Intern…</div>
@@ -328,17 +425,23 @@
     </div>
     <small class="privacy">Screenshots and selected files go to your configured model provider. Review them for secrets.</small>
   </div>
+  {#each edges as edge}
+    <div class={`resize-${edge}`} role="button" tabindex="0" aria-label={`Resize Pi Intern ${edge.replace('-', ' ')}`} onpointerdown={event => { event.stopPropagation(); startInteraction(event, edge); }} onkeydown={event => keyboardResize(event, edge)}></div>
+  {/each}
 </div>
 {#if open && planRequest && !planHidden}
-  <div class="plan-sheet">
+  <div class="plan-sheet" class:overlay={planPlacement.overlay} style={`left:${planPlacement.x}px;top:${geometry.y}px;width:${planPlacement.width}px;height:${geometry.height}px`}>
     <PlanReview plan={planOf(planRequest) ?? ''} source="Pi Intern" onApprove={() => answerPlan('approve')} onDecline={() => answerPlan('decline')} onFeedback={text => answerPlan('feedback', text)} onClose={() => planHidden = true} />
   </div>
 {/if}
 
 <style>
-  .intern { position:fixed; right:20px; bottom:44px; z-index:25; width:min(620px,calc(100vw - 48px)); height:min(760px,calc(100vh - 110px)); display:flex; flex-direction:column; background:var(--bg); border:1px solid var(--line-strong); box-shadow:var(--shadow); border-radius:var(--radius-lg); overflow:hidden; }
+  .intern { position:fixed; z-index:25; display:flex; flex-direction:column; background:var(--bg); border:1px solid var(--line-strong); box-shadow:var(--shadow); border-radius:var(--radius-lg); overflow:hidden; }
   .intern.hidden { display:none; }
   header { display:flex; align-items:center; gap:9px; padding:12px 14px; background:var(--elevated); border-bottom:1px solid var(--line); }
+  .drag-handle { display:flex; align-items:center; flex:1; min-width:0; align-self:stretch; cursor:grab; touch-action:none; user-select:none; }
+  .intern.moving .drag-handle { cursor:grabbing; }
+  .drag-handle:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
   .title { display:flex; align-items:center; gap:8px; font-size:14px; font-weight:600; }
   .title :global(svg) { color:var(--accent); }
   .scope { margin-left:auto; color:var(--muted); font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:200px; }
@@ -380,9 +483,20 @@
   .menu button:hover { background:var(--surface); }
   .menu span { flex:1; text-align:left; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .menu p { margin:6px 8px; font-size:11.5px; color:var(--muted); }
-  .plan-sheet { position:fixed; right:calc(32px + min(620px, calc(100vw - 48px))); bottom:44px; z-index:25; width:min(580px, calc(100vw - 700px)); height:min(760px,calc(100vh - 110px)); background:var(--panel); border:1px solid var(--line-strong); box-shadow:var(--shadow); border-radius:var(--radius-lg); overflow:hidden; animation:ui-rise .2s var(--ease); }
-  /* Too narrow to sit beside Intern: cover it instead. */
-  @media (max-width: 1080px) { .plan-sheet { right:20px; z-index:26; width:min(620px,calc(100vw - 48px)); } }
+  .plan-sheet { position:fixed; z-index:25; background:var(--panel); border:1px solid var(--line-strong); box-shadow:var(--shadow); border-radius:var(--radius-lg); overflow:hidden; animation:ui-rise .2s var(--ease); }
+  .plan-sheet.overlay { z-index:26; }
+  [class^="resize-"] { position:absolute; z-index:2; touch-action:none; }
+  .resize-top, .resize-bottom { left:12px; right:12px; height:8px; cursor:ns-resize; }
+  .resize-top { top:0; } .resize-bottom { bottom:0; }
+  .resize-left, .resize-right { top:12px; bottom:12px; width:8px; cursor:ew-resize; }
+  .resize-left { left:0; } .resize-right { right:0; }
+  .resize-top-left, .resize-top-right, .resize-bottom-left, .resize-bottom-right { width:16px; height:16px; }
+  .resize-top-left { top:0; left:0; cursor:nwse-resize; }
+  .resize-top-right { top:0; right:0; cursor:nesw-resize; }
+  .resize-bottom-left { bottom:0; left:0; cursor:nesw-resize; }
+  .resize-bottom-right { bottom:0; right:0; cursor:nwse-resize; }
+  .resize-bottom-right::after { content:''; position:absolute; bottom:4px; right:4px; width:6px; height:6px; border-right:2px solid var(--subtle); border-bottom:2px solid var(--subtle); }
+  [class^="resize-"]:focus-visible { outline:2px solid var(--accent); outline-offset:-2px; }
   .plan-ready { display:flex; align-items:center; gap:8px; margin:8px 12px 0; padding:9px 12px; border:1px solid var(--line-strong); border-radius:8px; background:var(--warn-bg); color:var(--text); font:500 12.5px var(--font); justify-content:flex-start; }
   .plan-ready :global(svg) { color:var(--warn); }
   .plan-ready .go { margin-left:auto; color:var(--accent); font-weight:600; }

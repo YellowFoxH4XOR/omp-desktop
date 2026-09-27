@@ -5,11 +5,11 @@
 </script>
 
 <script lang="ts">
-  import { ArrowUp, Brain, ChevronDown, ChevronRight, ClipboardList, CornerDownLeft, Cpu, FileText, Folder, Square, Zap } from '@lucide/svelte';
+  import { ArrowUp, ImagePlus, Brain, ChevronDown, ChevronRight, ClipboardList, CornerDownLeft, Cpu, FileText, Folder, Square, X, Zap } from '@lucide/svelte';
   import { tick } from 'svelte';
   import { api } from '../../api';
   import { mentionAt, rankPaths, withFolders } from '../../fuzzy';
-  import type { ContextUsage, ModelInfo, ThreadMode, ThreadStatus } from '../../types';
+  import type { ContextUsage, InternImage, ModelInfo, ThreadMode, ThreadStatus } from '../../types';
   import ModelPicker from './ModelPicker.svelte';
   import { slide } from 'svelte/transition';
   import { backOut } from 'svelte/easing';
@@ -17,6 +17,7 @@
   import { slashSuggestions, SOURCE_LABEL } from '../../slash';
   import ContextRing from './ContextRing.svelte';
   import { modelKey } from './model-utils';
+  import { MAX_ATTACHMENTS, screenshot, type Screenshot } from '../../attachments';
 
   type SendMode = 'prompt' | 'steer' | 'follow_up';
 
@@ -29,7 +30,7 @@
     effort?: string;
     levels?: string[];
     contextUsage?: ContextUsage;
-    onSend: (message: string, mode: SendMode) => void | Promise<void>;
+    onSend: (message: string, mode: SendMode, images?: InternImage[]) => void | Promise<void>;
     onAbort: () => void | Promise<void>;
     onSetModel?: (value: string) => void | Promise<void>;
     /** `provider/id` of the default model for new threads. */
@@ -105,7 +106,29 @@
 
   const streaming = $derived(status === 'active');
   const disabled = $derived(status === 'disconnected');
-  const canSend = $derived(text.trim().length > 0 && !disabled && !submitting);
+
+  // ---- Screenshots: attach, paste or drop images for the model to see ----
+  let attachments = $state<Screenshot[]>([]);
+  let attaching = $state(false);
+  let attachError = $state('');
+  let dragging = $state(false);
+  let fileInput = $state<HTMLInputElement>();
+  const imagesSupported = $derived(currentModel?.images !== false);
+  const canSend = $derived((text.trim().length > 0 || attachments.length > 0) && !disabled && !submitting && !attaching);
+  async function addImages(files: File[]) {
+    const images = files.filter(file => file.type.startsWith('image/'));
+    if (!images.length || attaching) return;
+    attachError = '';
+    if (!imagesSupported) { attachError = `${currentModel?.name ?? 'This model'} can't read images. Choose an image-capable model.`; return; }
+    if (attachments.length + images.length > MAX_ATTACHMENTS) { attachError = `Attach at most ${MAX_ATTACHMENTS} images.`; return; }
+    const origin = threadId;
+    attaching = true;
+    try {
+      const added = await Promise.all(images.map(screenshot));
+      if (threadId === origin) attachments = [...attachments, ...added];
+    } catch (error) { attachError = error instanceof Error ? error.message : String(error); }
+    finally { attaching = false; area?.focus(); }
+  }
 
   const suggestions = $derived(cmdDismissed ? [] : slashSuggestions(text, commands));
 
@@ -117,6 +140,8 @@
     submitting = false;
     text = '';
     cmdDismissed = false;
+    attachments = [];
+    attachError = '';
     const focused = document.activeElement;
     const typingElsewhere = focused instanceof HTMLElement && focused !== area
       && (focused.isContentEditable || (focused instanceof HTMLInputElement && !['button', 'checkbox', 'radio'].includes(focused.type)) || focused instanceof HTMLTextAreaElement);
@@ -143,14 +168,19 @@
   });
 
   async function submit() {
-    const message = text.trim();
-    if (!message || disabled || submitting) return;
+    const typed = text.trim();
+    const sent = attachments;
+    if ((!typed && !sent.length) || disabled || submitting || attaching) return;
+    const message = typed || (sent.length === 1 ? 'Please look at the attached image.' : 'Please look at the attached images.');
     const operation = ++submitGeneration;
     const originThreadId = threadId;
     submitting = true;
     try {
-      await onSend(message, streaming ? streamMode : 'prompt');
-      if (operation === submitGeneration && threadId === originThreadId && text.trim() === message) text = '';
+      await onSend(message, streaming ? streamMode : 'prompt', sent.map(({ data, mimeType }) => ({ data, mimeType })));
+      if (operation === submitGeneration && threadId === originThreadId) {
+        if (text.trim() === typed) text = '';
+        if (attachments === sent) { attachments = []; attachError = ''; }
+      }
     } catch {
       if (operation === submitGeneration && threadId === originThreadId) area?.focus();
     } finally {
@@ -351,7 +381,10 @@
     </div>
   {/if}
 
-  <div class="box" class:asking={!!approval}>
+  <div class="box" class:asking={!!approval} class:dragging role="group" aria-label="Composer"
+    ondragover={(event) => { if (event.dataTransfer?.types.includes('Files')) { event.preventDefault(); dragging = true; } }}
+    ondragleave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) dragging = false; }}
+    ondrop={(event) => { dragging = false; const files = Array.from(event.dataTransfer?.files ?? []); if (files.length) { event.preventDefault(); void addImages(files); } }}>
     {#if approval && facts}
       <div class="approval" role="group" aria-label="Plan approval" transition:slide={{ duration: reduceMotion ? 0 : 420, easing: backOut }}>
         <div class="approval-head">
@@ -378,8 +411,21 @@
         {/if}
       </div>
     {/if}
+    {#if attachments.length || attaching || attachError}
+      <div class="attachments" aria-label="Attached images">
+        {#each attachments as image, index (index + image.name)}
+          <div class="thumb">
+            <img src={`data:${image.mimeType};base64,${image.data}`} alt={image.name} title={image.name} />
+            <button type="button" aria-label={`Remove ${image.name}`} onclick={() => { attachments = attachments.filter((_, i) => i !== index); area?.focus(); }}><X size={11} strokeWidth={2.4} /></button>
+          </div>
+        {/each}
+        {#if attaching}<div class="thumb loading" aria-label="Preparing image"></div>{/if}
+        {#if attachError}<span class="attach-error" role="alert">{attachError}</span>{/if}
+      </div>
+    {/if}
     <textarea
       bind:this={area}
+      onpaste={(event) => { const files = Array.from(event.clipboardData?.files ?? []).filter(file => file.type.startsWith('image/')); if (files.length) { event.preventDefault(); void addImages(files); } }}
       bind:value={text}
       onkeydown={onKeydown}
       role="combobox"
@@ -408,6 +454,10 @@
 
     <div class="toolbar">
       <div class="left">
+        <input bind:this={fileInput} type="file" accept="image/png,image/jpeg,image/webp" multiple hidden aria-label="Attach images"
+          onchange={(event) => { void addImages(Array.from(event.currentTarget.files ?? [])); event.currentTarget.value = ''; }} />
+        <button type="button" class="icon attach" aria-label="Attach images" title={imagesSupported ? 'Attach images (or paste / drop them)' : "This model can't read images"}
+          disabled={disabled || attaching || !imagesSupported || attachments.length >= MAX_ATTACHMENTS} onclick={() => fileInput?.click()}><ImagePlus size={15} strokeWidth={1.9} /></button>
         {#if onSetMode}
           <div class="agent-mode" role="radiogroup" aria-label="Agent mode">
             <button type="button" role="radio" aria-checked={agentMode === 'plan'} class:on={agentMode === 'plan'} title="Plan: read-only; asks before making changes" onclick={() => { if (agentMode !== 'plan') void onSetMode('plan'); }}><ClipboardList size={12} strokeWidth={2} />Plan</button>
@@ -652,6 +702,71 @@
     padding: 16px 14px 12px;
     box-shadow: 0 4px 18px rgb(0 0 0 / 0.08), var(--shadow-sm);
     transition: border-color 0.15s, box-shadow 0.15s;
+  }
+  .box.dragging {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-bg), var(--shadow-sm);
+  }
+  .attachments {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: -4px;
+  }
+  .thumb {
+    position: relative;
+    width: 64px;
+    height: 48px;
+    border: 1px solid var(--line);
+    border-radius: 9px;
+    overflow: hidden;
+    background: var(--surface);
+    animation: ui-pop 0.15s var(--ease);
+  }
+  .thumb img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+  .thumb.loading {
+    background: linear-gradient(90deg, var(--surface), var(--surface-2), var(--surface));
+    background-size: 200% 100%;
+    animation: shimmer 1.1s linear infinite;
+  }
+  @keyframes shimmer { to { background-position: -200% 0; } }
+  .thumb button {
+    position: absolute;
+    top: 3px;
+    right: 3px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 18px;
+    padding: 0;
+    border: 0;
+    border-radius: 999px;
+    background: rgb(0 0 0 / 0.6);
+    color: #fff;
+    opacity: 0;
+    transition: opacity 0.12s;
+  }
+  .thumb:hover button,
+  .thumb button:focus-visible {
+    opacity: 1;
+  }
+  .attach-error {
+    color: var(--bad);
+    font-size: 12px;
+  }
+  .icon.attach {
+    flex: none;
+    width: 28px;
+    height: 28px;
+  }
+  .icon.attach:disabled {
+    opacity: 0.4;
   }
   .box.asking {
     border-color: color-mix(in srgb, var(--warn) 55%, var(--line-strong));
@@ -1011,9 +1126,17 @@
       grid-area: 1 / 2;
       justify-self: end;
     }
+    .icon.attach {
+      grid-area: 2 / 1;
+      justify-self: start;
+      align-self: center;
+    }
     .effort {
       grid-area: 2 / 1;
       justify-self: start;
+    }
+    .toolbar:has(.pill.model) .effort {
+      margin-left: 34px;
     }
     .pill select {
       max-width: 112px;
