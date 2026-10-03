@@ -13,9 +13,9 @@ bun install --frozen-lockfile   # install exact locked deps
 
 bun run tauri dev               # run the app (Vite frontend on :1420 + Rust backend)
 
-bun run check                   # svelte-check + `cargo fmt --check` + `cargo check --locked`
+bun run check                   # svelte-check + `cargo fmt --check` + `cargo clippy -D warnings`
 bun run check:frontend          # svelte-check only
-bun run check:rust              # cd src-tauri && cargo fmt -- --check && cargo check --locked
+bun run check:rust              # cd src-tauri && cargo fmt -- --check && cargo clippy --locked --all-targets -- -D warnings
 
 bun run test                    # vitest (excludes tests/e2e)
 bun run test:watch              # vitest watch mode
@@ -49,7 +49,7 @@ The Rust backend spawns Pi CLI processes per thread and talks to them over a lin
 
 `src-tauri/src/sessions.rs` discovers only private Pi sessions under `~/.pidesk/agent/sessions`, including late `session_info` names. Metadata scans and history count/bytes are bounded. Inherited session/config directory overrides are ignored. Never import external Pi sessions, even if their headers match.
 
-`src-tauri/src/git.rs` implements Git status/diff and file write/revert. Write operations are restricted to paths Git currently reports as changed, and writes/reverts are guarded by expected-content-hash checks to avoid clobbering concurrent external edits.
+`src-tauri/src/git.rs` implements Git status/diff and file write/revert (`git/checked_write.rs` for the symlink-safe, hash-verified replace; `git/worktree.rs` for private worktrees). Write operations are restricted to paths Git currently reports as changed, and writes/reverts are guarded by expected-content-hash checks to avoid clobbering concurrent external edits. Raw `libc` descriptor calls for repository files live only in `fsat.rs`, behind safe wrappers; keep `git.rs` free of `unsafe`.
 
 `src-tauri/src/store.rs` is the SQLite layer for local metadata (projects, threads, settings) — not conversation content, which lives in Pi's own session files on disk.
 
@@ -59,7 +59,7 @@ Everything routes through `src-tauri/src/commands.rs`, the `#[tauri::command]` I
 
 ### Frontend
 
-`src/lib/api.ts` is the sole typed bridge to Rust (`invoke` wrappers) and the single point where backend events are schema-validated before entering app state.
+`src/lib/api.ts` is the sole typed bridge to Rust (`invoke` wrappers) and the single point where backend events are schema-validated before entering app state. `tests/ipc-contract.test.ts` checks its command names and arguments against `commands.rs`, the handler list in `lib.rs`, and the e2e mock, since the e2e journeys run against a mocked IPC.
 
 `src/lib/session.svelte.ts` (`SessionModel`) is the reactive core of one open thread: it flattens `get_messages` history into `ConversationItem` rows and reduces Pi live RPC deltas into one normalized `SessionView`, reconciling final messages without duplicate text. UI components never see raw harness frames, only this normalized shape. This is the file to read first when changing how conversation/tool-call state is derived or displayed.
 
