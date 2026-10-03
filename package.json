@@ -9,7 +9,7 @@
     "preview": "vite preview",
     "check": "bun run check:frontend && bun run check:rust",
     "check:frontend": "svelte-check --tsconfig ./tsconfig.json",
-    "check:rust": "cd src-tauri && cargo fmt -- --check && cargo check --locked",
+    "check:rust": "cd src-tauri && cargo fmt -- --check && cargo clippy --locked --all-targets -- -D warnings",
     "check:watch": "svelte-check --tsconfig ./tsconfig.json --watch",
     "tauri": "tauri",
     "test": "vitest run --exclude 'tests/e2e/**' && node --test src-tauri/src/intern-extension.check.mjs src-tauri/src/pidesk-modes.check.mjs",
