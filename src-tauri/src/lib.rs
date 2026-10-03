@@ -2,6 +2,8 @@ mod commands;
 mod dto;
 mod error;
 mod extensions;
+#[cfg(unix)]
+mod fsat;
 mod git;
 mod harness;
 mod intern;
@@ -124,7 +126,7 @@ pub fn run() {
                     let registry = state.registry.clone();
                     let intern = state.intern.clone();
                     intern.cancel_all();
-                    let _ = tauri::async_runtime::block_on(async move {
+                    tauri::async_runtime::block_on(async move {
                         registry.shutdown().await;
                         threads.shutdown_all().await;
                         intern.settle().await;

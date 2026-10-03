@@ -1,5 +1,7 @@
 use crate::dto::{ChangedFile, ChangesSummary, GitFile};
 use crate::error::{AppError, AppResult};
+#[cfg(unix)]
+use crate::fsat;
 use crate::util;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -436,61 +438,28 @@ fn open_checked_dir_no_create(root: &Path, path: &Path) -> AppResult<std::fs::Fi
 
 #[cfg(unix)]
 fn open_checked_dir_impl(root: &Path, path: &Path, create: bool) -> AppResult<std::fs::File> {
-    use std::os::fd::{AsRawFd, FromRawFd};
     let relative = path
         .strip_prefix(root)
         .map_err(|_| AppError::new("Path is outside the repository."))?;
-    let root_fd = unsafe {
-        libc::open(
-            c_path(root)?.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
-        )
-    };
-    if root_fd < 0 {
-        return Err(AppError::new(format!(
-            "Could not open repository root: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    let mut current = unsafe { std::fs::File::from_raw_fd(root_fd) };
+    let mut current = fsat::open_dir(&c_path(root)?)
+        .map_err(|error| AppError::new(format!("Could not open repository root: {error}")))?;
     for component in relative.components() {
         let Component::Normal(component) = component else {
             return Err(AppError::new("Path is outside the repository."));
         };
         let name = c_path(Path::new(component))?;
-        let mut next = unsafe {
-            libc::openat(
-                current.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
-            )
-        };
-        if next < 0
-            && create
-            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT)
-        {
-            let created = unsafe { libc::mkdirat(current.as_raw_fd(), name.as_ptr(), 0o755) };
-            if created != 0 {
-                return Err(AppError::new(format!(
-                    "Could not create parent directory: {}",
-                    std::io::Error::last_os_error()
-                )));
+        let next = match fsat::open_dir_at(&current, &name) {
+            Err(error) if create && error.kind() == std::io::ErrorKind::NotFound => {
+                fsat::mkdir_at(&current, &name, 0o755).map_err(|error| {
+                    AppError::new(format!("Could not create parent directory: {error}"))
+                })?;
+                fsat::open_dir_at(&current, &name)
             }
-            next = unsafe {
-                libc::openat(
-                    current.as_raw_fd(),
-                    name.as_ptr(),
-                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
-                )
-            };
-        }
-        if next < 0 {
-            return Err(AppError::new(format!(
-                "Could not safely open file parent: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        current = unsafe { std::fs::File::from_raw_fd(next) };
+            result => result,
+        };
+        current = next.map_err(|error| {
+            AppError::new(format!("Could not safely open file parent: {error}"))
+        })?;
     }
     Ok(current)
 }
@@ -507,7 +476,6 @@ fn open_checked_file_no_create(root: &Path, abs: &Path) -> AppResult<std::fs::Fi
 
 #[cfg(unix)]
 fn open_checked_file_impl(root: &Path, abs: &Path, create: bool) -> AppResult<std::fs::File> {
-    use std::os::fd::{AsRawFd, FromRawFd};
     let parent = abs
         .parent()
         .ok_or_else(|| AppError::new("Path is outside the repository."))?;
@@ -519,29 +487,10 @@ fn open_checked_file_impl(root: &Path, abs: &Path, create: bool) -> AppResult<st
     let name = abs
         .file_name()
         .ok_or_else(|| AppError::new("Path must name a file."))?;
-    let fd = unsafe {
-        libc::openat(
-            parent_dir.as_raw_fd(),
-            c_path(Path::new(name))?.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW,
-        )
-    };
-    if fd < 0 {
-        return Err(AppError::new(format!(
-            "Could not safely open file: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
+    let file = fsat::open_file_at(&parent_dir, &c_path(Path::new(name))?)
+        .map_err(|error| AppError::new(format!("Could not safely open file: {error}")))?;
     parent_dir.metadata()?;
-    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
-}
-
-#[cfg(unix)]
-fn unlink_at(parent: &std::fs::File, name: &std::ffi::CString) {
-    use std::os::fd::AsRawFd;
-    unsafe {
-        libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0);
-    }
+    Ok(file)
 }
 
 #[cfg(unix)]
@@ -552,7 +501,6 @@ fn write_checked_unix(
     content: &str,
 ) -> AppResult<()> {
     use std::io::{Seek, SeekFrom, Write};
-    use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::fs::PermissionsExt;
     let parent = abs
         .parent()
@@ -582,7 +530,7 @@ fn write_checked_unix(
             return Err(AppError::new("Only regular files support hunk edits."));
         }
         let hash = hash_reader(root, &mut file)?;
-        (hash, metadata.permissions().mode())
+        (hash, metadata.permissions().mode() & 0o7777)
     } else {
         (hash_bytes(root, b"")?, 0o644)
     };
@@ -598,26 +546,18 @@ fn write_checked_unix(
         uuid::Uuid::new_v4()
     );
     let temp_c = c_path(Path::new(&temp_name))?;
-    let temp_fd = unsafe {
-        libc::openat(
-            parent_dir.as_raw_fd(),
-            temp_c.as_ptr(),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
-            mode as libc::c_uint,
-        )
-    };
-    if temp_fd < 0 {
-        return Err(AppError::new(format!(
-            "Could not create temporary file: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    let mut temp = unsafe { std::fs::File::from_raw_fd(temp_fd) };
-    let write_result = temp
+    let mut temp = fsat::create_new_at(&parent_dir, &temp_c, mode)
+        .map_err(|error| AppError::new(format!("Could not create temporary file: {error}")))?;
+    let mut write_result = temp
         .write_all(content.as_bytes())
         .and_then(|_| temp.sync_all());
+    if current_was_present && write_result.is_ok() {
+        // The umask narrowed the mode at creation; an edited file keeps the
+        // permissions it had.
+        write_result = temp.set_permissions(std::fs::Permissions::from_mode(mode));
+    }
     if let Err(error) = write_result {
-        unlink_at(&parent_dir, &temp_c);
+        fsat::unlink_at(&parent_dir, &temp_c);
         return Err(AppError::new(format!("Could not write file: {error}")));
     }
 
@@ -625,23 +565,23 @@ fn write_checked_unix(
         let mut original = match open_checked_file(root, abs) {
             Ok(file) => file,
             Err(error) => {
-                unlink_at(&parent_dir, &temp_c);
+                fsat::unlink_at(&parent_dir, &temp_c);
                 return Err(error);
             }
         };
         if let Err(error) = original.seek(SeekFrom::Start(0)) {
-            unlink_at(&parent_dir, &temp_c);
+            fsat::unlink_at(&parent_dir, &temp_c);
             return Err(AppError::new(format!("Could not recheck file: {error}")));
         }
         let after = match hash_reader(root, &mut original) {
             Ok(hash) => hash,
             Err(error) => {
-                unlink_at(&parent_dir, &temp_c);
+                fsat::unlink_at(&parent_dir, &temp_c);
                 return Err(error);
             }
         };
         if after != expected_hash {
-            unlink_at(&parent_dir, &temp_c);
+            fsat::unlink_at(&parent_dir, &temp_c);
             return Err(AppError::new(
                 "The file changed on disk while saving. Refresh the diff and try again.",
             ));
@@ -660,101 +600,8 @@ fn write_checked_unix(
         current_was_present,
     )
 }
-#[cfg(target_os = "macos")]
-fn atomic_replace(
-    parent: &std::fs::File,
-    temp: &std::ffi::CString,
-    name: &std::ffi::CString,
-    root: &Path,
-    abs: &Path,
-    expected_hash: &str,
-    current_was_present: bool,
-) -> AppResult<()> {
-    use std::os::fd::AsRawFd;
-    if !current_was_present {
-        // `renameat` replaces a destination created after the initial probe.
-        // `RENAME_EXCL` preserves that concurrent creation instead.
-        let renamed = unsafe {
-            libc::renameatx_np(
-                parent.as_raw_fd(),
-                temp.as_ptr(),
-                parent.as_raw_fd(),
-                name.as_ptr(),
-                libc::RENAME_EXCL,
-            )
-        };
-        if renamed != 0 {
-            unlink_at(parent, temp);
-            return Err(AppError::new(format!(
-                "Could not atomically create file without replacing concurrent work: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        return Ok(());
-    }
-    let swapped = unsafe {
-        libc::renameatx_np(
-            parent.as_raw_fd(),
-            temp.as_ptr(),
-            parent.as_raw_fd(),
-            name.as_ptr(),
-            libc::RENAME_SWAP,
-        )
-    };
-    if swapped != 0 {
-        unlink_at(parent, temp);
-        return Err(AppError::new(format!(
-            "Could not atomically replace file: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    let old_path = abs.with_file_name(temp.to_string_lossy().as_ref());
-    let old_hash = match hash_file(root, &old_path) {
-        Ok(hash) => hash,
-        Err(error) => {
-            let rollback = unsafe {
-                libc::renameatx_np(
-                    parent.as_raw_fd(),
-                    temp.as_ptr(),
-                    parent.as_raw_fd(),
-                    name.as_ptr(),
-                    libc::RENAME_SWAP,
-                )
-            };
-            return if rollback == 0 {
-                unlink_at(parent, temp);
-                Err(error)
-            } else {
-                Err(AppError::new(
-                    "Could not verify swapped file; rollback failed.",
-                ))
-            };
-        }
-    };
-    if old_hash != expected_hash {
-        let rollback = unsafe {
-            libc::renameatx_np(
-                parent.as_raw_fd(),
-                temp.as_ptr(),
-                parent.as_raw_fd(),
-                name.as_ptr(),
-                libc::RENAME_SWAP,
-            )
-        };
-        if rollback != 0 {
-            return Err(AppError::new("Concurrent edit detected; rollback failed."));
-        }
-        unlink_at(parent, temp);
-        return Err(AppError::new(
-            "The file changed on disk while saving. Refresh the diff and try again.",
-        ));
-    }
-    unlink_at(parent, temp);
-    Ok(())
-}
 
-#[cfg(all(unix, not(target_os = "macos")))]
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn atomic_replace(
     parent: &std::fs::File,
     temp: &std::ffi::CString,
@@ -764,94 +611,41 @@ fn atomic_replace(
     expected_hash: &str,
     current_was_present: bool,
 ) -> AppResult<()> {
-    use std::os::fd::AsRawFd;
-    if current_was_present {
-        // Verified exchange: swap temp into place, hash the displaced bytes,
-        // and roll back on mismatch so a concurrent edit is never silently
-        // overwritten. Mirrors the macOS RENAME_SWAP path via renameat2
-        // RENAME_EXCHANGE.
-        let exchanged = unsafe {
-            libc::syscall(
-                libc::SYS_renameat2,
-                parent.as_raw_fd(),
-                temp.as_ptr(),
-                parent.as_raw_fd(),
-                name.as_ptr(),
-                libc::RENAME_EXCHANGE,
-            )
-        };
-        if exchanged != 0 {
-            unlink_at(parent, temp);
-            return Err(AppError::new(format!(
-                "Could not atomically replace file: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        let temp_name = temp.to_string_lossy();
-        let old_path = abs.with_file_name(temp_name.as_ref());
-        let old_hash = match hash_file(root, &old_path) {
-            Ok(hash) => hash,
-            Err(error) => {
-                let rollback = unsafe {
-                    libc::syscall(
-                        libc::SYS_renameat2,
-                        parent.as_raw_fd(),
-                        temp.as_ptr(),
-                        parent.as_raw_fd(),
-                        name.as_ptr(),
-                        libc::RENAME_EXCHANGE,
-                    )
-                };
-                return if rollback == 0 {
-                    unlink_at(parent, temp);
-                    Err(error)
-                } else {
-                    Err(AppError::new(
-                        "Could not verify swapped file; rollback failed.",
-                    ))
-                };
-            }
-        };
-        if old_hash != expected_hash {
-            let rollback = unsafe {
-                libc::syscall(
-                    libc::SYS_renameat2,
-                    parent.as_raw_fd(),
-                    temp.as_ptr(),
-                    parent.as_raw_fd(),
-                    name.as_ptr(),
-                    libc::RENAME_EXCHANGE,
-                )
-            };
-            if rollback != 0 {
-                return Err(AppError::new("Concurrent edit detected; rollback failed."));
-            }
-            unlink_at(parent, temp);
-            return Err(AppError::new(
-                "The file changed on disk while saving. Refresh the diff and try again.",
-            ));
-        }
-        unlink_at(parent, temp);
-        return Ok(());
+    if !current_was_present {
+        // A plain rename would replace a destination created after the
+        // initial probe; the no-replace form preserves that concurrent work.
+        return fsat::rename_no_replace(parent, temp, name).map_err(|error| {
+            fsat::unlink_at(parent, temp);
+            AppError::new(format!(
+                "Could not atomically create file without replacing concurrent work: {error}"
+            ))
+        });
     }
-    let renamed = unsafe {
-        libc::syscall(
-            libc::SYS_renameat2,
-            parent.as_raw_fd(),
-            temp.as_ptr(),
-            parent.as_raw_fd(),
-            name.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
-    };
-    if renamed != 0 {
-        unlink_at(parent, temp);
+    // Verified exchange: swap the new bytes into place, hash what was
+    // displaced, and swap back on a mismatch so a concurrent edit is never
+    // silently overwritten.
+    if let Err(error) = fsat::rename_swap(parent, temp, name) {
+        fsat::unlink_at(parent, temp);
         return Err(AppError::new(format!(
-            "Could not atomically create file without replacing concurrent work: {}",
-            std::io::Error::last_os_error()
+            "Could not atomically replace file: {error}"
         )));
     }
-    Ok(())
+    let displaced = hash_file(root, &abs.with_file_name(temp.to_string_lossy().as_ref()));
+    if matches!(&displaced, Ok(hash) if hash == expected_hash) {
+        fsat::unlink_at(parent, temp);
+        return Ok(());
+    }
+    if fsat::rename_swap(parent, temp, name).is_err() {
+        // The displaced bytes stay in the temporary file rather than being lost.
+        return Err(AppError::new(match displaced {
+            Ok(_) => "Concurrent edit detected; rollback failed.",
+            Err(_) => "Could not verify swapped file; rollback failed.",
+        }));
+    }
+    fsat::unlink_at(parent, temp);
+    Err(displaced.err().unwrap_or_else(|| {
+        AppError::new("The file changed on disk while saving. Refresh the diff and try again.")
+    }))
 }
 
 #[cfg(all(unix, not(target_os = "macos"), not(target_os = "linux")))]
@@ -864,45 +658,17 @@ fn atomic_replace(
     _expected_hash: &str,
     current_was_present: bool,
 ) -> AppResult<()> {
-    use std::os::fd::AsRawFd;
     if !current_was_present {
-        // POSIX rename has no portable no-replace primitive. Linking the
-        // temporary inode into place is atomic and fails if the name appeared.
-        let linked = unsafe {
-            libc::linkat(
-                parent.as_raw_fd(),
-                temp.as_ptr(),
-                parent.as_raw_fd(),
-                name.as_ptr(),
-                0,
-            )
-        };
-        if linked != 0 {
-            unlink_at(parent, temp);
-            return Err(AppError::new(format!(
-                "Could not atomically create file without replacing concurrent work: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        unlink_at(parent, temp);
-        return Ok(());
+        return fsat::rename_no_replace(parent, temp, name).map_err(|error| {
+            AppError::new(format!(
+                "Could not atomically create file without replacing concurrent work: {error}"
+            ))
+        });
     }
-    let renamed = unsafe {
-        libc::renameat(
-            parent.as_raw_fd(),
-            temp.as_ptr(),
-            parent.as_raw_fd(),
-            name.as_ptr(),
-        )
-    };
-    if renamed != 0 {
-        unlink_at(parent, temp);
-        return Err(AppError::new(format!(
-            "Could not atomically replace file: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    Ok(())
+    fsat::rename_replace(parent, temp, name).map_err(|error| {
+        fsat::unlink_at(parent, temp);
+        AppError::new(format!("Could not atomically replace file: {error}"))
+    })
 }
 
 #[cfg(not(unix))]
@@ -1756,7 +1522,7 @@ mod tests {
     /// `git diff --numstat -z` emits an empty path field then OLD then NEW.
     #[test]
     fn numstat_rename_order() {
-        let data = b"0\t0\t\0oldname.txt\0newname.txt\03\t2\tsrc/a.rs\0-\t-\timg.png\0";
+        let data = b"0\t0\t\0oldname.txt\0newname.txt\x003\t2\tsrc/a.rs\0-\t-\timg.png\0";
         let map = parse_numstat(data);
         assert_eq!(map.get("newname.txt"), Some(&(0, 0, false)));
         assert_eq!(map.get("src/a.rs"), Some(&(3, 2, false)));
@@ -1879,6 +1645,43 @@ mod tests {
             std::fs::remove_file(outside).unwrap();
         }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The replacement is created under the umask; an edit must not change
+    /// the permissions the file already had.
+    #[cfg(unix)]
+    #[test]
+    fn hunk_edit_keeps_the_files_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("pidesk-git-mode-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("run.sh");
+        git(&dir, &["init", "-q"]).unwrap();
+        std::fs::write(&path, "one\n").unwrap();
+        git(&dir, &["add", "."]).unwrap();
+        git(
+            &dir,
+            &[
+                "-c",
+                "user.name=QA",
+                "-c",
+                "user.email=qa@localhost",
+                "commit",
+                "-qm",
+                "Base",
+            ],
+        )
+        .unwrap();
+        std::fs::write(&path, "two\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o775)).unwrap();
+
+        let diff = file(&dir, "run.sh").unwrap();
+        write_if_unchanged(&dir, "run.sh", &diff.current_hash, "three\n").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "three\n");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o775);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
