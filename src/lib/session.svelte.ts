@@ -119,8 +119,7 @@ function messageIdentity(value: unknown): string | undefined {
 }
 
 function stableMessageIdentity(m: RpcMessage): string | undefined {
-	const record = m as unknown as Record<string, unknown>;
-	const id = messageIdentity(record.id) ?? messageIdentity(record.messageId) ?? messageIdentity(record.message_id);
+	const id = messageIdentity(m.id) ?? messageIdentity(m.messageId) ?? messageIdentity(m.message_id);
 	return id === undefined ? undefined : `${m.role.length}:${m.role}:${id}`;
 }
 
@@ -219,7 +218,7 @@ function advisorLevel(details: unknown): string | undefined {
 
 /** Narrow an untrusted frame field to RpcMessage (requires a string role). */
 function asMsg(v: unknown): RpcMessage | null {
-	return isRec(v) && typeof v.role === 'string' ? (v as unknown as RpcMessage) : null;
+	return isRec(v) && typeof v.role === 'string' ? (v as RpcMessage) : null;
 }
 
 /* ---------------- item sink (shared by history + live) ---------------- */
@@ -310,14 +309,13 @@ class ItemSink {
 	}
 
 	pushBash(msg: RpcMessage): ConversationItem {
-		const m = msg as unknown as Record<string, unknown>;
 		const details: Record<string, unknown> = { ...(isRec(msg.details) ? msg.details : {}) };
 		if (msg.command !== undefined) details.command = msg.command;
 		if (msg.output !== undefined) details.output = msg.output;
 		if (msg.exitCode !== undefined) details.exitCode = msg.exitCode;
-		if (m.cancelled !== undefined) details.cancelled = m.cancelled;
-		if (m.truncated !== undefined) details.truncated = m.truncated;
-		if (m.fullOutputPath !== undefined) details.fullOutputPath = m.fullOutputPath;
+		if (msg.cancelled !== undefined) details.cancelled = msg.cancelled;
+		if (msg.truncated !== undefined) details.truncated = msg.truncated;
+		if (msg.fullOutputPath !== undefined) details.fullOutputPath = msg.fullOutputPath;
 		return this.push({
 			id: nid(),
 			kind: 'custom',
@@ -354,24 +352,22 @@ class ItemSink {
 	}
 
 	pushCompaction(msg: RpcMessage): void {
-		const m = msg as unknown as Record<string, unknown>;
-		const text = str(m.summary) || contentToText(msg.content) || 'Context compacted';
+		const text = str(msg.summary) || contentToText(msg.content) || 'Context compacted';
 		const details =
 			msg.details !== undefined
 				? msg.details
 				: clean({
-						shortSummary: str(m.shortSummary),
-						tokensBefore: num(m.tokensBefore),
-						tokensAfter: num(m.tokensAfter),
-						method: str(m.method),
+						shortSummary: str(msg.shortSummary),
+						tokensBefore: num(msg.tokensBefore),
+						tokensAfter: num(msg.tokensAfter),
+						method: str(msg.method),
 					});
 		this.push({ id: nid(), kind: 'custom', customType: 'compaction', text, details, timestamp: msg.timestamp });
 	}
 
 	pushBranchSummary(msg: RpcMessage): void {
-		const m = msg as unknown as Record<string, unknown>;
-		const text = str(m.summary) || contentToText(msg.content) || 'Branch summary';
-		const details = msg.details !== undefined ? msg.details : clean({ fromId: str(m.fromId) });
+		const text = str(msg.summary) || contentToText(msg.content) || 'Branch summary';
+		const details = msg.details !== undefined ? msg.details : clean({ fromId: str(msg.fromId) });
 		this.push({ id: nid(), kind: 'custom', customType: 'branchSummary', text, details, timestamp: msg.timestamp });
 	}
 
@@ -1104,8 +1100,7 @@ export class SessionModel {
 		if (isRec(msg.usage)) this.#addUsage(msg.usage);
 		if (msg.stopReason === 'error') {
 			this.#idleStatus = 'failed';
-			const em = (msg as unknown as Record<string, unknown>).errorMessage;
-			this.#notice('error', str(em) ?? 'Request failed');
+			this.#notice('error', str(msg.errorMessage) ?? 'Request failed');
 		}
 	}
 
