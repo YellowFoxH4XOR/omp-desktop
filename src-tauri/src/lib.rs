@@ -48,6 +48,12 @@ pub fn run() {
                 std::io::Error::other(format!("Could not release Intern threads: {error}"))
             })?;
             let state = state::AppState::new(app.handle().clone(), store);
+            // Check the private Pi while the window loads, so the UI's first
+            // detect call finds the answer ready. Detection never installs.
+            let registry = state.registry.clone();
+            tauri::async_runtime::spawn(async move {
+                registry.detect().await;
+            });
             app.manage(state);
             Ok(())
         })

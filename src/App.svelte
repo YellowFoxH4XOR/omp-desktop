@@ -432,17 +432,23 @@
   }
   const prewarmedAt = new Map<string, number>();
   let prewarmTimer: ReturnType<typeof setTimeout> | undefined;
+  function startPi(threadId: string) {
+    const last = prewarmedAt.get(threadId);
+    if (!installation || stopping.has(threadId) || (last !== undefined && Date.now() - last < PREWARM_COOLDOWN_MS)) return;
+    if (prewarmedAt.size > 256) prewarmedAt.clear();
+    prewarmedAt.set(threadId, Date.now());
+    void api.prewarmThread(threadId).catch(() => undefined);
+  }
+  /** Start a thread's Pi right away: the press that precedes a click. */
+  function prewarmNow(thread: Thread) {
+    clearTimeout(prewarmTimer);
+    if (liveSessions.has(thread.id) || openingSessions.has(thread.id)) return;
+    startPi(thread.id);
+  }
   /** Hovering a thread starts its Pi so the click lands on a warm process. */
   function prewarmSoon(thread: Thread) {
     clearTimeout(prewarmTimer);
-    if (!installation || liveSessions.has(thread.id) || openingSessions.has(thread.id) || stopping.has(thread.id)) return;
-    const last = prewarmedAt.get(thread.id);
-    if (last !== undefined && Date.now() - last < PREWARM_COOLDOWN_MS) return;
-    prewarmTimer = setTimeout(() => {
-      if (prewarmedAt.size > 256) prewarmedAt.clear();
-      prewarmedAt.set(thread.id, Date.now());
-      void api.prewarmThread(thread.id).catch(() => undefined);
-    }, PREWARM_HOVER_MS);
+    prewarmTimer = setTimeout(() => prewarmNow(thread), PREWARM_HOVER_MS);
   }
   function cancelPrewarm() {
     clearTimeout(prewarmTimer);
@@ -795,6 +801,9 @@
     try {
       const cached = liveSessions.get(thread.id);
       if (cached) {
+        // The transcript is cached, but its Pi may have been suspended while
+        // idle; start it now so the next prompt does not wait for it.
+        startPi(thread.id);
         cacheSession(thread.id, thread.projectId, cached);
         if (selectionToken === threadSelectionToken && activeThread?.id === thread.id) activeSession = cached;
       } else {
@@ -1179,6 +1188,12 @@
     try { await revealItemInDir(installation.path); }
     catch { startupError = 'Could not reveal the private Pi installation in Finder.'; }
   }
+  // The highlighted thread in the switcher is the likely next one.
+  $effect(() => {
+    const entry = switcherOpen ? switchEntries[switchIndex] : undefined;
+    if (entry?.kind === 'thread') { const thread = entry.thread; untrack(() => prewarmSoon(thread)); }
+    else untrack(cancelPrewarm);
+  });
   async function openSwitcher() {
     switchQuery = ''; switchIndex = 0; switcherOpen = true;
     await Promise.all(projects.map(p => refreshThreads(p.id)));
@@ -1268,7 +1283,7 @@
                       {:else}
                         {@const waiting = waitingLabel(thread)}
                         {@const stats = rowStats[thread.id]}
-                        <button class="thread-link" onclick={() => { cancelPrewarm(); void selectThread(thread); }} ondblclick={() => startRename(thread)} onpointerenter={() => prewarmSoon(thread)} onpointerleave={cancelPrewarm} onfocus={() => prewarmSoon(thread)} onblur={cancelPrewarm} title={thread.title}>
+                        <button class="thread-link" onclick={() => { cancelPrewarm(); void selectThread(thread); }} ondblclick={() => startRename(thread)} onpointerenter={() => prewarmSoon(thread)} onpointerleave={cancelPrewarm} onpointerdown={() => prewarmNow(thread)} onfocus={() => prewarmSoon(thread)} onblur={cancelPrewarm} title={thread.title}>
                           <span class={`status-dot ${thread.status}`} role="img" aria-label={thread.status}></span>
                           <span class="thread-text">
                             <span class="thread-line">
@@ -1354,7 +1369,7 @@
     {:else if onboarding || installerVisible}
       <PiSetup plan={installPlan} status={installStatus} busy={installInProgress} lines={installLog} error={installError || installPlanError} ready={installReady} checking={checkingRuntime} onInstall={() => void install()} onCheck={() => void checkPrivateRuntime()} onContinue={() => { installerVisible = false; installStatus = 'idle'; }} onOpenTerminal={openTerminal} />
     {:else if !activeProject}
-      <Welcome {projects} recent={recentThreads} busy={pendingAction} onOpenProject={project => void selectProject(project)} onOpenThread={thread => void openThreadById(thread.id, thread.projectId)} onAddProject={() => void addProject()} onOpenIntern={() => { internStarted = true; internOpen = true; }} />
+      <Welcome {projects} recent={recentThreads} busy={pendingAction} onOpenProject={project => void selectProject(project)} onOpenThread={thread => { cancelPrewarm(); void openThreadById(thread.id, thread.projectId); }} onPrewarmThread={prewarmSoon} onPressThread={prewarmNow} onCancelPrewarm={cancelPrewarm} onAddProject={() => void addProject()} onOpenIntern={() => { internStarted = true; internOpen = true; }} />
     {:else if loadingThread}
       <div class="main-empty delayed"><LoaderCircle class="spin" size={24} strokeWidth={1.6}/><h2>Opening thread</h2><p>Restoring the conversation from Pi.</p></div>
     {:else if !visibleThread || !currentView}
