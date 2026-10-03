@@ -33,8 +33,6 @@ const MAX_HISTORY_BYTES: usize = 32 * 1024 * 1024;
 /// Pi can acknowledge a prompt before its turn emits `agent_start`. The
 /// checkout reservation is held this long waiting for the turn to appear.
 const PI_PROMPT_SETTLE_SECS: u64 = 30;
-/// Same-thread prompts are serialized so an older failed/reservation release
-/// cannot tear down a newer accepted turn.
 
 pub struct LiveThread {
     client: Arc<RpcClient>,
@@ -342,6 +340,8 @@ pub struct ThreadManager {
 
 struct ThreadLocks {
     lifecycle: AsyncMutex<()>,
+    /// Same-thread prompts are serialized so an older failed/reservation release
+    /// cannot tear down a newer accepted turn.
     prompt: AsyncMutex<()>,
 }
 
@@ -626,10 +626,11 @@ impl ThreadManager {
                 let row = store.get_thread(&id)?;
                 let project = store.get_project(&row.project_id)?;
                 if let Some(path) = delete_worktree_path(&row)? {
-                    if path.exists() {
-                        if git::worktree_changed_entries(&path)? > 0 && !discard_changes {
-                            return Err(AppError::new("The isolated worktree has uncommitted changes. Confirm discarding them before deleting."));
-                        }
+                    if path.exists()
+                        && git::worktree_changed_entries(&path)? > 0
+                        && !discard_changes
+                    {
+                        return Err(AppError::new("The isolated worktree has uncommitted changes. Confirm discarding them before deleting."));
                     }
                     git::remove_worktree(Path::new(&project.path), &path, discard_changes)?;
                 }
@@ -1812,7 +1813,7 @@ impl ThreadManager {
                 })
             })
             .collect();
-        threads.sort_by(|a, b| b.memory_bytes.cmp(&a.memory_bytes));
+        threads.sort_by_key(|thread| std::cmp::Reverse(thread.memory_bytes));
         crate::dto::RuntimeStats {
             app_bytes: util::process_footprint(std::process::id() as i32),
             threads,
@@ -1921,7 +1922,10 @@ impl ThreadManager {
             .collect();
         for (id, locks) in entries {
             let _lifecycle = locks.lifecycle.lock().await;
-            if let Some(live) = self.live.lock().remove(&id) {
+            // Take the entry first: the map lock must not be held while the
+            // process is given time to exit.
+            let removed = self.live.lock().remove(&id);
+            if let Some(live) = removed {
                 live.cancel_idle_watch();
                 live.client.expect_exit();
                 self.watcher.unwatch(&id);
