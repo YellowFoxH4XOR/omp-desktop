@@ -141,8 +141,11 @@ pub fn strip_jsonc(text: &str) -> String {
     out
 }
 
+/// Raw text, parsed top-level object, and whether the text has comments.
+type ParsedFile = (String, Map<String, Value>, bool);
+
 /// Parse an MCP file; `Ok(None)` when it does not exist.
-fn read_file(path: &Path) -> AppResult<Option<(String, Map<String, Value>, bool)>> {
+fn read_file(path: &Path) -> AppResult<Option<ParsedFile>> {
     let Ok(metadata) = std::fs::symlink_metadata(path) else {
         return Ok(None);
     };

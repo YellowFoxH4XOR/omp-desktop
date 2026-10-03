@@ -190,7 +190,7 @@ fn scan_session_directory(dir: &Path, cwd: &Path) -> Vec<ScannedSession> {
             }
         }
     }
-    out.sort_by(|a, b| b.modified_unix.cmp(&a.modified_unix));
+    out.sort_by_key(|session| std::cmp::Reverse(session.modified_unix));
     out
 }
 

@@ -97,7 +97,8 @@ export interface SessionState {
   contextUsage?: ContextUsage;
 }
 export interface RpcContent { type: string; text?: string; thinking?: string; id?: string; name?: string; arguments?: Record<string, unknown>; [key: string]: unknown }
-export interface RpcMessage { role: string; content?: string | RpcContent[]; timestamp?: number; customType?: string; display?: boolean; details?: unknown; toolCallId?: string; toolName?: string; isError?: boolean; usage?: Record<string, unknown>; stopReason?: string; command?: string; output?: string; exitCode?: number }
+/** A harness message. Fields beyond the named ones are untrusted and stay `unknown`. */
+export interface RpcMessage { [field: string]: unknown; role: string; content?: string | RpcContent[]; timestamp?: number; customType?: string; display?: boolean; details?: unknown; toolCallId?: string; toolName?: string; isError?: boolean; usage?: Record<string, unknown>; stopReason?: string; command?: string; output?: string; exitCode?: number }
 export interface SessionSnapshot {
   thread: Thread;
   messages: RpcMessage[];

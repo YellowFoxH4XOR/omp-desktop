@@ -113,7 +113,7 @@ pub(crate) fn write_bytes(path: &Path, bytes: &[u8]) -> AppResult<()> {
         let mut file = options.open(&temp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
-        std::fs::rename(&temp, &path)?;
+        std::fs::rename(&temp, path)?;
         Ok(())
     })();
     if written.is_err() {
