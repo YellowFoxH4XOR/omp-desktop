@@ -30,7 +30,13 @@ fn noop_handlers() -> RpcHandlers {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pending_request_table_is_bounded() {
-    let client = Arc::new(attach_shell("exec cat >/dev/null", noop_handlers()));
+    // Reads every request and never answers. The shell keeps the stdout pipe
+    // open: at EOF the client marks the harness exited and fails every call
+    // before the cap is reached (`exec cat >/dev/null` lost that race).
+    let client = Arc::new(attach_shell(
+        "while read -r line; do :; done",
+        noop_handlers(),
+    ));
     let mut calls = Vec::new();
     for _ in 0..257 {
         let client = client.clone();
