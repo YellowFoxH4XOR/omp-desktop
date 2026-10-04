@@ -41,7 +41,7 @@ pub struct CatalogPackage {
     pub downloads: u64,
     pub published_ms: u64,
     pub types: Vec<String>,
-    /// Source for `pi install`, e.g. `npm:pi-mcp-adapter`.
+    /// Source for `pi install`, e.g. `npm:pi-web-access`.
     pub source: String,
 }
 

@@ -2,6 +2,7 @@
   import { Code2, Plug } from '@lucide/svelte';
   import ToolShell from './ToolShell.svelte';
   import CodeBlock from '../conversation/CodeBlock.svelte';
+  import NestedCalls from './NestedCalls.svelte';
   import { formatDuration, prettyJson, resultDuration, resultText, type ToolItem } from './tool-utils';
   import { argPills, formatResult, humanize, resultSummary, type McpCall } from './mcp-tools.svelte';
 
@@ -18,16 +19,10 @@
 
   const verb = $derived.by(() => {
     switch (call.kind) {
-      case 'script': return running ? 'Running MCP script' : 'Ran MCP script';
-      case 'search': return running ? 'Searching MCP tools' : 'Searched MCP tools';
-      case 'describe': return 'Looked up';
-      case 'connect': return running ? 'Connecting to' : 'Connected to';
-      case 'list': return 'Listed tools on';
-      case 'status': return 'Checked MCP servers';
-      case 'instructions': return 'Read instructions for';
-      case 'auth': return 'Signing in to';
-      case 'install': return 'Adding MCP server';
-      case 'other': return 'MCP';
+      case 'script': return running ? 'Running script' : 'Ran script';
+      case 'search': return running ? 'Searching tools' : 'Searched tools';
+      case 'resources': return call.templates ? 'Listed MCP resource templates' : 'Listed MCP resources';
+      case 'resource': return 'Read MCP resource';
       default: return '';
     }
   });
@@ -44,9 +39,10 @@
       {:else}
         <span class="tool-name">{verb}</span>
         {#if call.kind === 'search' && call.query}<span class="q">“{call.query}”</span>
-        {:else if call.kind === 'describe' && call.tool}{#if call.server}<span class="server">{call.server}</span>{/if}<span class="q">{humanize(call.tool)}</span>
         {:else if call.kind === 'script' && scriptPreview}<code class="script">{scriptPreview}</code>
-        {:else if call.kind === 'other' && call.tool}<span class="q">{call.tool}</span>
+        {:else if call.kind === 'resource'}
+          {#if call.server}<span class="server">{call.server}</span>{/if}
+          {#if call.uri}<span class="q" title={call.uri}>{call.uri}</span>{/if}
         {:else if call.server}<span class="server">{call.server}</span>{/if}
       {/if}
     </span>
@@ -55,7 +51,7 @@
     {#if call.kind === 'script' && call.code}
       <div class="section">Script</div>
       <CodeBlock code={call.code} lang="javascript" />
-    {:else if call.args && Object.keys(call.args).length}
+    {:else if call.kind === 'call' && call.args && Object.keys(call.args).length}
       <div class="section">Arguments</div>
       <div class="args">
         {#each Object.entries(call.args) as [key, value] (key)}
@@ -63,11 +59,14 @@
         {/each}
       </div>
     {/if}
+    {#if call.kind === 'script' && item.nested?.length}
+      <NestedCalls calls={item.nested} />
+    {/if}
     {#if output}
       <div class="section">{failed ? 'Error' : 'Result'}</div>
       <pre class:err={failed}>{shownOutput}</pre>
     {:else if running}
-      <p class="muted">Waiting for the server…</p>
+      <p class="muted">Running…</p>
     {/if}
   {/snippet}
 </ToolShell>

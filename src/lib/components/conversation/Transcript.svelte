@@ -2,7 +2,7 @@
   import { onDestroy, untrack } from 'svelte';
   import { VList, type VListHandle } from 'virtua/svelte';
   import { ArrowDown, Brain, ChevronRight, Code2, FileText, Globe, Image as ImageIcon, Info, Pencil, Plug, Puzzle, Search, Sparkles, SquareTerminal, TriangleAlert } from '@lucide/svelte';
-  import { mcpCall } from '../tools/mcp-tools.svelte';
+  import { loadMcpServers, mcpCall, mcpToolName } from '../tools/mcp-tools.svelte';
   import type { ConversationItem } from '../../types';
   import CommandCard from '../tools/CommandCard.svelte';
   import ToolCard from '../tools/ToolCard.svelte';
@@ -19,6 +19,8 @@
   }
 
   let { items, status = 'idle', onShowChanges }: Props = $props();
+  // Folded summaries name the servers of nested MCP calls before any card mounts.
+  void loadMcpServers();
 
   let list = $state<VListHandle>();
   let wrap = $state<HTMLDivElement>();
@@ -183,7 +185,11 @@
     if (item.kind !== 'tool') return { kind: 'other' };
     const failed = item.status === 'failed' || item.result?.isError === true;
     const mcp = mcpCall(item);
-    if (mcp) return { kind: mcp.kind === 'script' ? 'script' : 'mcp', server: mcp.server, failed };
+    if (mcp) {
+      if (mcp.kind === 'script') return { kind: 'script', failed };
+      if (mcp.kind === 'search') return { kind: 'search', failed };
+      return { kind: 'mcp', server: mcp.server, failed };
+    }
     const name = item.toolName.toLowerCase();
     const path = typeof item.args.path === 'string' ? item.args.path : typeof item.args.file_path === 'string' ? item.args.file_path : undefined;
     if (/edit|write|patch|replace|create/.test(name)) return { kind: 'edit', path, failed };
@@ -215,6 +221,12 @@
       counts.set(step.kind, (counts.get(step.kind) ?? 0) + 1);
       if (step.failed) failed += 1;
       if (step.kind === 'mcp' && step.server) servers.set(step.server, (servers.get(step.server) ?? 0) + 1);
+      if (item.kind === 'tool') {
+        for (const nested of item.nested ?? []) {
+          const mapped = mcpToolName(nested.toolName);
+          if (mapped) servers.set(mapped.server, (servers.get(mapped.server) ?? 0) + 1);
+        }
+      }
       if (step.kind === 'edit' && step.path) edited.add(step.path);
       if (step.kind === 'read' && step.path) read.add(step.path);
     }
@@ -225,7 +237,7 @@
     for (const [server, count] of servers) parts.push(count > 1 ? `${server} ×${count}` : server);
     const unnamedMcp = n('mcp') - [...servers.values()].reduce((a, b) => a + b, 0);
     if (unnamedMcp > 0) parts.push(plural(unnamedMcp, 'MCP call'));
-    if (n('script')) parts.push(plural(n('script'), 'MCP script'));
+    if (n('script')) parts.push(plural(n('script'), 'script'));
     if (n('read')) parts.push(`read ${plural(read.size || n('read'), 'file')}`);
     if (n('search')) parts.push(plural(n('search'), 'search', 'searches'));
     if (n('web')) parts.push(plural(n('web'), 'web lookup'));

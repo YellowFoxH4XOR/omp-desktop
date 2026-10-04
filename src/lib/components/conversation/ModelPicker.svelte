@@ -3,6 +3,8 @@
   import { Brain, Check, ChevronDown, Image, Search, Star } from '@lucide/svelte';
   import type { ModelInfo } from '../../types';
   import { formatCost, formatTokens, matchesModel, modelKey, providerHue, providerLabel } from './model-utils';
+  import { modelIcon, providerIcon } from '../../brands';
+  import BrandIcon from '../brand/BrandIcon.svelte';
 
   interface Props {
     models: ModelInfo[];
@@ -142,6 +144,16 @@
   }
 </script>
 
+<!-- A provider's logo when known, else a colored monogram. -->
+{#snippet mark(provider: string, small: boolean)}
+  {@const icon = providerIcon(provider)}
+  {#if icon}
+    <span class="mono brand-tile" class:small aria-hidden="true"><BrandIcon name={icon} size={small ? 13 : 14} /></span>
+  {:else}
+    <span class="mono" class:small style={`--hue:${providerHue(provider)}`} aria-hidden="true">{monogram(providerLabel(provider))}</span>
+  {/if}
+{/snippet}
+
 <svelte:window onpointerdown={onWindowPointer} onresize={() => open && hide(false)} />
 
 <div class="picker" bind:this={root}>
@@ -155,7 +167,7 @@
     title={current ? `${current.name} · ${providerLabel(current.provider)}${currentContext ? ` · ${currentContext} context` : ''}` : label}
     onclick={() => (open ? hide() : void show())}
   >
-    {#if current}<span class="mono small" style={`--hue:${providerHue(current.provider)}`} aria-hidden="true">{monogram(providerLabel(current.provider))}</span>{/if}
+    {#if current}{@render mark(current.provider, true)}{/if}
     <span class="trigger-name">{current?.name ?? 'Default model'}</span>
     {#if currentContext}<span class="trigger-context">{currentContext}</span>{/if}
     <ChevronDown size={11} strokeWidth={2} />
@@ -193,7 +205,7 @@
                 aria-selected={!searching && entry.id === (sections[0]?.id ?? '')}
                 onclick={() => selectProvider(entry.id)}
               >
-                <span class="mono" style={`--hue:${entry.hue}`} aria-hidden="true">{monogram(entry.label)}</span>
+                {@render mark(entry.id, false)}
                 <span class="provider-name">{entry.label}</span>
                 {#if entry.id === current?.provider}<span class="live" title="Current model's provider"></span>{/if}
                 <span class="provider-count">{count}</span>
@@ -205,7 +217,7 @@
           {#each sections as section (section.id)}
             <div class="group" role="group" aria-label={section.label}>
               <div class="group-head">
-                <span class="mono small" style={`--hue:${section.hue}`} aria-hidden="true">{monogram(section.label)}</span>
+                {@render mark(section.id, true)}
                 <span>{section.label}</span>
                 <span class="group-count">{section.models.length} model{section.models.length === 1 ? '' : 's'}</span>
               </div>
@@ -214,6 +226,7 @@
                 {@const key = modelKey(model)}
                 {@const context = formatTokens(model.contextWindow)}
                 {@const cost = formatCost(model.cost)}
+                {@const maker = modelIcon(model)}
                 <div
                   id={`${listId}-${index}`}
                   class="row"
@@ -229,6 +242,7 @@
                 >
                   <span class="main">
                     <span class="name">
+                      {#if maker}<BrandIcon name={maker} size={13} />{/if}
                       {model.name || model.id}
                       {#if key === currentKey}<span class="check" aria-label="Current"><Check size={12} strokeWidth={2.6} /></span>{/if}
                       {#if key === defaultKey}<span class="badge">Default</span>{/if}
@@ -285,6 +299,10 @@
     font-size: 9.5px;
     font-weight: 700;
     letter-spacing: 0.02em;
+  }
+  .mono.brand-tile {
+    background: var(--surface-2);
+    box-shadow: inset 0 0 0 1px var(--line);
   }
   .mono.small {
     width: 20px;

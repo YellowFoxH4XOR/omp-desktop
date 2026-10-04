@@ -485,7 +485,7 @@ pub async fn extensions_remove(state: State<'_, AppState>, source: String) -> Cm
 }
 
 // ---------------------------------------------------------------------
-// MCP servers (pi-mcp-adapter config in the private agent dir)
+// MCP servers (Pi's built-in MCP config in the private agent dir)
 // ---------------------------------------------------------------------
 
 #[tauri::command]
@@ -516,27 +516,51 @@ pub async fn mcp_set_enabled(name: String, enabled: bool) -> CmdResult<()> {
 }
 
 #[tauri::command]
-pub async fn mcp_set_approve_tools(all: bool) -> CmdResult<()> {
-    blocking(move || crate::mcp::set_approve_tools(&util::pidesk_root(), all)).await
-}
-
-#[tauri::command]
 pub async fn mcp_save_raw(text: String) -> CmdResult<()> {
     blocking(move || crate::mcp::save_raw(&util::pidesk_root(), &text)).await
 }
 
-/// Copies only the servers the user picked; returns the names copied.
+/// Copies only the servers the user picked; entries that cannot be copied
+/// come back with a reason instead.
 #[tauri::command]
-pub async fn mcp_import(source: String, names: Vec<String>) -> CmdResult<Vec<String>> {
+pub async fn mcp_import(
+    source: String,
+    names: Vec<String>,
+) -> CmdResult<crate::mcp::McpImportResult> {
     blocking(move || crate::mcp::import(&util::pidesk_root(), &source, &names)).await
 }
 
+/// Replaces the old pi-mcp-adapter extension with Pi's built-in MCP.
 #[tauri::command]
-pub async fn mcp_install_adapter(state: State<'_, AppState>) -> CmdResult<()> {
-    crate::extensions::install(&state.registry, crate::mcp::ADAPTER_SOURCE)
+pub async fn mcp_switch_to_builtin(
+    state: State<'_, AppState>,
+) -> CmdResult<crate::mcp::McpImportResult> {
+    crate::mcp::switch_to_builtin(&state.registry)
         .await
-        .map(|_| ())
         .map_err(cmd_err)
+}
+
+#[tauri::command]
+pub async fn mcp_enable_builtin() -> CmdResult<()> {
+    blocking(|| crate::mcp::enable_builtin(&util::pidesk_root())).await
+}
+
+#[tauri::command]
+pub async fn mcp_check(state: State<'_, AppState>) -> CmdResult<crate::mcp::McpStatus> {
+    crate::mcp::check(&state.registry).await.map_err(cmd_err)
+}
+
+#[tauri::command]
+pub async fn mcp_login(state: State<'_, AppState>, name: String) -> CmdResult<String> {
+    crate::mcp::login(&state.registry, &name)
+        .await
+        .map_err(cmd_err)
+}
+
+#[tauri::command]
+pub fn mcp_login_cancel() -> CmdResult<()> {
+    crate::mcp::cancel_login();
+    Ok(())
 }
 
 #[tauri::command]

@@ -73,6 +73,36 @@ async fn pi_state_and_messages() {
     drop(rx);
 }
 
+/// πDesk settles a thread from the prompt reply alone when Pi reports that a
+/// command handled it, because no agent events follow. Needs no provider.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn pi_command_prompt_is_handled_without_a_run() {
+    let dir = std::env::temp_dir().join("pi-rpc-live");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (client, rx) = spawn(&["--mode", "rpc", "--no-session"], &dir);
+    let reply = tokio::time::timeout(
+        std::time::Duration::from_secs(45),
+        client.call(
+            "prompt",
+            Map::from_iter([("message".into(), json!("/mcp"))]),
+        ),
+    )
+    .await
+    .expect("timeout")
+    .expect("prompt");
+    assert_eq!(reply.get("disposition"), Some(&json!("handled")));
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let events: Vec<Value> = rx.try_iter().collect();
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.get("type") == Some(&json!("agent_start"))),
+        "a handled command must not start a run: {events:?}"
+    );
+    client.shutdown().await;
+}
+
 async fn smoke_prompt(args: &[&str]) {
     let dir = std::env::temp_dir().join(format!("pidesk-rpc-prompt-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();

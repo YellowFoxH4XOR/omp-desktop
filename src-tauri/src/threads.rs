@@ -39,6 +39,9 @@ const MAX_HISTORY_BYTES: usize = 32 * 1024 * 1024;
 /// Pi can acknowledge a prompt before its turn emits `agent_start`. The
 /// checkout reservation is held this long waiting for the turn to appear.
 const PI_PROMPT_SETTLE_SECS: u64 = 30;
+/// Pi answers a `/command` prompt only after the command's handler returns,
+/// and handlers can wait on the user: dialogs, or `/mcp login` in the browser.
+const COMMAND_PROMPT_TIMEOUT_SECS: u64 = 15 * 60;
 
 pub struct LiveThread {
     client: Arc<RpcClient>,
@@ -1302,12 +1305,46 @@ impl ThreadManager {
                     .collect::<Vec<_>>()),
             );
         }
-        if let Err(error) = client.call(command, args).await {
-            if !already_owned {
-                self.release_checkout(&row.cwd, thread_id);
-                self.set_status(thread_id, "failed");
+        let reply = if command == "prompt" && message.trim_start().starts_with('/') {
+            client
+                .call_with_timeout(command, args, COMMAND_PROMPT_TIMEOUT_SECS)
+                .await
+        } else {
+            client.call(command, args).await
+        };
+        let accepted = match reply {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                if !already_owned {
+                    self.release_checkout(&row.cwd, thread_id);
+                    self.set_status(thread_id, "failed");
+                }
+                return Err(error);
             }
-            return Err(error);
+        };
+        self.touch_activity(thread_id);
+        // An extension command or input handler consumed it (`/mcp`, …): no
+        // run started, so no agent_settled will end one. A dialog the command
+        // showed is answered by now; settle unless other work is pending.
+        if accepted.get("disposition").and_then(Value::as_str) == Some("handled") {
+            let busy = self
+                .live
+                .lock()
+                .get(thread_id)
+                .is_some_and(|live| live.is_busy());
+            if !busy {
+                if self
+                    .store
+                    .get_thread(thread_id)
+                    .is_ok_and(|row| matches!(row.status.as_str(), "active" | "waiting"))
+                {
+                    self.set_status(thread_id, "completed");
+                }
+                if !already_owned {
+                    self.release_checkout(&row.cwd, thread_id);
+                }
+            }
+            return Ok(());
         }
         let busy = self
             .live
@@ -1315,7 +1352,6 @@ impl ThreadManager {
             .get(thread_id)
             .is_some_and(|live| live.is_busy());
         self.set_status(thread_id, "active");
-        self.touch_activity(thread_id);
         if !busy && !already_owned {
             // Pi can acknowledge before agent_start. Hold the checkout for a
             // bounded window; terminal event handlers release it earlier.

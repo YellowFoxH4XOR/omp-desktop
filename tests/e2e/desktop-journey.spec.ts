@@ -31,6 +31,8 @@ function thread(id: string, title: string, viewedAt: string) {
 interface Scenario {
   piInstalled?: boolean;
   systemPiOnly?: boolean;
+  /** The private Pi is an older version than this πDesk runs. */
+  piOutdated?: boolean;
   manualInstall?: boolean;
   missingInstallPlan?: boolean;
   deferEvents?: boolean;
@@ -44,6 +46,10 @@ interface Scenario {
   models?: boolean;
   /** Raw get_messages history for thread `a`. */
   history?: unknown[];
+  /** Report the old pi-mcp-adapter package as installed. */
+  mcpAdapter?: boolean;
+  /** Servers already in πDesk's mcp.json. */
+  mcpServers?: Record<string, { url: string }>;
 }
 
 const MODEL_CATALOGUE = [
@@ -60,9 +66,18 @@ async function openProject(page: Page) {
   await expect(page.getByRole('heading', { name: 'What shall we work on?' })).toBeVisible();
 }
 
+interface MockCall { command: string; args: Record<string, unknown> }
+/** Every Tauri command the mocked desktop received, in order. */
+async function mockCalls(page: Page): Promise<MockCall[]> {
+  return page.evaluate(() => {
+    const mock: unknown = Reflect.get(window, '__mockDesktop');
+    return mock && typeof mock === 'object' && 'calls' in mock && Array.isArray(mock.calls) ? mock.calls : [];
+  });
+}
+
 async function installDesktopMock(page: Page, scenario: Scenario = {}) {
   const [firstTitle, secondTitle] = scenario.titles ?? ['Alpha', 'Beta'];
-  await page.addInitScript(({ project, threads, openDelay, sendDelay, rememberedThreadId, assistantText, piInstalled, systemPiOnly, manualInstall, missingInstallPlan, deferEvents, catalogue, history }) => {
+  await page.addInitScript(({ project, threads, openDelay, sendDelay, rememberedThreadId, assistantText, piInstalled, piOutdated, systemPiOnly, manualInstall, missingInstallPlan, deferEvents, catalogue, history, mcpAdapter, mcpConfigured }) => {
     let defaults: { provider?: string; modelId?: string; thinkingLevel?: string } = catalogue.length ? { provider: 'opencode-go', modelId: 'kimi-k2.6' } : {};
     localStorage.setItem('lastProject', project.id);
     if (rememberedThreadId) localStorage.setItem('lastThread', rememberedThreadId);
@@ -74,16 +89,45 @@ async function installDesktopMock(page: Page, scenario: Scenario = {}) {
     let installed = piInstalled;
     let internPlans: any[] = [];
     (window as any).__git = {};
-    let mcpServers: Record<string, any> = {};
-    let mcpApprove = false;
-    const sharedMcp: Record<string, any> = {
+    interface MockMcpEntry {
+      command?: string;
+      args?: string[];
+      url?: string;
+      enabled?: boolean;
+      exposure?: string;
+      description?: string;
+      env?: Record<string, string>;
+      headers?: Record<string, string>;
+      oauth?: { clientSecret?: string };
+      type?: string;
+      socket?: string;
+      auth?: string;
+      directTools?: boolean | string[];
+    }
+    let mcpServers: Record<string, MockMcpEntry> = { ...mcpConfigured };
+    let mcpBuiltinDisabled = false;
+    let mcpAuthed = false;
+    let mcpAdapterInstalled = mcpAdapter;
+    const sharedMcp: Record<string, MockMcpEntry> = {
       'chrome-devtools': { command: 'npx', args: ['-y', 'chrome-devtools-mcp@latest'] },
       context7: { url: 'https://mcp.context7.com/mcp' },
-      'eureka-db': { url: 'https://eureka.example/mcp', auth: 'oauth' },
+      'eureka-db': { url: 'https://eureka.example/mcp', auth: 'oauth', directTools: true },
+      'legacy-sse': { url: 'https://x.example/sse', type: 'sse' },
     };
-    const mcpView = (name: string, config: any, full: boolean) => ({
-      name, transport: config.command ? 'stdio' : 'http', target: config.command ? [config.command, ...(config.args ?? [])].join(' ') : config.url,
-      disabled: config.disabled === true, auth: config.auth, lifecycle: config.lifecycle, hasSecrets: !!(config.env || config.headers), ...(full ? { config } : {}),
+    const importedMcp = (name: string): MockMcpEntry | null => {
+      const config = sharedMcp[name];
+      if (!config || config.type === 'sse' || config.socket) return null;
+      const entry: MockMcpEntry = { ...config };
+      delete entry.auth;
+      delete entry.directTools;
+      if (config.directTools === true && !entry.exposure) entry.exposure = 'direct';
+      return entry;
+    };
+    const mcpView = (name: string, config: MockMcpEntry, full: boolean, issue?: string) => ({
+      name, transport: config.command ? 'stdio' : 'http', target: config.command ? [config.command, ...(config.args ?? [])].join(' ') : (config.url ?? ''),
+      enabled: config.enabled !== false, exposure: config.exposure === 'codemode-deferred' ? 'codemode' : (config.exposure ?? 'codemode'),
+      ...(config.description ? { description: config.description } : {}),
+      hasSecrets: !!(config.env || config.headers || config.oauth?.clientSecret), ...(issue ? { issue } : {}), ...(full ? { config } : {}),
     });
     let extensions: any[] = [{ source: 'npm:@narumitw/pi-usage', name: '@narumitw/pi-usage', kind: 'npm', version: '0.60.0', description: 'Usage stats for Pi', latest: '0.61.1', updateAvailable: true }];
     let finishInstall: ((error?: string) => void) | undefined;
@@ -104,7 +148,7 @@ async function installDesktopMock(page: Page, scenario: Scenario = {}) {
         state: { sessionId: row.sessionId, sessionFile: row.sessionFile, isStreaming: false,
           ...(catalogue.length ? { model: catalogue.find(model => model.provider === defaults.provider && model.id === defaults.modelId) ?? catalogue[0], thinkingLevel: defaults.thinkingLevel ?? 'medium' } : {}) },
         models: clone(catalogue), levels: catalogue.length ? ['off', 'medium', 'high'] : [], agents: [],
-        commands: [{ name: 'mcp-auth', description: 'Authenticate with an MCP server', source: 'extension' }, { name: 'skill:mcp-scripting', description: 'Batch MCP calls in a script', source: 'skill' }],
+        commands: [{ name: 'mcp', description: 'Manage MCP servers: sign in, reconnect, enable or disable, and change exposure', source: 'extension' }, { name: 'skill:mcp-builder', description: 'Build an MCP server', source: 'skill' }],
         capabilities: {
           agents: false, nestedAgents: false, agentSteering: false, agentKill: false,
           agentRevive: false, planMode: false, permissions: false, modelSwitching: catalogue.length > 0,
@@ -137,7 +181,7 @@ async function installDesktopMock(page: Page, scenario: Scenario = {}) {
           listeners.delete(Number(args.eventId));
           return;
         }
-        if (command === 'detect_harnesses') return installed ? [{ kind: 'pi', path: '/Users/test/.pidesk/runtime/node_modules/.bin/pi', version: '0.87.1', source: 'managed' }] : systemPiOnly ? [{ kind: 'pi', path: '/usr/local/bin/pi', version: '0.87.1', source: 'PATH' }] : [];
+        if (command === 'detect_harnesses') return installed ? [{ kind: 'pi', path: '/Users/test/.pidesk/runtime/node_modules/.bin/pi', version: '1.0.1', source: 'managed', requiredVersion: '1.0.1' }] : piOutdated ? [{ kind: 'pi', path: '/Users/test/.pidesk/runtime/node_modules/.bin/pi', version: '0.87.1', source: 'managed', requiredVersion: '1.0.1' }] : systemPiOnly ? [{ kind: 'pi', path: '/usr/local/bin/pi', version: '1.0.1', source: 'PATH', requiredVersion: '1.0.1' }] : [];
         if (command === 'harness_install_commands') return missingInstallPlan ? [] : [{ kind: 'pi', command: 'npm install --prefix /Users/test/.pidesk/runtime --ignore-scripts --no-audit --no-fund @earendil-works/pi-coding-agent', installPath: '/Users/test/.pidesk/runtime', agentDir: '/Users/test/.pidesk/agent', loginCommand: 'env -i HOME="$HOME" PATH="$PATH" PI_CODING_AGENT_DIR=/Users/test/.pidesk/agent /Users/test/.pidesk/runtime/node_modules/.bin/pi --no-approve' }];
         if (command === 'install_harness') {
           emit({ type: 'install_stage', kind: 'pi', stage: 'preparing' });
@@ -291,16 +335,48 @@ async function installDesktopMock(page: Page, scenario: Scenario = {}) {
         }
         if (command === 'extensions_remove') { extensions = extensions.filter(item => item.source !== args.source); return; }
         if (command === 'mcp_overview') return clone({
-          adapterInstalled: true, adapterVersion: '2.37.0', path: '~/.pidesk/agent/mcp.json',
+          path: '~/.pidesk/agent/mcp.json',
           servers: Object.entries(mcpServers).map(([name, config]) => mcpView(name, config, true)),
-          approveTools: mcpApprove ? 'all' : 'off', raw: JSON.stringify({ mcpServers }, null, 2), hasComments: false,
-          importSources: [{ id: 'config-mcp', path: '~/.config/mcp/mcp.json', servers: Object.entries(sharedMcp).map(([name, config]) => mcpView(name, config, false)) }],
+          raw: JSON.stringify({ mcpServers }, null, 2),
+          importSources: [{ id: 'config-mcp', path: '~/.config/mcp/mcp.json', servers: Object.entries(sharedMcp).map(([name, config]) => config.type === 'sse' ? mcpView(name, config, false, 'Legacy SSE transport is not supported; use the streamable HTTP URL.') : mcpView(name, importedMcp(name) ?? config, false)) }],
+          ...(mcpAdapterInstalled ? { adapter: { source: 'npm:pi-mcp-adapter', version: '2.37.0', servers: ['eureka-db', 'chrome-devtools'] } } : {}),
+          builtinDisabled: mcpBuiltinDisabled,
         });
-        if (command === 'mcp_import') { const copied = (args.names as string[]).filter(name => !mcpServers[name]); for (const name of copied) mcpServers[name] = clone(sharedMcp[name]); return copied; }
-        if (command === 'mcp_save_server') { if (args.original && args.original !== args.name) delete mcpServers[String(args.original)]; mcpServers[String(args.name)] = clone(args.config); return; }
-        if (command === 'mcp_set_enabled') { if (args.enabled) delete mcpServers[String(args.name)].disabled; else mcpServers[String(args.name)].disabled = true; return; }
+        if (command === 'mcp_import') {
+          const copied: string[] = [];
+          const skipped: Array<{ name: string; reason: string }> = [];
+          for (const name of args.names as string[]) {
+            const entry = importedMcp(name);
+            if (!entry) { skipped.push({ name, reason: 'Legacy SSE transport is not supported; use the streamable HTTP URL.' }); continue; }
+            if (mcpServers[name]) { skipped.push({ name, reason: 'already in mcp.json' }); continue; }
+            mcpServers[name] = clone(entry);
+            copied.push(name);
+          }
+          return { copied, skipped };
+        }
+        if (command === 'mcp_save_server') { if (args.original && args.original !== args.name) delete mcpServers[String(args.original)]; mcpServers[String(args.name)] = clone(args.config) as MockMcpEntry; return; }
+        if (command === 'mcp_set_enabled') { if (args.enabled) delete mcpServers[String(args.name)].enabled; else mcpServers[String(args.name)].enabled = false; return; }
         if (command === 'mcp_remove_server') { delete mcpServers[String(args.name)]; return; }
-        if (command === 'mcp_set_approve_tools') { mcpApprove = Boolean(args.all); return; }
+        if (command === 'mcp_check') return {
+          servers: [
+            { name: 'context7', state: 'connected', tools: ['resolve-library-id', 'query-docs'] },
+            { name: 'eureka-db', state: mcpAuthed ? 'connected' : 'needs-auth', tools: mcpAuthed ? Array.from({ length: 18 }, (_, index) => `tool-${index}`) : [] },
+            { name: 'legacy-sse', state: 'failed', tools: [], error: 'Legacy SSE transport is not supported.' },
+          ],
+          errors: [],
+        };
+        if (command === 'mcp_login') { mcpAuthed = true; return 'Signed in to MCP server "eureka-db" (18 tools).'; }
+        if (command === 'mcp_login_cancel') return;
+        if (command === 'mcp_switch_to_builtin') {
+          const copied: string[] = [];
+          for (const name of ['eureka-db', 'chrome-devtools']) {
+            const entry = importedMcp(name);
+            if (entry && !mcpServers[name]) { mcpServers[name] = clone(entry); copied.push(name); }
+          }
+          mcpAdapterInstalled = false;
+          return { copied, skipped: [] };
+        }
+        if (command === 'mcp_enable_builtin') { mcpBuiltinDisabled = false; return; }
         if (command === 'compact_thread') return;
         if (command === 'list_thread_files') return { files: ['README.md', 'src/App.svelte', 'src/app.css', 'src/lib/api.ts', 'src/lib/components/conversation/Composer.svelte', 'docs/modes.md'], truncated: false };
         if (command === 'get_usage') return { tokens: { input: 1200, output: 300, cacheRead: 0, cacheWrite: 0, total: 1500 }, cost: 0.0123, contextUsage: { tokens: 1500, contextWindow: 200000, percent: 1 } };
@@ -340,12 +416,15 @@ async function installDesktopMock(page: Page, scenario: Scenario = {}) {
     rememberedThreadId: scenario.rememberedThreadId,
     assistantText: scenario.assistantText,
     piInstalled: scenario.piInstalled ?? true,
+    piOutdated: scenario.piOutdated ?? false,
     systemPiOnly: scenario.systemPiOnly ?? false,
     manualInstall: scenario.manualInstall ?? false,
     missingInstallPlan: scenario.missingInstallPlan ?? false,
     deferEvents: scenario.deferEvents ?? false,
     catalogue: scenario.models ? MODEL_CATALOGUE : [],
     history: scenario.history,
+    mcpAdapter: scenario.mcpAdapter ?? false,
+    mcpConfigured: scenario.mcpServers ?? {},
   });
 }
 
@@ -529,6 +608,21 @@ test('private Pi setup ignores system Pi and never auto-installs', async ({ page
   await openProject(page);
 });
 
+test('an older private Pi is offered as an explicit update and starts nothing until updated', async ({ page }) => {
+  await installDesktopMock(page, { piInstalled: false, piOutdated: true });
+  await page.goto('/');
+  await expect(page.getByRole('heading', { name: 'Pi needs an update.' })).toBeVisible();
+  await expect(page.getByText(/This πDesk runs Pi 1\.0\.1; its private copy is Pi 0\.87\.1\./)).toBeVisible();
+  expect((await mockCalls(page)).some(call => ['install_harness', 'open_thread', 'prewarm_thread'].includes(call.command))).toBe(false);
+  await page.getByRole('button', { name: 'Update to Pi 1.0.1' }).click();
+  await expect(page.getByRole('heading', { name: 'Pi is up to date.' })).toBeVisible();
+  await expect(page.getByText(/Updated from Pi 0\.87\.1 to 1\.0\.1\./)).toBeVisible();
+  // Sign-ins survive an update, so setup doesn't ask for one again.
+  await expect(page.getByRole('textbox', { name: 'Private Pi sign-in command' })).toHaveCount(0);
+  await page.getByRole('button', { name: 'Continue to πDesk' }).click();
+  await openProject(page);
+});
+
 test('Install waits for its live event subscription before enabling', async ({ page }) => {
   await installDesktopMock(page, { piInstalled: false, deferEvents: true });
   await page.goto('/');
@@ -676,34 +770,34 @@ test('when npm cannot be reached, Extensions says so instead of claiming up to d
   await expect(settings.getByText(/Up to date/)).toHaveCount(0);
 });
 
-test('MCP servers: copy chosen servers from the shared file, add one by URL, edit, and turn off', async ({ page }, testInfo) => {
+test('MCP servers: copy chosen servers, add one by URL, edit, check connections, and sign in', async ({ page }, testInfo) => {
   await installDesktopMock(page);
   await page.goto('/');
   await page.getByRole('button', { name: 'Settings', exact: true }).click();
   const settings = page.getByRole('dialog', { name: 'Settings' });
   await settings.getByRole('button', { name: 'MCP servers' }).click();
   await expect(settings.getByRole('heading', { name: 'MCP servers' })).toBeVisible();
-  await expect(settings.getByText('3 servers in ~/.config/mcp/mcp.json')).toBeVisible();
+  await expect(settings.getByText('4 servers in ~/.config/mcp/mcp.json')).toBeVisible();
   await settings.getByRole('button', { name: 'Choose servers…' }).click();
   const copy = settings.getByRole('group', { name: 'Copy MCP servers' });
+  // The SSE server cannot be represented by Pi's built-in MCP, so it stays off.
+  const sseRow = copy.getByRole('listitem').filter({ hasText: 'legacy-sse' });
+  await expect(sseRow.getByRole('checkbox')).toBeDisabled();
+  await expect(sseRow).toContainText('Legacy SSE transport is not supported');
   await copy.getByRole('checkbox').first().uncheck();
   await copy.getByRole('button', { name: 'Copy 2 servers' }).click();
   await expect(settings.getByRole('status')).toContainText('Copied context7, eureka-db into πDesk');
   const list = settings.getByRole('list', { name: 'MCP servers' });
   await expect(list.getByRole('listitem')).toHaveCount(2);
-  await expect(settings.getByText(/eureka-db needs a one-time sign-in/)).toBeVisible();
-  await settings.getByRole('button', { name: 'Sign in to eureka-db' }).click();
-  const terminal = page.getByRole('dialog', { name: 'Pi terminal' });
-  await expect(terminal).toBeVisible();
-  await expect.poll(() => page.evaluate(() => (window as any).__mockDesktop.calls.filter((call: { command: string }) => call.command === 'terminal_write').map((call: { args: { data: string } }) => call.args.data).join(''))).toBe("pi '/mcp-auth eureka-db'\r");
-  await terminal.getByRole('button', { name: 'Close terminal' }).click();
-  // The remaining shared server is still offered.
-  await expect(settings.getByText('1 server in ~/.config/mcp/mcp.json')).toBeVisible();
+  // The adapter's directTools became Pi's exposure=direct.
+  await expect(list.getByRole('listitem').filter({ hasText: 'eureka-db' })).toContainText('Direct');
 
   await settings.getByRole('button', { name: 'Add server' }).click();
   const form = settings.getByRole('form', { name: 'Add MCP server' });
   await form.getByLabel('Name', { exact: true }).fill('deepwiki');
   await form.getByLabel('URL', { exact: true }).fill('https://mcp.deepwiki.com/mcp');
+  await form.getByLabel('Description').fill('DeepWiki docs');
+  await form.getByLabel('Tools reach the model').selectOption('deferred');
   await form.getByRole('button', { name: 'Add server' }).click();
   await expect(list.getByRole('listitem')).toHaveCount(3);
   await page.screenshot({ path: testInfo.outputPath('mcp-servers.png') });
@@ -716,16 +810,42 @@ test('MCP servers: copy chosen servers from the shared file, add one by URL, edi
 
   await list.getByRole('switch', { name: 'context7 enabled' }).uncheck();
   await expect(list.getByRole('listitem').filter({ hasText: 'context7' })).toContainText('Off');
-  await settings.getByRole('switch', { name: 'Ask before every MCP tool call' }).check();
 
-  const calls = await page.evaluate(() => (window as any).__mockDesktop.calls.filter((call: { command: string }) => call.command.startsWith('mcp_') && call.command !== 'mcp_overview').map((call: { command: string; args: unknown }) => [call.command, call.args]));
+  await settings.getByRole('button', { name: 'Check connections' }).click();
+  await expect(list.getByRole('listitem').filter({ hasText: 'context7' })).toContainText('Connected · 2 tools');
+  await expect(list.getByRole('listitem').filter({ hasText: 'eureka-db' })).toContainText('Needs sign-in');
+  await list.getByRole('button', { name: 'Sign in to eureka-db' }).click();
+  await expect(settings.getByRole('status')).toContainText('Signed in to MCP server "eureka-db" (18 tools).');
+  await expect(list.getByRole('listitem').filter({ hasText: 'eureka-db' })).toContainText('Connected · 18 tools');
+
+  const calls = (await mockCalls(page)).filter(call => call.command.startsWith('mcp_') && call.command !== 'mcp_overview').map(call => [call.command, call.args]);
   expect(calls).toEqual([
     ['mcp_import', { source: 'config-mcp', names: ['context7', 'eureka-db'] }],
-    ['mcp_save_server', { original: null, name: 'deepwiki', config: { url: 'https://mcp.deepwiki.com/mcp' } }],
-    ['mcp_save_server', { original: 'deepwiki', name: 'deepwiki', config: { url: 'https://mcp.deepwiki.com/mcp', headers: { Authorization: 'Bearer ${DEEPWIKI_TOKEN}' } } }],
+    ['mcp_save_server', { original: null, name: 'deepwiki', config: { url: 'https://mcp.deepwiki.com/mcp', description: 'DeepWiki docs', exposure: 'deferred' } }],
+    ['mcp_save_server', { original: 'deepwiki', name: 'deepwiki', config: { url: 'https://mcp.deepwiki.com/mcp', description: 'DeepWiki docs', exposure: 'deferred', headers: { Authorization: 'Bearer ${DEEPWIKI_TOKEN}' } } }],
     ['mcp_set_enabled', { name: 'context7', enabled: false }],
-    ['mcp_set_approve_tools', { all: true }],
+    ['mcp_check', {}],
+    ['mcp_login', { name: 'eureka-db' }],
+    ['mcp_check', {}],
   ]);
+});
+
+test('MCP servers: switching from pi-mcp-adapter copies its servers and turns built-in MCP on', async ({ page }) => {
+  await installDesktopMock(page, { mcpAdapter: true });
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  const settings = page.getByRole('dialog', { name: 'Settings' });
+  await settings.getByRole('button', { name: 'MCP servers' }).click();
+  await expect(settings.getByText('pi-mcp-adapter is installed')).toBeVisible();
+  await expect(settings.getByText(/\(eureka-db, chrome-devtools\) into mcp\.json/)).toBeVisible();
+  await settings.getByRole('button', { name: 'Switch to built-in MCP' }).click();
+  await expect(settings.getByRole('status')).toContainText('Copied eureka-db, chrome-devtools into mcp.json.');
+  await expect(settings.getByText('pi-mcp-adapter is installed')).toHaveCount(0);
+  const list = settings.getByRole('list', { name: 'MCP servers' });
+  await expect(list.getByRole('listitem')).toHaveCount(2);
+
+  const calls = (await mockCalls(page)).filter(call => call.command.startsWith('mcp_') && call.command !== 'mcp_overview').map(call => [call.command, call.args]);
+  expect(calls).toEqual([['mcp_switch_to_builtin', {}]]);
 });
 
 test('Settings shows full private paths and opens and closes the Pi terminal', async ({ page }) => {
@@ -1141,49 +1261,52 @@ test('a Plan-mode permission request shows the exact command and can be allowed 
 const MCP_RUN = [
   { role: 'user', content: 'use eureka mcp to find good ideas', timestamp: 1000 },
   { role: 'assistant', timestamp: 2000, content: [
-    { type: 'thinking', thinking: 'The user wants to use the eureka MCP to find good ideas. Connect first.' },
-    { type: 'toolCall', id: 'c1', name: 'mcp', arguments: { connect: 'eureka-db' } },
+    { type: 'thinking', thinking: 'The user wants to use the eureka MCP to find good ideas. Load its tools first.' },
+    { type: 'toolCall', id: 'c1', name: 'tool_search', arguments: { query: 'business ideas' } },
   ] },
-  { role: 'toolResult', toolCallId: 'c1', toolName: 'mcp', content: [{ type: 'text', text: 'Connected to eureka-db (18 tools).' }], details: { mode: 'connect', server: 'eureka-db' }, timestamp: 3000 },
+  { role: 'toolResult', toolCallId: 'c1', toolName: 'tool_search', content: [{ type: 'text', text: 'Loaded 2 tools:\n- eureka-db · get_saved_ideas\n- eureka-db · search_business_ideas' }], timestamp: 3000 },
   { role: 'assistant', timestamp: 5000, content: [
-    { type: 'thinking', thinking: 'Connected. Now search with filters.' },
-    { type: 'toolCall', id: 'c2', name: 'eureka-db_get_saved_ideas', arguments: {} },
-    { type: 'toolCall', id: 'c3', name: 'eureka-db_search_business_ideas', arguments: { min_opportunity_score: 80, max_difficulty: 3, has_revenue_signal: true } },
+    { type: 'thinking', thinking: 'Loaded. Now search with filters.' },
+    { type: 'toolCall', id: 'c2', name: 'mcp__eureka_db__get_saved_ideas', arguments: {} },
+    { type: 'toolCall', id: 'c3', name: 'mcp__eureka_db__search_business_ideas', arguments: { min_opportunity_score: 80, max_difficulty: 3, has_revenue_signal: true } },
   ] },
-  { role: 'toolResult', toolCallId: 'c2', toolName: 'eureka-db_get_saved_ideas', content: [{ type: 'text', text: '{"ideas":[{"id":1},{"id":2},{"id":3}]}' }], details: { server: 'eureka-db', tool: 'get_saved_ideas' }, timestamp: 8000 },
-  { role: 'toolResult', toolCallId: 'c3', toolName: 'eureka-db_search_business_ideas', content: [{ type: 'text', text: JSON.stringify({ results: Array.from({ length: 21 }, (_, i) => ({ id: i })) }) }], details: { server: 'eureka-db', tool: 'search_business_ideas' }, timestamp: 12000 },
+  { role: 'toolResult', toolCallId: 'c2', toolName: 'mcp__eureka_db__get_saved_ideas', content: [{ type: 'text', text: '{"ideas":[{"id":1},{"id":2},{"id":3}]}' }], details: { server: 'eureka-db', tool: 'get_saved_ideas' }, timestamp: 8000 },
+  { role: 'toolResult', toolCallId: 'c3', toolName: 'mcp__eureka_db__search_business_ideas', content: [{ type: 'text', text: JSON.stringify({ results: Array.from({ length: 21 }, (_, i) => ({ id: i })) }) }], details: { server: 'eureka-db', tool: 'search_business_ideas' }, timestamp: 12000 },
   { role: 'assistant', timestamp: 15000, content: [
     { type: 'thinking', thinking: 'I got 21 ideas. Let me narrow to the best with a script.' },
-    { type: 'toolCall', id: 'c4', name: 'mcpScript', arguments: { code: '// top ideas\nconst r = await tools.eureka_db_search_business_ideas({ min_opportunity_score: 90 });\nemit(r.data);' } },
+    { type: 'toolCall', id: 'c4', name: 'codemode', arguments: { code: '// top ideas\nconst r = await tools.mcp__eureka_db__search_business_ideas({ min_opportunity_score: 90 });\ntext(r);' } },
   ] },
-  { role: 'toolResult', toolCallId: 'c4', toolName: 'mcpScript', content: [{ type: 'text', text: '[{"name":"AI bookkeeping for salons"}]' }], details: { mode: 'script' }, timestamp: 30000 },
+  { role: 'toolResult', toolCallId: 'c4', toolName: 'codemode', content: [{ type: 'text', text: 'Script completed\nWall time 0.4 seconds\nOutput:\n[{"name":"AI bookkeeping for salons"}]' }], nestedCalls: { calls: [{ id: 'c4/1', name: 'mcp__eureka_db__search_business_ideas', status: 'ok', arguments: { min_opportunity_score: 90 }, durationMs: 380 }], complete: true }, timestamp: 30000 },
   { role: 'assistant', timestamp: 43000, content: [{ type: 'text', text: 'Here are the strongest ideas from eureka-db.' }] },
 ];
 
 test('finished work folds into a summary, and MCP calls read as server + action', async ({ page }, testInfo) => {
-  await installDesktopMock(page, { history: MCP_RUN });
+  await installDesktopMock(page, { history: MCP_RUN, mcpServers: { 'eureka-db': { url: 'https://eureka.example/mcp' } } });
   await page.goto('/');
   await openProject(page);
   await page.locator('.thread-link[title="Alpha"]').click();
   await expect(page.getByText('Here are the strongest ideas from eureka-db.')).toBeVisible();
   const summary = page.getByRole('button', { name: /Worked for 41s/ });
   await expect(summary).toContainText('eureka-db ×3');
-  await expect(summary).toContainText('1 MCP script');
+  await expect(summary).toContainText('1 script');
   await expect(summary).toContainText('3 thoughts');
   await expect(summary).toHaveAttribute('aria-expanded', 'false');
   await page.screenshot({ path: testInfo.outputPath('steps-folded.png') });
   await summary.click();
   await expect(summary).toHaveAttribute('aria-expanded', 'true');
-  await expect(page.getByText('Connected to', { exact: true })).toBeVisible();
+  await expect(page.getByText('Searched tools', { exact: true })).toBeVisible();
   const search = page.locator('.tool', { hasText: 'Search business ideas' });
   await expect(search).toContainText('eureka-db');
   await expect(search).toContainText('min opportunity score 80');
   await expect(search).toContainText('21 results');
   await expect(page.locator('.tool', { hasText: 'Get saved ideas' })).toContainText('3 results');
-  await expect(page.locator('.tool', { hasText: 'Ran MCP script' })).toContainText('const r = await tools');
+  const script = page.locator('.tool', { hasText: 'Ran script' });
+  await expect(script).toContainText('const r = await tools');
   await page.screenshot({ path: testInfo.outputPath('steps-open.png') });
   await search.getByRole('button').first().click();
   await expect(search).toContainText('has_revenue_signal');
+  await script.getByRole('button').first().click();
+  await expect(script).toContainText('Search business ideas');
 });
 
 test('slash commands: Pi built-ins run in πDesk, Pi commands go to Pi, terminal-only ones explain', async ({ page }) => {
@@ -1197,8 +1320,8 @@ test('slash commands: Pi built-ins run in πDesk, Pi commands go to Pi, terminal
   const menu = page.getByRole('listbox', { name: 'Commands' });
   await expect(menu.getByRole('option', { name: /\/model/ })).toContainText('πDesk');
   await box.fill('/mc');
-  await expect(menu.getByRole('option', { name: /\/mcp-auth/ })).toContainText('Extension');
-  await expect(menu.getByRole('option', { name: /\/skill:mcp-scripting/ })).toContainText('Skill');
+  await expect(menu.getByRole('option', { name: /^\/mcp\b/ })).toContainText('Extension');
+  await expect(menu.getByRole('option', { name: /\/skill:mcp-builder/ })).toContainText('Skill');
   const sent = () => page.evaluate(() => (window as any).__mockDesktop.calls.filter((call: { command: string }) => ['send_prompt', 'compact_thread', 'get_usage'].includes(call.command)).map((call: { command: string; args: unknown }) => [call.command, call.args]));
   const send = async (text: string) => { await box.fill(text); await box.press('Escape'); await page.getByRole('button', { name: 'Send message' }).click(); };
 
@@ -1208,12 +1331,12 @@ test('slash commands: Pi built-ins run in πDesk, Pi commands go to Pi, terminal
   await expect(page.getByText(/1,500 tokens \(1,200 in, 300 out\) · \$0\.0123 · context 1% full/)).toBeVisible();
   await send('/tree');
   await expect(page.getByText(/\/tree only exists in Pi's own terminal UI/)).toBeVisible();
-  await send('/mcp-auth eureka-db');
+  await send('/mcp login eureka-db');
   await expect.poll(sent).toEqual([
     ['compact_thread', { threadId: 'a', instructions: 'keep the API notes' }],
     ['get_usage', { threadId: 'a' }], // /compact refreshes the context meter
     ['get_usage', { threadId: 'a' }], // /session
-    ['send_prompt', { threadId: 'a', message: '/mcp-auth eureka-db', mode: 'prompt' }],
+    ['send_prompt', { threadId: 'a', message: '/mcp login eureka-db', mode: 'prompt' }],
   ]);
   // A slash command never becomes the thread title.
   await expect(page.locator('.top-thread')).toHaveText('Alpha');
@@ -1732,12 +1855,12 @@ test('Pi Intern shows its context and runs / commands: built-ins in πDesk, Pi c
 
   // A Pi extension command is sent as typed, without Intern's project preamble.
   await input.fill('/mcp');
-  await expect(menu.getByRole('option', { name: /\/mcp-auth/ })).toBeVisible();
+  await expect(menu.getByRole('option', { name: /^\/mcp\b/ })).toBeVisible();
   await input.press('Enter');
-  await expect(input).toHaveValue('/mcp-auth ');
-  await input.pressSequentially('github');
+  await expect(input).toHaveValue('/mcp ');
+  await input.pressSequentially('login github');
   await input.press('Enter');
-  await expect.poll(() => page.evaluate(() => (window as any).__mockDesktop.calls.filter((call: any) => call.command === 'intern_prompt').map((call: any) => call.args.message))).toEqual(['/mcp-auth github']);
+  await expect.poll(async () => (await mockCalls(page)).filter(call => call.command === 'intern_prompt').map(call => call.args.message)).toEqual(['/mcp login github']);
 
   // /compact runs in πDesk against Intern's Pi and refreshes the meter.
   await input.fill('/compact');

@@ -13,16 +13,14 @@ use tokio::process::{Child, Command};
 
 // Pin the RPC contract this desktop build supports; updates are never implicit.
 const PI_PACKAGE: &str = "@earendil-works/pi-coding-agent";
-const PI_PACKAGE_SPEC: &str = "@earendil-works/pi-coding-agent@0.87.1";
+/// The only Pi version this build runs. Another installed version is
+/// reported so setup can offer the update, but it never starts.
+const PI_VERSION: &str = "1.0.1";
 const INCOMPLETE_MARKER: &str = ".pidesk-install-incomplete";
 const MAX_PROBE_BYTES: u64 = 1024 * 1024;
 const MAX_LOG_LINE_BYTES: usize = 4096;
 const MAX_LOG_LINES: usize = 5000;
 const INSTALL_TIMEOUT_SECS: u64 = 600;
-/// Pi packages every new private installation starts with. πDesk's MCP
-/// servers settings manage this adapter's configuration.
-pub const DEFAULT_PACKAGES: &[&str] = &["npm:pi-mcp-adapter"];
-const DEFAULT_PACKAGE_TIMEOUT_SECS: u64 = 300;
 type Emit = Arc<dyn Fn(BackendEvent) + Send + Sync>;
 
 fn executable_in(root: &Path) -> PathBuf {
@@ -61,7 +59,7 @@ fn install_args(root: &Path) -> Vec<String> {
         root.join("npm-global.conf").to_string_lossy().into_owned(),
         "--cache".into(),
         root.join("npm-cache").to_string_lossy().into_owned(),
-        PI_PACKAGE_SPEC.into(),
+        format!("{PI_PACKAGE}@{PI_VERSION}"),
     ]
 }
 
@@ -297,6 +295,7 @@ async fn validate_pi(root: &Path) -> AppResult<HarnessInstallation> {
         path: executable.to_string_lossy().into_owned(),
         version,
         source: "managed".into(),
+        required_version: PI_VERSION.into(),
     })
 }
 
@@ -433,9 +432,14 @@ impl HarnessRegistry {
                 "Private Pi installation is incomplete. Retry installation in πDesk.",
             ));
         }
-        self.validated_installation()
-            .await
-            .map(|installation| PathBuf::from(installation.path))
+        let installation = self.validated_installation().await?;
+        if installation.version != PI_VERSION {
+            return Err(AppError::new(format!(
+                "πDesk runs Pi {PI_VERSION}, but its private copy is Pi {}. Choose Update Pi in πDesk.",
+                installation.version
+            )));
+        }
+        Ok(PathBuf::from(installation.path))
     }
 
     /// Ownership and symlink checks always run (they are filesystem-only);
@@ -519,9 +523,15 @@ impl HarnessRegistry {
         if self.root.try_exists()? {
             util::check_owned_path(&self.root, true)?;
         }
-        // This endpoint is setup, not a live-runtime upgrade. Never replace a
-        // working installation while it may have active sessions.
-        if !self.detect().await.is_empty() {
+        // Setup, not a live-runtime upgrade: never replace a verified current
+        // installation. Another version can't start any Pi in this build
+        // (`executable_path` refuses it), so updating it replaces nothing in use.
+        if self
+            .detect()
+            .await
+            .iter()
+            .any(|installation| installation.version == PI_VERSION)
+        {
             emit(BackendEvent::InstallProgress {
                 kind: HarnessKind::Pi,
                 line: "Private Pi is already installed and verified.".into(),
@@ -686,12 +696,16 @@ impl HarnessRegistry {
         self.check_open()?;
         *self.validated.lock() = None;
         let installation = self.validated_installation().await?;
+        if installation.version != PI_VERSION {
+            return Err(AppError::new(format!(
+                "npm installed Pi {} instead of {PI_VERSION}. Retry installation.",
+                installation.version
+            )));
+        }
         self.check_open()?;
         std::fs::remove_file(marker)?;
         // The terminal's sign-in command loads it, so it must exist now.
         crate::threads::write_modes_extension(&self.root)?;
-        self.install_default_packages(emit, Path::new(&installation.path))
-            .await;
         emit(BackendEvent::InstallProgress {
             kind: HarnessKind::Pi,
             line: format!(
@@ -700,41 +714,6 @@ impl HarnessRegistry {
             ),
         });
         Ok(())
-    }
-
-    /// Add πDesk's default packages to a fresh private Pi. Best effort: a
-    /// failure is reported in the log and never fails the runtime install.
-    async fn install_default_packages(&self, emit: &Emit, executable: &Path) {
-        let declared = crate::pi_settings::read_packages(&self.root).unwrap_or_default();
-        for source in DEFAULT_PACKAGES {
-            if declared.iter().any(|existing| existing == source) {
-                continue;
-            }
-            let line = |line: String| {
-                emit(BackendEvent::InstallProgress {
-                    kind: HarnessKind::Pi,
-                    line,
-                })
-            };
-            line(format!("Adding {source} so πDesk can manage MCP servers…"));
-            let mut command = Command::new(executable);
-            util::configure_private_command(&mut command, &self.root);
-            command
-                .current_dir(&self.root)
-                .args(["install", source, "--no-approve"])
-                .kill_on_drop(true);
-            let result = tokio::time::timeout(
-                std::time::Duration::from_secs(DEFAULT_PACKAGE_TIMEOUT_SECS),
-                command.output(),
-            )
-            .await;
-            match result {
-                Ok(Ok(output)) if output.status.success() => line(format!("Added {source}.")),
-                _ => line(format!(
-                    "Could not add {source}. Pi still works; add it later from Settings → MCP servers."
-                )),
-            }
-        }
     }
 }
 
@@ -748,6 +727,10 @@ mod tests {
     }
 
     fn fake_private_pi(root: &Path) {
+        fake_private_pi_version(root, PI_VERSION);
+    }
+
+    fn fake_private_pi_version(root: &Path, version: &str) {
         let package = root.join("runtime/node_modules").join(PI_PACKAGE);
         std::fs::create_dir_all(&package).unwrap();
         std::fs::create_dir_all(root.join("runtime/node_modules/.bin")).unwrap();
@@ -757,7 +740,7 @@ mod tests {
         )
         .unwrap();
         let executable = package.join("cli.js");
-        std::fs::write(&executable, "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 0.87.1; else echo 'Pi - AI coding assistant --mode --no-approve'; fi\n").unwrap();
+        std::fs::write(&executable, format!("#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo {version}; else echo 'Pi - AI coding assistant --mode --no-approve'; fi\n")).unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::os::unix::fs::symlink(&executable, executable_in(root)).unwrap();
     }
@@ -772,6 +755,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn other_pi_version_is_reported_for_update_but_never_runs() {
+        let root = root();
+        fake_private_pi_version(&root, "0.87.1");
+        let registry = HarnessRegistry::at_root(root.clone());
+        let installs = registry.detect().await;
+        assert_eq!(installs.len(), 1, "setup must see the copy it can update");
+        assert_eq!(installs[0].version, "0.87.1");
+        assert_eq!(installs[0].required_version, PI_VERSION);
+        let error = registry
+            .executable_path(HarnessKind::Pi)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("0.87.1") && error.contains(PI_VERSION),
+            "{error}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn validation_probes_run_once_until_the_install_changes() {
         let root = root();
         fake_private_pi(&root);
@@ -782,7 +786,7 @@ mod tests {
         let log = root.join("probes.log");
         let script = |extra: &str| {
             format!(
-                "#!/bin/sh\necho run >> '{}'\nif [ \"$1\" = \"--version\" ]; then echo 0.87.1; else echo 'Pi - AI coding assistant --mode --no-approve'; fi\n{extra}",
+                "#!/bin/sh\necho run >> '{}'\nif [ \"$1\" = \"--version\" ]; then echo {PI_VERSION}; else echo 'Pi - AI coding assistant --mode --no-approve'; fi\n{extra}",
                 log.display()
             )
         };

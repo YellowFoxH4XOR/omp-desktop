@@ -8,7 +8,7 @@ Intern is app-wide. It sees a project only when one is attached in its picker, o
 
 ## Capabilities
 
-- Pi's built-in tools (`read`, `bash`, `edit`, `write`, and any enabled `grep`/`find`/`ls`) plus every extension, skill and prompt template installed in the private Pi profile. Its instructions are appended to Pi's default system prompt.
+- Pi's built-in tools (`read`, `bash`, `edit`, `write`, and any enabled `grep`/`find`/`ls`), the MCP servers from Settings through Pi's built-in MCP (`codemode`, `tool_search`, MCP tools), plus every extension, skill and prompt template installed in the private Pi profile. Its instructions are appended to Pi's default system prompt.
 - It is locked to **Plan mode** (see `docs/modes.md`), enforced inside Pi by the bundled modes extension: reads, searches, read-only shell commands and `curl` lookups run freely; edits, writes and other commands are blocked. To change anything it calls `request_auto` with a numbered plan, which shows an approval card in the Intern panel. Approval turns on Auto for the rest of that run only.
 - It works from its private folder (`~/.pidesk/intern`); each message states the attached project's absolute path, which it uses for files and commands.
 - `/` commands work as in a thread (shared `src/lib/slash-actions.ts`): πDesk's built-ins (`/model`, `/thinking`, `/compact`, `/session`, `/copy`, `/reload`, `/login`; `/new` clears Intern) run in the app, while extension commands, skills and prompt templates go to Pi as typed, without the attached-project preamble, since Pi only runs a command at the start of a prompt. `/name`, `/plan` and `/auto` are thread-only. The toolbar ring shows Intern's context use.
