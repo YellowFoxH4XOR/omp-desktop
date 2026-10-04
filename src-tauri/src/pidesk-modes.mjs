@@ -9,7 +9,10 @@
 // Pi's extension loader maps this to the running Pi (static imports only).
 import { createBashTool } from '@earendil-works/pi-coding-agent';
 
-const READ_ONLY_TOOLS = new Set(['read', 'grep', 'find', 'ls', 'pidesk', 'request_auto']);
+// `codemode` only runs JavaScript in Pi's sandbox: every tool its script calls
+// reaches the `tool_call` hook below on its own, so writes and MCP calls in a
+// script still ask. Tool search and MCP resource reads only read.
+const READ_ONLY_TOOLS = new Set(['read', 'grep', 'find', 'ls', 'pidesk', 'request_auto', 'codemode', 'tool_search', 'list_mcp_resources', 'list_mcp_resource_templates', 'read_mcp_resource']);
 // πDesk matches these labels (src/lib/plan.ts) to show its plan review panel.
 const TITLE = 'Run this plan in Auto mode?';
 const APPROVE = 'Approve and run in Auto';
@@ -22,7 +25,7 @@ const ALLOW_RUN = 'Allow for this run (Auto)';
 const KEEP_BLOCKED = 'Keep blocked';
 const ALLOW_SESSION = 'Allow for this session';
 const PLAN_CONTEXT = `[πDesk PLAN MODE]
-You are in Plan mode, which is read-only. You may read, search, list files, run read-only shell commands (for example cat, rg, ls, git status, git diff, git log), look things up on the web with curl, and look up MCP servers and tools with mcp({}), mcp({ search }) or mcp({ describe }). Edits, file writes, calling MCP tools, and every other command need the user's permission: πDesk asks them each time you try one, and they may allow it or keep it blocked.
+You are in Plan mode, which is read-only. You may read, search, list files, run read-only shell commands (for example cat, rg, ls, git status, git diff, git log), look things up on the web with curl, find tools with tool_search, read MCP resources, and run codemode scripts (each tool call a script makes is checked like a direct call). Edits, file writes, calling MCP tools, and every other command need the user's permission: πDesk asks them each time you try one, and they may allow it or keep it blocked.
 For a single small step you may just try it. When the task needs several changes, first investigate, then present a concrete numbered plan with the exact files and commands involved, and call request_auto with that plan. If the user approves, Auto mode (full tools) is on until this run ends; carry out the plan in the same run, verify it, and report. If they decline, keep planning or ask what to change.`;
 
 // A command passes only if every segment is an allowlisted read-only
@@ -53,14 +56,6 @@ const SAFE = [
   /^cargo\s+(metadata|tree)\b/,
   /^curl\s/,
 ];
-
-/** pi-mcp-adapter's `mcp` calls that only read metadata: status, a server's
- *  tool list, search, describe, instructions. Calling a tool, connecting,
- *  and auth actions still need Auto. */
-export function isMcpLookup(input) {
-  if (!input || typeof input !== 'object') return true;
-  return !['tool', 'connect', 'action', 'args', 'code', 'script'].some(key => key in input && input[key] !== undefined && input[key] !== null && input[key] !== '');
-}
 
 // Other apps' config and credential locations under the user's real home.
 // The agent's shell sees that home, so reaching into these asks first.
@@ -106,9 +101,13 @@ export function describeCall(toolName, input) {
     return `Edit ${path || 'a file'} (${edits} change${edits === 1 ? '' : 's'})`;
   }
   if (toolName === 'write') return `Write ${path || 'a file'} (${text(input?.content).length} characters)`;
-  if (toolName === 'mcp') {
-    const target = text(input?.tool) || text(input?.connect) || text(input?.action);
-    return `Use MCP: ${target || 'call'}${input?.args ? `\n${clip(JSON.stringify(input.args), 600)}` : ''}`;
+  if (toolName.startsWith('mcp__')) {
+    const name = toolName.slice(5);
+    const split = name.indexOf('__');
+    const target = split > 0 ? `${name.slice(split + 2)} on ${name.slice(0, split)}` : name;
+    let args = '';
+    try { args = JSON.stringify(input ?? {}); } catch { args = ''; }
+    return `Call the MCP tool ${target}${args && args !== '{}' ? `\n${clip(args, 600)}` : ''}`;
   }
   let args = '';
   try { args = JSON.stringify(input ?? {}); } catch { args = ''; }
@@ -211,7 +210,6 @@ export default function (pi) {
       else if (choice !== ALLOW_ONCE) return declined;
     }
     if (!plan || executing || READ_ONLY_TOOLS.has(event.toolName)) return undefined;
-    if (event.toolName === 'mcp' && isMcpLookup(event.input)) return undefined;
     if (event.toolName === 'bash' && isReadOnlyCommand(event.input?.command)) return undefined;
     if (!ctx?.hasUI) {
       return { block: true, reason: `Plan mode is read-only and no one could be asked, so ${event.toolName} was blocked. Put this step in a plan and call request_auto.` };

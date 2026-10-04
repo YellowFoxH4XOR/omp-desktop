@@ -18,7 +18,7 @@
 
   let { item, onShowChanges }: Props = $props();
 
-  // MCP calls (the adapter's tools, or `<server>_<tool>` direct tools) get their own card.
+  // Built-in MCP tools (`mcp__…`), codemode, tool search, and MCP resources get their own card.
   void loadMcpServers();
   const mcp = $derived(mcpCall(item));
 

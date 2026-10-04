@@ -230,3 +230,114 @@ test('tool call argument deltas do not create duplicate rows', () => {
   expect(tools).toHaveLength(1);
   expect(tools[0].kind === 'tool' && tools[0].args).toEqual({ path: 'a.txt' });
 });
+
+test('live nested tool frames attach to the parent call without adding rows', () => {
+  const model = new SessionModel(snapshot);
+  model.apply({ type: 'agent_start' });
+  model.apply({ type: 'message_start', message: { role: 'assistant', content: [], timestamp: 1 } });
+  model.apply({ type: 'message_update', assistantMessageEvent: { type: 'toolcall_start', contentIndex: 0, id: 'call_1', name: 'codemode' } });
+  model.apply({ type: 'message_update', assistantMessageEvent: { type: 'toolcall_end', contentIndex: 0, toolCall: { id: 'call_1', name: 'codemode', arguments: { code: 'text(1);' } } } });
+  model.apply({ type: 'tool_execution_start', toolCallId: 'call_1', toolName: 'codemode', args: { code: 'text(1);' } });
+  model.apply({ type: 'tool_execution_start', toolCallId: 'call_1/1', toolName: 'mcp__eureka_db__get_saved_ideas', args: { limit: 1 }, parentToolCallId: 'call_1' });
+  model.apply({ type: 'tool_execution_start', toolCallId: 'call_1/2', toolName: 'mcp__eureka_db__search_business_ideas', parentToolCallId: 'call_1/1' });
+  model.apply({ type: 'tool_update', toolCallId: 'call_1/2', parentToolCallId: 'call_1/1', partialResult: { content: [{ type: 'text', text: '…' }] } });
+  model.apply({ type: 'tool_execution_end', toolCallId: 'call_1/2', parentToolCallId: 'call_1/1', result: { content: [{ type: 'text', text: 'nested out' }] } });
+  model.apply({ type: 'tool_execution_end', toolCallId: 'call_1/1', parentToolCallId: 'call_1', result: { content: [{ type: 'text', text: 'boom' }], isError: true }, isError: true });
+
+  const tools = model.view.items.filter(item => item.kind === 'tool');
+  expect(tools).toHaveLength(1);
+  const parent = tools[0];
+  expect(parent.kind === 'tool' && parent.status).toBe('running');
+  const nested = parent.kind === 'tool' ? parent.nested : undefined;
+  expect(nested).toHaveLength(2);
+  expect(nested?.[0]).toMatchObject({ id: 'call_1/1', toolName: 'mcp__eureka_db__get_saved_ideas', status: 'failed', error: 'boom' });
+  expect(typeof nested?.[0]?.durationMs).toBe('number');
+  expect(nested?.[1]).toMatchObject({ id: 'call_1/2', toolName: 'mcp__eureka_db__search_business_ideas', status: 'completed' });
+
+  // The persisted toolResult replaces the live entries authoritatively.
+  model.apply({ type: 'message_end', message: {
+    role: 'toolResult', toolCallId: 'call_1', toolName: 'codemode',
+    content: [{ type: 'text', text: 'Script completed' }],
+    nestedCalls: { calls: [{ id: 'call_1/1', name: 'mcp__eureka_db__get_saved_ideas', status: 'ok', durationMs: 12 }], complete: true }
+  } });
+  expect(parent.kind === 'tool' && parent.nested).toEqual([
+    { id: 'call_1/1', toolName: 'mcp__eureka_db__get_saved_ideas', status: 'completed', durationMs: 12 }
+  ]);
+  model.apply({ type: 'tool_execution_end', toolCallId: 'call_1', result: { content: [{ type: 'text', text: 'done' }] } });
+  expect(model.view.items.filter(item => item.kind === 'tool')).toHaveLength(1);
+});
+
+test('persisted nestedCalls map onto the tool row and skip malformed entries', () => {
+  const call: RpcMessage = {
+    role: 'assistant', timestamp: 1,
+    content: [{ type: 'toolCall', id: 'c4', name: 'codemode', arguments: { code: 'text(1);' } }]
+  };
+  const result: RpcMessage = {
+    role: 'toolResult', toolCallId: 'c4', toolName: 'codemode', timestamp: 2,
+    content: [{ type: 'text', text: 'Script completed\nWall time 0.4 seconds\nOutput:\n[]' }],
+    nestedCalls: {
+      calls: [
+        { id: 'c4/1', name: 'mcp__eureka_db__search_business_ideas', status: 'ok', arguments: { min_opportunity_score: 90 }, durationMs: 380 },
+        { id: 'c4/2', name: 'mcp__eureka_db__get_saved_ideas', status: 'unfinished' },
+        { id: 'c4/3', name: 'broken', status: 'mystery' },
+        'not-a-record'
+      ],
+      complete: true
+    }
+  };
+  const model = new SessionModel({ ...snapshot, messages: [call, result] });
+  const tool = model.view.items.find(item => item.kind === 'tool');
+  expect(tool?.kind === 'tool' && tool.nested).toEqual([
+    { id: 'c4/1', toolName: 'mcp__eureka_db__search_business_ideas', status: 'completed', args: { min_opportunity_score: 90 }, durationMs: 380 },
+    { id: 'c4/2', toolName: 'mcp__eureka_db__get_saved_ideas', status: 'cancelled' }
+  ]);
+});
+
+test('a toolResult without a prior call keeps its nested calls', () => {
+  const model = new SessionModel({ ...snapshot, messages: [{
+    role: 'toolResult', toolCallId: 'c9', toolName: 'codemode', timestamp: 1,
+    content: [{ type: 'text', text: 'Script completed' }],
+    nestedCalls: { calls: [{ id: 'c9/1', name: 'mcp__x__y', status: 'error', error: 'offline' }], complete: false }
+  }] });
+  const tool = model.view.items.find(item => item.kind === 'tool');
+  expect(tool?.kind === 'tool' && tool.nested).toEqual([
+    { id: 'c9/1', toolName: 'mcp__x__y', status: 'failed', error: 'offline' }
+  ]);
+});
+
+test('nested frames with an unknown parent fall back to a top-level row', () => {
+  const model = new SessionModel(snapshot);
+  model.apply({ type: 'tool_execution_start', toolCallId: 'orphan/1', toolName: 'mcp__x__y', parentToolCallId: 'missing' });
+  model.apply({ type: 'tool_execution_end', toolCallId: 'orphan/1', parentToolCallId: 'missing', result: { content: [{ type: 'text', text: 'ok' }] } });
+  const tools = model.view.items.filter(item => item.kind === 'tool');
+  expect(tools).toHaveLength(1);
+  expect(tools[0].kind === 'tool' && tools[0].toolCallId).toBe('orphan/1');
+  expect(tools[0].kind === 'tool' && tools[0].status).toBe('completed');
+});
+
+test('disconnecting cancels running nested calls and reconnect carries saved ones', () => {
+  const model = new SessionModel(snapshot);
+  model.apply({ type: 'agent_start' });
+  model.apply({ type: 'tool_execution_start', toolCallId: 'call_1', toolName: 'codemode', args: { code: 'x' } });
+  model.apply({ type: 'tool_execution_start', toolCallId: 'call_1/1', toolName: 'mcp__eureka_db__get_saved_ideas', parentToolCallId: 'call_1' });
+  model.setError('gone');
+  const cancelled = model.view.items.find(item => item.kind === 'tool');
+  expect(cancelled?.kind === 'tool' && cancelled.nested?.[0]?.status).toBe('cancelled');
+
+  const assistant: RpcMessage = {
+    role: 'assistant', timestamp: 1,
+    content: [{ type: 'toolCall', id: 'call_1', name: 'codemode', arguments: { code: 'x' } }]
+  };
+  const result: RpcMessage = {
+    role: 'toolResult', toolCallId: 'call_1', toolName: 'codemode', timestamp: 2,
+    content: [{ type: 'text', text: 'done' }],
+    nestedCalls: { calls: [{ id: 'call_1/1', name: 'mcp__eureka_db__get_saved_ideas', status: 'ok' }], complete: true }
+  };
+  model.reconnect({ ...snapshot, messages: [assistant, result] });
+  const tools = model.view.items.filter(item => item.kind === 'tool');
+  expect(tools).toHaveLength(1);
+  expect(tools[0].kind === 'tool' && tools[0].status).toBe('completed');
+  expect(tools[0].kind === 'tool' && tools[0].nested).toEqual([
+    { id: 'call_1/1', toolName: 'mcp__eureka_db__get_saved_ideas', status: 'completed' }
+  ]);
+});

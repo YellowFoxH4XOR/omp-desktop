@@ -1,6 +1,7 @@
 <script lang="ts">
   import { Wrench } from '@lucide/svelte';
   import ToolShell from './ToolShell.svelte';
+  import NestedCalls from './NestedCalls.svelte';
   import {
     formatDuration,
     prettyJson,
@@ -40,6 +41,9 @@
       <pre>{shownOutput}</pre>
     {:else if item.status === 'running'}
       <div class="muted">Running…</div>
+    {/if}
+    {#if item.nested?.length}
+      <NestedCalls calls={item.nested} />
     {/if}
     {#if hasArgs}
       <details class="raw">

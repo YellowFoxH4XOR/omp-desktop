@@ -6,6 +6,8 @@
 
   interface Props {
     plan: HarnessInstallCommand | null;
+    /** Set when the private copy runs another Pi version than this πDesk. */
+    update?: { from: string; to: string };
     status: InstallStatus;
     busy: boolean;
     lines: string[];
@@ -17,12 +19,17 @@
     onContinue: () => void;
     onOpenTerminal: () => void;
   }
-  let { plan, status, busy, lines, error, ready, checking, onInstall, onCheck, onContinue, onOpenTerminal }: Props = $props();
+  let { plan, update, status, busy, lines, error, ready, checking, onInstall, onCheck, onContinue, onOpenTerminal }: Props = $props();
   let output = $state<HTMLDivElement>();
   let following = $state(true);
   const steps = ['Check requirements', 'Install packages', 'Verify Pi'];
   const stepIndex = $derived(status === 'preparing' ? 0 : status === 'installing' ? 1 : status === 'verifying' ? 2 : status === 'complete' ? 3 : -1);
-  const statusLabel = $derived(status === 'idle' ? 'Not installed' : status === 'preparing' ? 'Checking requirements' : status === 'installing' ? 'Installing packages' : status === 'verifying' ? 'Verifying installation' : status === 'complete' ? 'Ready' : 'Installation failed');
+  const statusLabel = $derived(status === 'idle' ? (update ? `Pi ${update.from} installed` : 'Not installed') : status === 'preparing' ? 'Checking requirements' : status === 'installing' ? 'Installing packages' : status === 'verifying' ? 'Verifying installation' : status === 'complete' ? 'Ready' : 'Installation failed');
+  const title = $derived(status === 'complete' ? (update ? 'Pi is up to date.' : 'Your Pi is ready.') : update ? 'Pi needs an update.' : 'A Pi of its own.');
+  const intro = $derived(status === 'complete'
+    ? update ? `Updated from Pi ${update.from} to ${update.to}. Your settings, sign-ins, extensions, and sessions were kept.` : 'Installed just for πDesk. Connect a provider below, then you’re ready to work.'
+    : update ? `This πDesk runs Pi ${update.to}; its private copy is Pi ${update.from}. Updating replaces only the runtime: settings, sign-ins, extensions, and sessions stay.` : 'Install a dedicated Pi for πDesk. Your terminal’s Pi, extensions, and sessions stay untouched.');
+  const action = $derived(update ? `Update to Pi ${update.to}` : 'Install Pi');
 
   $effect(() => {
     lines;
@@ -37,8 +44,8 @@
   <div class="setup-content">
     <header>
       <div class="eyebrow"><span class="pi-mark" aria-hidden="true">π</span><span>πDesk / SETUP</span></div>
-      <h1>{status === 'complete' ? 'Your Pi is ready.' : 'A Pi of its own.'}</h1>
-      <p class="intro">{status === 'complete' ? 'Installed just for πDesk. Connect a provider below, then you’re ready to work.' : 'Install a dedicated Pi for πDesk. Your terminal’s Pi, extensions, and sessions stay untouched.'}</p>
+      <h1>{title}</h1>
+      <p class="intro">{intro}</p>
     </header>
 
     <div class="location-card">
@@ -68,7 +75,7 @@
       <div class="terminal-output" bind:this={output} onscroll={onScroll} role="log" aria-label="Pi installation output" aria-live="polite" aria-relevant="additions" tabindex="0">
         {#if status === 'idle'}
           <pre class="command">$ {plan?.command ?? 'Loading installer…'}</pre>
-          <p class="waiting">Ready when you are. Nothing runs until you choose Install Pi.</p>
+          <p class="waiting">Ready when you are. Nothing runs until you choose {action}.</p>
         {:else}
           <pre>{#each lines as line}<span>{line}{'\n'}</span>{/each}{#if busy}<span class="cursor" aria-hidden="true">▍</span>{/if}</pre>
         {/if}
@@ -79,14 +86,14 @@
 
     {#if error}<div class="install-error" role="alert"><AlertTriangle size={16} /><div><strong>{status === 'failed' ? 'Installation didn’t finish' : 'Setup is unavailable'}</strong><p>{error}</p><small>Your existing Pi installation has not been changed.</small></div></div>{/if}
 
-    {#if status === 'complete' && plan}<PiSignIn command={plan.loginCommand} {onOpenTerminal} />{/if}
+    {#if status === 'complete' && plan && !update}<PiSignIn command={plan.loginCommand} {onOpenTerminal} />{/if}
 
     <div class="actions">
       {#if status === 'complete'}
         <button class="primary" disabled={busy} onclick={onContinue}>Continue to πDesk <ArrowRight size={15} /></button>
       {:else}
         <button class="primary" disabled={busy || !ready || checking} onclick={onInstall}>
-          {#if busy}<LoaderCircle size={15} class="spin" />{statusLabel}…{:else if status === 'failed'}<RefreshCw size={15} />Retry installation{:else}<Download size={15} />Install Pi{/if}
+          {#if busy}<LoaderCircle size={15} class="spin" />{statusLabel}…{:else if status === 'failed'}<RefreshCw size={15} />Retry installation{:else}<Download size={15} />{action}{/if}
         </button>
         <button class="secondary" disabled={busy || checking} onclick={onCheck}><RefreshCw size={13} class={checking ? 'spin' : ''} />{checking ? 'Checking…' : 'Check again'}</button>
       {/if}
