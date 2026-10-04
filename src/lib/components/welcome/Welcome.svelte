@@ -3,12 +3,16 @@
   import type { Project, Thread } from '$lib/types';
   import { ago } from '$lib/time';
 
-  let { projects, recent, busy, onOpenProject, onOpenThread, onAddProject, onOpenIntern }: {
+  let { projects, recent, busy, onOpenProject, onOpenThread, onPrewarmThread, onPressThread, onCancelPrewarm, onAddProject, onOpenIntern }: {
     projects: Project[];
     recent: Thread[];
     busy: boolean;
     onOpenProject: (project: Project) => void;
     onOpenThread: (thread: Thread) => void;
+    /** Hover or focus on a recent thread: its Pi can start ahead of the click. */
+    onPrewarmThread?: (thread: Thread) => void;
+    onPressThread?: (thread: Thread) => void;
+    onCancelPrewarm?: () => void;
     onAddProject: () => void;
     onOpenIntern: () => void;
   } = $props();
@@ -34,7 +38,7 @@
       <section class="recent" aria-label="Last used">
         <div class="section-heading"><h2>Pick up where you left off</h2><span>Recent threads</span></div>
         {#each lastUsed as thread (thread.id)}
-          <button class="row" onclick={() => onOpenThread(thread)} title={thread.title || 'New thread'}>
+          <button class="row" onclick={() => onOpenThread(thread)} onpointerenter={() => onPrewarmThread?.(thread)} onpointerleave={() => onCancelPrewarm?.()} onpointerdown={() => onPressThread?.(thread)} onfocus={() => onPrewarmThread?.(thread)} onblur={() => onCancelPrewarm?.()} title={thread.title || 'New thread'}>
             <span class="thread-glyph" aria-hidden="true"><MessageSquare size={16} strokeWidth={1.8}/></span>
             <span class="name">{thread.title || 'New thread'}</span>
             <span class="meta">{projectName.get(thread.projectId)} · {ago(thread.lastViewedAt)}</span>

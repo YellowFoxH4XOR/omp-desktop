@@ -148,7 +148,7 @@ fn watcher_thread(
                 {
                     continue;
                 }
-                for (_, watched) in watchers.iter_mut() {
+                for watched in watchers.values_mut() {
                     watched.threads.retain(|t| t != &thread_id);
                 }
                 watchers.retain(|_, watched| !watched.threads.is_empty());
@@ -242,7 +242,7 @@ fn watcher_thread(
                     continue;
                 }
                 applied.insert(thread_id.clone(), generation);
-                for (_, watched) in watchers.iter_mut() {
+                for watched in watchers.values_mut() {
                     watched.threads.retain(|t| t != &thread_id);
                 }
                 watchers.retain(|_, watched| !watched.threads.is_empty());

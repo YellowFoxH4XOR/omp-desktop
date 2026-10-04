@@ -262,23 +262,26 @@ fn fingerprint(root: &Path, executable: &Path) -> AppResult<InstallFingerprint> 
 
 async fn validate_pi(root: &Path) -> AppResult<HarnessInstallation> {
     let executable = managed_executable(root)?;
-    let version_text = probe(root, &executable, &["--version"]).await?;
+    // Each probe starts a Node process; running them together halves the
+    // wait at launch.
+    let (version_text, help) = tokio::try_join!(
+        probe(root, &executable, &["--version"]),
+        probe(
+            root,
+            &executable,
+            &[
+                "--help",
+                "--no-extensions",
+                "--no-skills",
+                "--no-prompt-templates",
+                "--no-context-files",
+                "--no-approve",
+            ],
+        ),
+    )?;
     let version = util::parse_version(&version_text)
         .ok_or_else(|| AppError::new("Private Pi did not report its version."))?;
-    let help = probe(
-        root,
-        &executable,
-        &[
-            "--help",
-            "--no-extensions",
-            "--no-skills",
-            "--no-prompt-templates",
-            "--no-context-files",
-            "--no-approve",
-        ],
-    )
-    .await?
-    .to_ascii_lowercase();
+    let help = help.to_ascii_lowercase();
     if !help.contains("pi - ai coding assistant")
         || !help.contains("--mode")
         || !help.contains("--no-approve")
@@ -357,6 +360,9 @@ async fn stream_output(
 pub struct HarnessRegistry {
     root: PathBuf,
     validated: parking_lot::Mutex<Option<(InstallFingerprint, HarnessInstallation)>>,
+    /// One validation at a time: a caller that arrives during the launch
+    /// warm-up waits for its result instead of probing again.
+    validating: tokio::sync::Mutex<()>,
     closing: AtomicBool,
     installing: AtomicBool,
     stop_install: tokio::sync::Notify,
@@ -380,6 +386,7 @@ impl HarnessRegistry {
         Self {
             root,
             validated: parking_lot::Mutex::new(None),
+            validating: tokio::sync::Mutex::new(()),
             closing: AtomicBool::new(false),
             installing: AtomicBool::new(false),
             stop_install: tokio::sync::Notify::new(),
@@ -440,10 +447,19 @@ impl HarnessRegistry {
     async fn validated_installation(&self) -> AppResult<HarnessInstallation> {
         let executable = managed_executable(&self.root)?;
         let current = fingerprint(&self.root, &executable)?;
-        if let Some((cached, installation)) = self.validated.lock().as_ref() {
-            if *cached == current {
-                return Ok(installation.clone());
-            }
+        let cached = || {
+            self.validated
+                .lock()
+                .as_ref()
+                .filter(|(cached, _)| *cached == current)
+                .map(|(_, installation)| installation.clone())
+        };
+        if let Some(installation) = cached() {
+            return Ok(installation);
+        }
+        let _validating = self.validating.lock().await;
+        if let Some(installation) = cached() {
+            return Ok(installation);
         }
         let installation = validate_pi(&self.root).await?;
         let verified = fingerprint(&self.root, &managed_executable(&self.root)?)?;

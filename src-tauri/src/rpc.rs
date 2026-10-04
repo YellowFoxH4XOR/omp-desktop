@@ -165,8 +165,12 @@ struct RpcInner {
     /// buffered frames, then reports it. Never used for group signalling.
     leader_exit_tx: watch::Sender<Option<LeaderExit>>,
     /// Exit callback, stored so stdin-failure paths can fail the client.
-    on_exit: Arc<Box<dyn Fn(Option<i32>, String, bool) + Send + Sync>>,
+    on_exit: Arc<ExitHandler>,
 }
+
+/// Called once when the process is gone: exit code, redacted stderr tail,
+/// and whether the exit was expected.
+pub type ExitHandler = Box<dyn Fn(Option<i32>, String, bool) + Send + Sync>;
 
 /// Leader status observed by the poll monitor.
 #[derive(Clone)]
@@ -181,7 +185,7 @@ pub struct RpcHandlers {
     pub on_event: Box<dyn Fn(Value) + Send + Sync>,
     /// Fired once when the process exits or the stdout stream ends.
     /// Args: exit code, stderr tail, whether the exit was expected.
-    pub on_exit: Box<dyn Fn(Option<i32>, String, bool) + Send + Sync>,
+    pub on_exit: ExitHandler,
 }
 
 impl RpcClient {
@@ -607,7 +611,7 @@ async fn fail_all(inner: &Arc<RpcInner>, msg: &str) {
 
 async fn mark_exited(
     inner: &Arc<RpcInner>,
-    on_exit: Arc<Box<dyn Fn(Option<i32>, String, bool) + Send + Sync>>,
+    on_exit: Arc<ExitHandler>,
     code: Option<i32>,
     stderr: String,
 ) {

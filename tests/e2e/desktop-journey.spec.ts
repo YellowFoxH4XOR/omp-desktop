@@ -940,6 +940,33 @@ test('startup does not spawn a harness and newer thread selection wins', async (
   await expect(page.getByText('History a')).toHaveCount(0);
 });
 
+test('a press starts Pi without waiting for the hover dwell, on the welcome screen and for a cached thread', async ({ page }) => {
+  await page.clock.install();
+  await installDesktopMock(page);
+  await page.goto('/');
+  const prewarms = () => page.evaluate(() => (window as any).__mockDesktop.calls.filter((call: { command: string }) => call.command === 'prewarm_thread').map((call: { args: { threadId: string } }) => call.args.threadId));
+
+  // Welcome screen: the press itself starts Alpha's Pi, before the click lands.
+  const recent = page.getByRole('region', { name: 'Last used' }).getByRole('button', { name: /Alpha/ });
+  const box = (await recent.boundingBox())!;
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await page.mouse.down();
+  expect(await prewarms()).toEqual(['a']);
+  await page.mouse.up();
+  await expect(page.getByText('History a')).toBeVisible();
+
+  await page.locator('.thread-link[title="Beta"]').click();
+  await expect(page.getByText('History b')).toBeVisible();
+  expect(await prewarms()).toEqual(['a', 'b']);
+
+  // Alpha's transcript is cached, but its Pi may have been suspended since:
+  // coming back starts it again rather than waiting for the next prompt.
+  await page.clock.fastForward(61_000);
+  await page.locator('.thread-link[title="Alpha"]').click();
+  await expect(page.getByText('History a')).toBeVisible();
+  expect(await prewarms()).toEqual(['a', 'b', 'a']);
+});
+
 test('launch shows the welcome screen and reopens a last-used thread in one click', async ({ page }, testInfo) => {
   await installDesktopMock(page, { rememberedThreadId: 'a' });
   await page.goto('/');

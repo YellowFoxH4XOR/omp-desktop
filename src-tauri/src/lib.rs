@@ -2,6 +2,8 @@ mod commands;
 mod dto;
 mod error;
 mod extensions;
+#[cfg(unix)]
+mod fsat;
 mod git;
 mod harness;
 mod intern;
@@ -46,6 +48,12 @@ pub fn run() {
                 std::io::Error::other(format!("Could not release Intern threads: {error}"))
             })?;
             let state = state::AppState::new(app.handle().clone(), store);
+            // Check the private Pi while the window loads, so the UI's first
+            // detect call finds the answer ready. Detection never installs.
+            let registry = state.registry.clone();
+            tauri::async_runtime::spawn(async move {
+                registry.detect().await;
+            });
             app.manage(state);
             Ok(())
         })
@@ -127,7 +135,7 @@ pub fn run() {
                     let registry = state.registry.clone();
                     let intern = state.intern.clone();
                     intern.cancel_all();
-                    let _ = tauri::async_runtime::block_on(async move {
+                    tauri::async_runtime::block_on(async move {
                         registry.shutdown().await;
                         threads.shutdown_all().await;
                         intern.settle().await;
