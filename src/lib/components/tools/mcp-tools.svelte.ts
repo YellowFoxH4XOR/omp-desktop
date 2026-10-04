@@ -2,9 +2,9 @@ import { api } from '$lib/api';
 import { detailString, resultText, type ToolItem } from './tool-utils';
 
 /**
- * Configured MCP server names, loaded once. Direct MCP tools are named
- * `<server>_<tool>`; the name alone can't say which part is the server
- * until the result reports it, so the configured names fill that gap.
+ * Configured MCP server names, loaded once. Built-in MCP tools are named
+ * `mcp__<namespace>__<tool>`, where the namespace is the server name with
+ * dashes turned into underscores; the configured names recover the real one.
  */
 export const mcpServers = $state<{ names: string[] }>({ names: [] });
 let loading: Promise<void> | undefined;
@@ -18,68 +18,63 @@ export function loadMcpServers(): Promise<void> {
 
 export interface McpCall {
   /** What happened, for the card's summary line. */
-  kind: 'call' | 'script' | 'search' | 'describe' | 'connect' | 'list' | 'status' | 'instructions' | 'auth' | 'install' | 'other';
+  kind: 'call' | 'script' | 'search' | 'resources' | 'resource';
   server?: string;
-  /** Tool name without the server prefix. */
+  /** Tool name without the server namespace. */
   tool?: string;
   args?: Record<string, unknown>;
   query?: string;
   code?: string;
+  uri?: string;
+  templates?: boolean;
 }
 
 function text(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
 }
-function record(value: unknown): Record<string, unknown> | undefined {
-  if (value && typeof value === 'object' && !Array.isArray(value)) return value as Record<string, unknown>;
-  if (typeof value === 'string') {
-    try { return record(JSON.parse(value)); } catch { return undefined; }
-  }
-  return undefined;
-}
 
-/** Split `server_tool` using the result's server or a configured name. */
-function splitName(name: string, server?: string): { server?: string; tool: string } {
-  const known = server ? [server] : [...mcpServers.names].sort((a, b) => b.length - a.length);
-  for (const candidate of known) {
-    for (const separator of ['_', '__', '-']) {
-      if (name.startsWith(candidate + separator)) return { server: candidate, tool: name.slice(candidate.length + separator.length) };
+/** Split a built-in `mcp__<namespace>__<tool>` tool name into server and tool.
+ *  Prefers a configured server whose namespace prefixes the name. */
+export function mcpToolName(name: string): { server: string; tool: string } | null {
+  if (!name.startsWith('mcp__')) return null;
+  const rest = name.slice(5);
+  const known = [...mcpServers.names].sort((a, b) => b.length - a.length);
+  for (const server of known) {
+    const namespace = server.replace(/-/g, '_');
+    if (rest.startsWith(`${namespace}__`) && rest.length > namespace.length + 2) {
+      return { server, tool: rest.slice(namespace.length + 2) };
     }
   }
-  return { server, tool: name };
+  const separator = rest.indexOf('__');
+  if (separator <= 0 || separator + 2 >= rest.length) return null;
+  return { server: rest.slice(0, separator), tool: rest.slice(separator + 2) };
 }
 
-/** The MCP call this tool item represents, or null when it isn't one. */
+/** The built-in MCP call this tool item represents, or null when it isn't one. */
 export function mcpCall(item: ToolItem): McpCall | null {
   const name = item.toolName;
   const args = item.args ?? {};
+  switch (name) {
+    case 'codemode':
+      return { kind: 'script', code: text(args.code) };
+    case 'tool_search':
+      return { kind: 'search', query: text(args.query) };
+    case 'list_mcp_resources':
+      return { kind: 'resources', server: text(args.server) };
+    case 'list_mcp_resource_templates':
+      return { kind: 'resources', server: text(args.server), templates: true };
+    case 'read_mcp_resource':
+      return { kind: 'resource', server: text(args.server), uri: text(args.uri) };
+  }
+  if (!name.startsWith('mcp__')) return null;
   const details = item.result?.details;
-  const resultServer = detailString(details, ['server']);
-  if (name === 'mcpScript') return { kind: 'script', code: text(args.code) };
-  if (name.startsWith('mcp__')) {
-    const server = name.slice(5);
-    const tool = text(args.tool);
-    return tool ? { kind: 'call', server, tool: splitName(tool, server).tool, args: record(args.args) } : { kind: 'list', server };
-  }
-  if (name === 'mcp') {
-    const tool = text(args.tool);
-    if (tool) {
-      const split = splitName(tool, resultServer ?? text(args.server));
-      return { kind: 'call', server: split.server, tool: split.tool, args: record(args.args) };
-    }
-    const action = text(args.action);
-    if (action?.startsWith('auth')) return { kind: 'auth', server: text(args.server) };
-    if (action === 'install') return { kind: 'install', server: text(args.name) ?? text(args.url) };
-    if (text(args.connect)) return { kind: 'connect', server: text(args.connect) };
-    if (text(args.search)) return { kind: 'search', query: text(args.search) };
-    if (text(args.describe)) return { kind: 'describe', ...splitName(text(args.describe)!) };
-    if (text(args.instructions)) return { kind: 'instructions', server: text(args.instructions) };
-    if (text(args.server)) return { kind: 'list', server: text(args.server) };
-    return action ? { kind: 'other', tool: action } : { kind: 'status' };
-  }
-  const split = splitName(name, resultServer);
-  if (split.server) return { kind: 'call', server: split.server, tool: detailString(details, ['tool']) ?? split.tool, args };
-  return null;
+  const split = mcpToolName(name);
+  return {
+    kind: 'call',
+    server: detailString(details, ['server']) ?? split?.server,
+    tool: detailString(details, ['tool']) ?? split?.tool,
+    args,
+  };
 }
 
 /** `search_business_ideas` → "Search business ideas". */

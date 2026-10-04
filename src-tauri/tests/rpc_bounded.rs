@@ -1,4 +1,4 @@
-use pidesk_lib::rpc::{RpcClient, RpcHandlers};
+use pidesk_lib::rpc::{RpcClient, RpcHandlers, MAX_PI_FRAME_BYTES};
 use serde_json::Map;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -64,10 +64,13 @@ async fn pending_request_table_is_bounded() {
 #[cfg(unix)]
 #[tokio::test]
 async fn oversized_wire_line_terminates_harness_and_fails_closed() {
-    let script = "head -c 8388609 /dev/zero | tr '\\0' x; printf '\\n'; exec sleep 30";
-    let client = attach_shell(script, noop_handlers());
+    let script = format!(
+        "head -c {} /dev/zero | tr '\\0' x; printf '\\n'; exec sleep 30",
+        MAX_PI_FRAME_BYTES + 1
+    );
+    let client = attach_shell(&script, noop_handlers());
 
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     while !client.is_exited() && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }

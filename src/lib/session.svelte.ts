@@ -11,6 +11,7 @@ import type {
 	ConversationItem,
 	ContextUsage,
 	ModelInfo,
+	NestedCall,
 	RpcContent,
 	RpcMessage,
 	SessionSnapshot,
@@ -49,6 +50,11 @@ interface BashLive {
 /** Live `!command` output is unbounded; the command card shows only a tail. */
 const MAX_LIVE_BASH_CHARS = 64 * 1024;
 const BASH_MATCH_HEAD_CHARS = 4096;
+
+/** Pi keeps at most this many nested calls per tool item. */
+const MAX_NESTED_CALLS = 256;
+/** Failed nested calls keep this much of their error text. */
+const MAX_NESTED_ERROR_CHARS = 500;
 
 let itemSeq = 0;
 function nid(): string {
@@ -110,6 +116,31 @@ function normalizeResult(v: unknown): ToolResult | undefined {
 	if (v.details !== undefined) r.details = v.details;
 	if (typeof v.isError === 'boolean') r.isError = v.isError;
 	return r;
+}
+
+/** Map Pi's persisted `nestedCalls.calls` onto transcript nested entries.
+ *  Returns undefined when the message carries no nested-call record. */
+function nestedCallsFrom(value: unknown): NestedCall[] | undefined {
+	if (!isRec(value)) return undefined;
+	const calls = arr(value.calls);
+	if (!calls) return undefined;
+	const out: NestedCall[] = [];
+	for (const raw of calls) {
+		if (!isRec(raw)) continue;
+		const id = str(raw.id);
+		const name = str(raw.name);
+		const status: NestedCall['status'] | undefined =
+			raw.status === 'ok' ? 'completed' : raw.status === 'error' ? 'failed' : raw.status === 'unfinished' ? 'cancelled' : undefined;
+		if (!id || !name || !status) continue;
+		const entry: NestedCall = { id, toolName: name, status };
+		if (isRec(raw.arguments)) entry.args = raw.arguments;
+		const durationMs = num(raw.durationMs);
+		if (durationMs !== undefined) entry.durationMs = durationMs;
+		const error = str(raw.error);
+		if (error) entry.error = error;
+		out.push(entry);
+	}
+	return out;
 }
 
 function messageIdentity(value: unknown): string | undefined {
@@ -288,11 +319,13 @@ class ItemSink {
 		if (msg.details !== undefined) result.details = msg.details;
 		if (typeof msg.isError === 'boolean') result.isError = msg.isError;
 		const status = msg.isError ? 'failed' : 'completed';
+		const nested = nestedCallsFrom(msg.nestedCalls);
 		const existing = toolCallId ? this.toolIndex.get(toolCallId) : undefined;
 		if (existing) {
 			existing.result = result;
 			existing.partial = undefined;
 			existing.status = status;
+			if (nested !== undefined) existing.nested = nested;
 			return;
 		}
 		if (!toolCallId) return;
@@ -304,6 +337,7 @@ class ItemSink {
 			args: {},
 			status,
 			result,
+			...(nested !== undefined ? { nested } : {}),
 			timestamp: msg.timestamp,
 		}) as ToolItem;
 		this.toolIndex.set(toolCallId, stored);
@@ -453,6 +487,10 @@ export class SessionModel {
 
 	#sink: ItemSink;
 	#toolIndex = new Map<string, ToolItem>();
+	/** Nested tool-call id → root tool item, for calls nested inside a nested call. */
+	#nestedRoot = new Map<string, ToolItem>();
+	/** Nested tool-call id → Date.now() at execution start. */
+	#nestedStarted = new Map<string, number>();
 	#live: LiveState | null = null;
 	#staleLiveIds = new Set<string>();
 	#seen = new Set<string>();
@@ -522,6 +560,7 @@ export class SessionModel {
 		this.#bashLive.clear();
 		for (const it of this.#toolIndex.values()) {
 			if (it.status === 'running' || it.status === 'queued') it.status = 'cancelled';
+			for (const nested of it.nested ?? []) if (nested.status === 'running') nested.status = 'cancelled';
 		}
 		this.view.pendingRequests = [];
 		this.view.status = 'disconnected';
@@ -566,6 +605,7 @@ export class SessionModel {
 					prior.status = row.status;
 					prior.result = row.result ?? prior.result;
 					prior.args = row.args;
+					prior.nested = row.nested ?? prior.nested;
 				}
 				continue;
 			}
@@ -586,7 +626,10 @@ export class SessionModel {
 		}
 		for (const row of rows) {
 			if (row.kind === 'text' || row.kind === 'thinking') row.streaming = false;
-			if (row.kind === 'tool' && (row.status === 'running' || row.status === 'queued')) row.status = 'cancelled';
+			if (row.kind === 'tool' && (row.status === 'running' || row.status === 'queued')) {
+				row.status = 'cancelled';
+				for (const nested of row.nested ?? []) if (nested.status === 'running') nested.status = 'cancelled';
+			}
 		}
 		this.view.items = [...rows, ...appended];
 		this.view.pendingRequests = [];
@@ -609,6 +652,12 @@ export class SessionModel {
 		this.#bashLive = restored.#bashLive;
 		this.#toolIndex = new Map();
 		for (const row of this.view.items) if (row.kind === 'tool' && row.toolCallId) this.#toolIndex.set(row.toolCallId, row);
+		this.#nestedRoot = new Map();
+		this.#nestedStarted = new Map();
+		for (const row of this.view.items) {
+			if (row.kind !== 'tool') continue;
+			for (const nested of row.nested ?? []) this.#nestedRoot.set(nested.id, row);
+		}
 		this.#sink = new ItemSink(this.view.items, this.#toolIndex);
 	}
 
@@ -1111,7 +1160,85 @@ export class SessionModel {
 
 	/* ---- tool execution events ---- */
 
+	/** Root item for a nested call: the parent is a top-level call, or — for
+	 *  nested-in-nested calls — another nested call. */
+	#nestedRootOf(parentToolCallId: string): ToolItem | undefined {
+		return this.#toolIndex.get(parentToolCallId) ?? this.#nestedRoot.get(parentToolCallId);
+	}
+
+	#nestedEntry(root: ToolItem, id: string): NestedCall | undefined {
+		return root.nested?.find(entry => entry.id === id);
+	}
+
+	/** Append a running nested entry and remember its root for nested-in-nested calls. */
+	#createNested(root: ToolItem, id: string, toolName: string, args?: Record<string, unknown>): NestedCall {
+		const entry: NestedCall = { id, toolName, status: 'running' };
+		if (args) entry.args = args;
+		root.nested ??= [];
+		root.nested.push(entry);
+		if (root.nested.length > MAX_NESTED_CALLS) root.nested.splice(0, root.nested.length - MAX_NESTED_CALLS);
+		this.#nestedRoot.set(id, root);
+		return entry;
+	}
+
+	/** Attach a nested execution start. False when the frame has no parent or
+	 *  the parent is unknown, so the caller keeps the top-level behavior. */
+	#nestedStart(frame: Record<string, unknown>): boolean {
+		const parentId = str(frame.parentToolCallId);
+		if (!parentId) return false;
+		const root = this.#nestedRootOf(parentId);
+		if (!root) return false;
+		const id = str(frame.toolCallId);
+		if (id) {
+			const toolName = str(frame.toolName);
+			const args = isRec(frame.args) ? frame.args : undefined;
+			const entry = this.#nestedEntry(root, id) ?? this.#createNested(root, id, toolName ?? 'tool', args);
+			entry.status = 'running';
+			if (toolName) entry.toolName = toolName;
+			if (args) entry.args = args;
+			this.#nestedRoot.set(id, root);
+			if (!this.#nestedStarted.has(id)) this.#nestedStarted.set(id, Date.now());
+		}
+		return true;
+	}
+
+	/** Ensure a nested entry exists for an update frame; it stays running. */
+	#nestedUpdate(frame: Record<string, unknown>): boolean {
+		const parentId = str(frame.parentToolCallId);
+		if (!parentId) return false;
+		const root = this.#nestedRootOf(parentId);
+		if (!root) return false;
+		const id = str(frame.toolCallId);
+		if (id && !this.#nestedEntry(root, id)) this.#createNested(root, id, str(frame.toolName) ?? 'tool');
+		return true;
+	}
+
+	/** Settle a nested execution: status, duration, and error text when failed. */
+	#nestedEnd(frame: Record<string, unknown>): boolean {
+		const parentId = str(frame.parentToolCallId);
+		if (!parentId) return false;
+		const root = this.#nestedRootOf(parentId);
+		if (!root) return false;
+		const id = str(frame.toolCallId);
+		if (!id) return true;
+		const entry = this.#nestedEntry(root, id) ?? this.#createNested(root, id, str(frame.toolName) ?? 'tool');
+		const started = this.#nestedStarted.get(id);
+		if (started !== undefined) {
+			entry.durationMs = Math.max(0, Math.round(Date.now() - started));
+			this.#nestedStarted.delete(id);
+		}
+		const failed = frame.isError === true;
+		entry.status = failed ? 'failed' : 'completed';
+		if (failed) {
+			const result = normalizeResult(frame.result);
+			const text = result ? contentToText(result.content) : '';
+			if (text) entry.error = text.slice(0, MAX_NESTED_ERROR_CHARS);
+		}
+		return true;
+	}
+
 	#onToolStart(frame: Record<string, unknown>): void {
+		if (this.#nestedStart(frame)) return;
 		const id = str(frame.toolCallId);
 		const args = isRec(frame.args) ? frame.args : undefined;
 		const intent = str(frame.intent);
@@ -1139,6 +1266,7 @@ export class SessionModel {
 	}
 
 	#onToolUpdate(frame: Record<string, unknown>): void {
+		if (this.#nestedUpdate(frame)) return;
 		const id = str(frame.toolCallId);
 		const partial = normalizeResult(frame.partialResult ?? frame.result ?? frame.partial);
 		let item = id ? this.#toolIndex.get(id) : undefined;
@@ -1152,6 +1280,7 @@ export class SessionModel {
 	}
 
 	#onToolEnd(frame: Record<string, unknown>): void {
+		if (this.#nestedEnd(frame)) return;
 		const id = str(frame.toolCallId);
 		let item = id ? this.#toolIndex.get(id) : undefined;
 		if (!item) {

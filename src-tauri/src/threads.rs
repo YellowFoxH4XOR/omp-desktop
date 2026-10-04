@@ -33,6 +33,9 @@ const MAX_HISTORY_BYTES: usize = 32 * 1024 * 1024;
 /// Pi can acknowledge a prompt before its turn emits `agent_start`. The
 /// checkout reservation is held this long waiting for the turn to appear.
 const PI_PROMPT_SETTLE_SECS: u64 = 30;
+/// Pi answers a `/command` prompt only after the command's handler returns,
+/// and handlers can wait on the user: dialogs, or `/mcp login` in the browser.
+const COMMAND_PROMPT_TIMEOUT_SECS: u64 = 15 * 60;
 /// Same-thread prompts are serialized so an older failed/reservation release
 /// cannot tear down a newer accepted turn.
 
@@ -224,7 +227,7 @@ When the user writes @path (for example @src/app.ts or @docs/), it names that fi
 /// Threads run on πDesk's private Pi, but their shell sees the user's real
 /// home, where other tools (the terminal Pi, shared MCP files) keep their own
 /// config and credentials. Point the agent at its own profile instead.
-const PROFILE_GUIDE: &str = "You run on πDesk's own private Pi profile, not the user's terminal Pi. Your Pi settings, installed extensions, MCP server config (mcp.json), and sessions live in $PI_CODING_AGENT_DIR (~/.pidesk/agent); extensions keep their files under ~/.pidesk/home. To see which MCP servers you have, use the mcp tool (for example mcp({}) or mcp({ search: \"…\" })), not config files. ~/.pi, ~/.config/mcp, ~/.agents, and other apps' config directories belong to the user's other tools and may hold credentials: do not go looking in them. Questions about your MCP servers, extensions, or settings are about your own profile. If the user explicitly asks about another tool's files, πDesk will ask them to allow the read first.";
+const PROFILE_GUIDE: &str = "You run on πDesk's own private Pi profile, not the user's terminal Pi. Your Pi settings, installed extensions, MCP server config (mcp.json), and sessions live in $PI_CODING_AGENT_DIR (~/.pidesk/agent); extensions keep their files under ~/.pidesk/home. Pi's built-in MCP connects the servers in that mcp.json: tools of servers with direct exposure are in your tool list, and the other servers are listed in your mcp_servers section and reached through tool_search or codemode scripts (searchTools(), describeNamespace()). `pi mcp list` checks their connections; don't read config files to find them. ~/.pi, ~/.config/mcp, ~/.agents, and other apps' config directories belong to the user's other tools and may hold credentials: do not go looking in them. Questions about your MCP servers, extensions, or settings are about your own profile. If the user explicitly asks about another tool's files, πDesk will ask them to allow the read first.";
 
 /// Plan/Auto modes, loaded into every Pi πDesk starts. The file is rewritten
 /// atomically on each spawn so it always matches this build.
@@ -1438,12 +1441,46 @@ impl ThreadManager {
                     .collect::<Vec<_>>()),
             );
         }
-        if let Err(error) = client.call(command, args).await {
-            if !already_owned {
-                self.release_checkout(&row.cwd, thread_id);
-                self.set_status(thread_id, "failed");
+        let reply = if command == "prompt" && message.trim_start().starts_with('/') {
+            client
+                .call_with_timeout(command, args, COMMAND_PROMPT_TIMEOUT_SECS)
+                .await
+        } else {
+            client.call(command, args).await
+        };
+        let accepted = match reply {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                if !already_owned {
+                    self.release_checkout(&row.cwd, thread_id);
+                    self.set_status(thread_id, "failed");
+                }
+                return Err(error);
             }
-            return Err(error);
+        };
+        self.touch_activity(thread_id);
+        // An extension command or input handler consumed it (`/mcp`, …): no
+        // run started, so no agent_settled will end one. A dialog the command
+        // showed is answered by now; settle unless other work is pending.
+        if accepted.get("disposition").and_then(Value::as_str) == Some("handled") {
+            let busy = self
+                .live
+                .lock()
+                .get(thread_id)
+                .is_some_and(|live| live.is_busy());
+            if !busy {
+                if self
+                    .store
+                    .get_thread(thread_id)
+                    .is_ok_and(|row| matches!(row.status.as_str(), "active" | "waiting"))
+                {
+                    self.set_status(thread_id, "completed");
+                }
+                if !already_owned {
+                    self.release_checkout(&row.cwd, thread_id);
+                }
+            }
+            return Ok(());
         }
         let busy = self
             .live
@@ -1451,7 +1488,6 @@ impl ThreadManager {
             .get(thread_id)
             .is_some_and(|live| live.is_busy());
         self.set_status(thread_id, "active");
-        self.touch_activity(thread_id);
         if !busy && !already_owned {
             // Pi can acknowledge before agent_start. Hold the checkout for a
             // bounded window; terminal event handlers release it earlier.

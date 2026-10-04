@@ -10,7 +10,8 @@ A local-first desktop app for [Pi](https://github.com/earendil-works/pi) coding-
 - Private Pi installation with an opt-in installer and live terminal output
 - Local SQLite metadata for projects and threads
 - Pi JSONL RPC integration; no terminal scraping
-- Streaming assistant responses and structured tool cards, including extension tools
+- Streaming assistant responses and structured tool cards, including extension tools, `codemode` scripts with the tool calls they make, and MCP tools
+- MCP servers through Pi's built-in MCP: add, import, check connections, and sign in from Settings
 - Rendered Markdown with syntax-highlighted code and Mermaid diagrams (Diagram/Code toggle)
 - Extension input, selection, confirmation, and editor requests
 - Model, effort, context, and token usage where supported by Pi
@@ -32,6 +33,8 @@ A local-first desktop app for [Pi](https://github.com/earendil-works/pi) coding-
 
 πDesk does **not** use Pi from your PATH or your existing `~/.pi` directory. On launch it checks only its own installation. If Pi is missing, the setup screen offers **Install Pi**. No installation happens until you click it.
 
+Each πDesk build runs one pinned Pi version (currently 1.0.1). If the private copy is another version, nothing starts until the setup screen's **Update to Pi …** runs; it replaces only the runtime and keeps settings, sign-ins, extensions, MCP servers, and sessions.
+
 The installer shows the exact local npm command, live stdout/stderr, and real check/install/verify stages. Errors stay visible and can be retried. npm installs `@earendil-works/pi-coding-agent` locally with scripts disabled—not with `-g`.
 
 ```text
@@ -42,6 +45,10 @@ The installer shows the exact local npm command, live stdout/stderr, and real ch
 ```
 
 After installation, copy the **private Pi sign-in command** from setup or Settings into Terminal, then use `/login`. A bare `pi` command opens your separate terminal installation, not πDesk's profile. No credentials or extensions are copied from it. There is no in-app provider OAuth flow or built-in subagent transcript browser.
+
+## MCP servers
+
+Pi's built-in MCP connects the servers in `~/.pidesk/agent/mcp.json` when a thread or Intern starts. **Settings → MCP servers** edits that file (form or raw JSON), copies servers from other clients' files on request (`~/.config/mcp/mcp.json`, `~/.agents/…`, your terminal Pi's `~/.pi/agent/mcp.json`), checks connections with `pi mcp list`, and signs in to OAuth servers with `pi mcp login`. Each server's exposure decides how models reach its tools: through `codemode` scripts (default), after `tool_search` finds them, or directly. In a thread, `/mcp` shows server status and `/mcp login <server>` signs in. The `pi-mcp-adapter` extension replaces the built-in MCP; if it is installed, Settings offers to switch back, copying its servers.
 
 ## Development
 
@@ -106,7 +113,8 @@ src-tauri/
     commands.rs                 Tauri command boundary
     dto.rs                      IPC data types
     git.rs                      Git status, diff, safe file operations
-    harness.rs                  Managed Pi validation and opt-in installation
+    harness.rs                  Pinned Pi validation, opt-in installation, and updates
+    mcp.rs                      Built-in MCP config, imports, status, and sign-in
     rpc.rs                      Bounded JSONL transport and correlation
     sessions.rs                 Pi session discovery
     store.rs                    SQLite metadata for projects and threads

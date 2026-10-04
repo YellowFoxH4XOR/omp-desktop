@@ -1,11 +1,9 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { Braces, Download, Globe, KeyRound, LoaderCircle, Pencil, Plug, Plus, Terminal, Trash2 } from '@lucide/svelte';
+  import { Braces, Download, Globe, KeyRound, LoaderCircle, Pencil, Plug, Plus, RefreshCw, Terminal, Trash2 } from '@lucide/svelte';
   import { api } from '$lib/api';
-  import type { McpImportSource, McpOverview, McpServer } from '$lib/types';
-
-  /** Opens πDesk's terminal and types `command` into it. */
-  let { onRunInTerminal }: { onRunInTerminal?: (command: string) => void } = $props();
+  import { mcpServers } from '$lib/components/tools/mcp-tools.svelte';
+  import type { McpImportSource, McpOverview, McpServer, McpServerStatus, McpStatus } from '$lib/types';
 
   interface Draft {
     original: string | null;
@@ -16,8 +14,9 @@
     env: string;
     url: string;
     headers: string;
-    auth: '' | 'bearer' | 'oauth';
-    lifecycle: string;
+    description: string;
+    /** '' keeps the default (codemode). */
+    exposure: string;
     /** Fields the form doesn't edit, kept as they were. */
     base: Record<string, unknown>;
   }
@@ -34,33 +33,46 @@
   let rawError = $state('');
   let importing = $state<McpImportSource | null>(null);
   let picked = $state<Set<string>>(new Set());
+  let checking = $state(false);
+  let status = $state<McpStatus | null>(null);
+  let signingIn = $state<string | null>(null);
 
   const existing = $derived(new Set(overview?.servers.map(server => server.name) ?? []));
-  const needsSignIn = $derived(overview?.servers.filter(server => server.auth === 'oauth' && !server.disabled) ?? []);
+  const statusByName = $derived(new Map<string, McpServerStatus>((status?.servers ?? []).map((server): [string, McpServerStatus] => [server.name, server])));
 
   function errorText(error: unknown): string {
     return error instanceof Error ? error.message : String(error);
   }
   async function load() {
-    try { overview = await api.mcpOverview(); }
+    try {
+      overview = await api.mcpOverview();
+      // Transcripts map `mcp__<namespace>__…` tool names back to these names.
+      mcpServers.names = overview.servers.map(server => server.name);
+    }
     catch (error) { notice = { kind: 'error', text: errorText(error) }; }
     finally { loading = false; }
   }
-  async function act(run: () => Promise<unknown>, done?: string) {
-    if (busy) return false;
+  /** Run a change, reload the overview, and surface failures as a notice. */
+  async function perform<T>(work: () => Promise<T>): Promise<{ ok: true; value: T } | { ok: false }> {
+    if (busy) return { ok: false };
     busy = true;
     notice = null;
     try {
-      await run();
+      const value = await work();
       await load();
-      if (done) notice = { kind: 'ok', text: `${done} New threads use it; press Reload Pi (⟳) in an open thread or in Intern to load it there.` };
-      return true;
+      return { ok: true, value };
     } catch (error) {
       notice = { kind: 'error', text: errorText(error) };
-      return false;
+      return { ok: false };
     } finally {
       busy = false;
     }
+  }
+  async function act(work: () => Promise<unknown>, done?: string): Promise<boolean> {
+    const result = await perform(work);
+    if (!result.ok) return false;
+    if (done) notice = { kind: 'ok', text: `${done} New threads use it; press Reload Pi (⟳) in an open thread or in Intern to load it there.` };
+    return true;
   }
 
   function lines(value: unknown, join: string): string {
@@ -68,10 +80,11 @@
     return Object.entries(value as Record<string, unknown>).map(([key, val]) => `${key}${join}${String(val)}`).join('\n');
   }
   function blankDraft(): Draft {
-    return { original: null, name: '', kind: 'http', command: '', args: '', env: '', url: '', headers: '', auth: '', lifecycle: '', base: {} };
+    return { original: null, name: '', kind: 'http', command: '', args: '', env: '', url: '', headers: '', description: '', exposure: '', base: {} };
   }
   function edit(server: McpServer) {
     const config = { ...(server.config ?? {}) };
+    const exposure = config.exposure;
     draft = {
       original: server.name,
       name: server.name,
@@ -81,8 +94,8 @@
       env: lines(config.env, '='),
       url: typeof config.url === 'string' ? config.url : '',
       headers: lines(config.headers, ': '),
-      auth: config.auth === 'bearer' || config.auth === 'oauth' ? config.auth : '',
-      lifecycle: typeof config.lifecycle === 'string' ? config.lifecycle : '',
+      description: typeof config.description === 'string' ? config.description : '',
+      exposure: exposure === 'deferred' || exposure === 'direct' || exposure === 'hidden' ? exposure : '',
       base: config,
     };
     formError = '';
@@ -98,7 +111,7 @@
   }
   function toConfig(value: Draft): Record<string, unknown> {
     const config: Record<string, unknown> = { ...value.base };
-    for (const key of ['command', 'args', 'env', 'url', 'headers', 'socket', 'auth', 'lifecycle']) delete config[key];
+    for (const key of ['command', 'args', 'env', 'url', 'headers', 'description', 'exposure', 'type']) delete config[key];
     if (value.kind === 'stdio') {
       if (!value.command.trim()) throw new Error('Enter the command that starts the server, for example npx.');
       config.command = value.command.trim();
@@ -112,8 +125,9 @@
       const headers = parsePairs(value.headers, ':', 'header');
       if (headers) config.headers = headers;
     }
-    if (value.auth) config.auth = value.auth;
-    if (value.lifecycle) config.lifecycle = value.lifecycle;
+    const description = value.description.trim();
+    if (description) config.description = description;
+    if (value.exposure) config.exposure = value.exposure;
     return config;
   }
   async function saveDraft(event: SubmitEvent) {
@@ -142,7 +156,7 @@
 
   function startImport(source: McpImportSource) {
     importing = source;
-    picked = new Set(source.servers.filter(server => !existing.has(server.name)).map(server => server.name));
+    picked = new Set(source.servers.filter(server => !existing.has(server.name) && !server.issue).map(server => server.name));
   }
   function toggle(name: string) {
     const next = new Set(picked);
@@ -152,12 +166,71 @@
   async function runImport() {
     if (!importing) return;
     const source = importing;
-    let copied: string[] = [];
-    const ok = await act(async () => { copied = await api.mcpImport(source.id, [...picked]); });
-    if (ok) {
-      importing = null;
-      notice = { kind: 'ok', text: copied.length ? `Copied ${copied.join(', ')} into πDesk. New threads use them; press Reload Pi (⟳) in an open thread or in Intern to load them there.` : 'Nothing new to copy.' };
+    const result = await perform(() => api.mcpImport(source.id, [...picked]));
+    if (!result.ok) return;
+    importing = null;
+    const parts = [result.value.copied.length ? `Copied ${result.value.copied.join(', ')} into πDesk.` : 'Nothing new to copy.'];
+    if (result.value.skipped.length) parts.push(`Skipped ${result.value.skipped.map(row => `${row.name} (${row.reason})`).join(', ')}.`);
+    notice = { kind: 'ok', text: `${parts.join(' ')} New threads use it; press Reload Pi (⟳) in an open thread or in Intern to load it there.` };
+  }
+
+  async function switchToBuiltin() {
+    if (busy) return;
+    busy = true;
+    notice = null;
+    try {
+      const result = await api.mcpSwitchToBuiltin();
+      await load();
+      const copied = result.copied.length ? `Copied ${result.copied.join(', ')} into mcp.json.` : 'No servers needed copying.';
+      const skipped = result.skipped.length ? ` Skipped ${result.skipped.map(row => `${row.name} (${row.reason})`).join(', ')}.` : '';
+      notice = { kind: 'ok', text: `${copied}${skipped} Pi's built-in MCP is on. OAuth servers need one new sign-in.` };
+    } catch (error) {
+      notice = { kind: 'error', text: errorText(error) };
+    } finally {
+      busy = false;
     }
+  }
+  async function check() {
+    if (checking) return;
+    checking = true;
+    try {
+      status = await api.mcpCheck();
+      if (status.errors.length) notice = { kind: 'error', text: status.errors.join(' ') };
+    } catch (error) {
+      notice = { kind: 'error', text: errorText(error) };
+    } finally {
+      checking = false;
+    }
+  }
+  async function signIn(name: string) {
+    if (signingIn) return;
+    signingIn = name;
+    try {
+      const message = await api.mcpLogin(name);
+      notice = { kind: 'ok', text: message };
+      await check();
+    } catch (error) {
+      notice = { kind: 'error', text: errorText(error) };
+    } finally {
+      signingIn = null;
+    }
+  }
+  async function cancelSignIn() {
+    try { await api.mcpLoginCancel(); }
+    catch (error) { notice = { kind: 'error', text: errorText(error) }; }
+  }
+  function statusChip(server: McpServer): { label: string; title: string; tone: '' | 'ok' | 'warn' | 'bad' } | null {
+    const row = statusByName.get(server.name);
+    // An Off server already says so; its check state adds nothing.
+    if (!row || row.state === 'disabled') return null;
+    const title = row.error ?? '';
+    if (row.state === 'connected') return { label: `Connected · ${row.tools.length} tool${row.tools.length === 1 ? '' : 's'}`, title, tone: 'ok' };
+    if (row.state === 'needs-auth') return { label: 'Needs sign-in', title, tone: 'warn' };
+    if (row.state === 'failed' || row.state === 'disconnected') return { label: 'Failed', title, tone: 'bad' };
+    return { label: row.state, title, tone: '' };
+  }
+  function needsAuth(server: McpServer): boolean {
+    return statusByName.get(server.name)?.state === 'needs-auth';
   }
 
   onMount(() => { void load(); });
@@ -167,11 +240,23 @@
   {#if loading}
     <div class="empty"><LoaderCircle size={16} class="spin" />Loading MCP servers…</div>
   {:else if overview}
-    {#if !overview.adapterInstalled}
+    {#if overview.adapter}
       <div class="callout">
         <Plug size={18} />
-        <div><strong>MCP support isn't installed</strong><p>πDesk uses the Pi MCP adapter extension to connect MCP servers.</p></div>
-        <button class="primary" disabled={busy} onclick={() => void act(() => api.mcpInstallAdapter(), 'Installed the Pi MCP adapter.')}>{busy ? 'Installing…' : 'Install adapter'}</button>
+        <div>
+          <strong>pi-mcp-adapter is installed</strong>
+          <p>It replaces Pi's built-in MCP, so the servers here don't load while it's installed. Switching copies its servers{overview.adapter.servers.length ? ` (${overview.adapter.servers.join(', ')})` : ''} into mcp.json, removes the adapter, and turns Pi's built-in MCP on. OAuth servers need one new sign-in.</p>
+        </div>
+        <button class="primary" disabled={busy} onclick={() => void switchToBuiltin()}>{busy ? 'Switching…' : 'Switch to built-in MCP'}</button>
+      </div>
+    {:else if overview.builtinDisabled}
+      <div class="callout">
+        <Plug size={18} />
+        <div>
+          <strong>Pi's built-in MCP is turned off</strong>
+          <p><code>settings.json</code> has <code>-builtin:mcp</code>, so no MCP server loads. Turn it back on to use the servers here.</p>
+        </div>
+        <button class="primary" disabled={busy} onclick={() => void act(() => api.mcpEnableBuiltin(), "Turned Pi's built-in MCP back on.")}>Turn on</button>
       </div>
     {/if}
 
@@ -196,15 +281,15 @@
           {#each importing.servers as server (server.name)}
             {@const already = existing.has(server.name)}
             <li>
-              <label class:disabled={already}>
-                <input type="checkbox" checked={picked.has(server.name)} disabled={already} onchange={() => toggle(server.name)} />
+              <label class:disabled={already || !!server.issue}>
+                <input type="checkbox" checked={picked.has(server.name)} disabled={already || !!server.issue} onchange={() => toggle(server.name)} />
                 <span class="pick-name">{server.name}</span>
                 <span class="chip">{server.transport === 'stdio' ? 'Command' : 'URL'}</span>
-                {#if server.auth === 'oauth'}<span class="chip">Sign-in</span>{/if}
                 {#if server.hasSecrets}<span class="chip warn" title="Its keys or tokens are copied too">Includes keys</span>{/if}
                 {#if already}<span class="muted small">already added</span>{/if}
               </label>
               <code>{server.target}</code>
+              {#if server.issue}<p class="field-error" role="note">{server.issue}</p>{/if}
             </li>
           {/each}
         </ul>
@@ -218,6 +303,7 @@
     <div class="bar">
       <span class="muted">{overview.servers.length ? `${overview.servers.length} server${overview.servers.length === 1 ? '' : 's'} · ${overview.path}` : `No servers yet · ${overview.path}`}</span>
       <span class="grow"></span>
+      <button class="secondary" disabled={checking} onclick={() => void check()}>{#if checking}<LoaderCircle size={13} class="spin" />Checking…{:else}<RefreshCw size={13} />Check connections{/if}</button>
       <button class="secondary" onclick={openRaw}><Braces size={13} />Edit mcp.json</button>
       <button class="primary" onclick={() => { draft = blankDraft(); formError = ''; }}><Plus size={14} />Add server</button>
     </div>
@@ -227,7 +313,8 @@
     {#if overview.servers.length}
       <ul class="servers" aria-label="MCP servers">
         {#each overview.servers as server (server.name)}
-          <li class:off={server.disabled}>
+          {@const chip = statusChip(server)}
+          <li class:off={!server.enabled}>
             {#if draft?.original === server.name}
               {@render form()}
             {:else}
@@ -235,12 +322,15 @@
               <div class="info">
                 <div class="title-row">
                   <strong>{server.name}</strong>
-                  {#if server.disabled}<span class="chip">Off</span>{/if}
-                  {#if server.auth === 'oauth'}<span class="chip">Sign-in</span>{:else if server.auth === 'bearer'}<span class="chip">Token</span>{/if}
+                  {#if !server.enabled}<span class="chip">Off</span>{/if}
+                  {#if server.exposure === 'deferred'}<span class="chip">On demand</span>
+                  {:else if server.exposure === 'direct'}<span class="chip">Direct</span>
+                  {:else if server.exposure === 'hidden'}<span class="chip">Hidden</span>{/if}
                   {#if server.hasSecrets}<span class="chip" title="Has environment values, headers, or a token"><KeyRound size={11} />keys</span>{/if}
-                  {#if server.lifecycle && server.lifecycle !== 'lazy'}<span class="chip">{server.lifecycle}</span>{/if}
+                  {#if chip}<span class="chip" class:ok={chip.tone === 'ok'} class:warn={chip.tone === 'warn'} class:bad={chip.tone === 'bad'} title={chip.title}>{chip.label}</span>{/if}
                 </div>
                 <code title={server.target}>{server.target}</code>
+                {#if server.description}<span class="description">{server.description}</span>{/if}
               </div>
               <div class="actions">
                 {#if confirmRemove === server.name}
@@ -248,8 +338,16 @@
                   <button class="ghost" onclick={() => (confirmRemove = null)}>Cancel</button>
                   <button class="danger" disabled={busy} onclick={() => void act(() => api.mcpRemoveServer(server.name), `Removed ${server.name}.`).then(() => (confirmRemove = null))}>Remove</button>
                 {:else}
-                  <label class="switch" title={server.disabled ? 'Turn on' : 'Turn off'}>
-                    <input type="checkbox" role="switch" aria-label={`${server.name} enabled`} checked={!server.disabled} disabled={busy}
+                  {#if needsAuth(server)}
+                    {#if signingIn === server.name}
+                      <span class="muted small">Waiting for your browser…</span>
+                      <button class="ghost" onclick={() => void cancelSignIn()}>Cancel</button>
+                    {:else}
+                      <button class="secondary" aria-label={`Sign in to ${server.name}`} disabled={busy || signingIn !== null} onclick={() => void signIn(server.name)}><KeyRound size={13} />Sign in</button>
+                    {/if}
+                  {/if}
+                  <label class="switch" title={server.enabled ? 'Turn off' : 'Turn on'}>
+                    <input type="checkbox" role="switch" aria-label={`${server.name} enabled`} checked={server.enabled} disabled={busy}
                       onchange={event => void act(() => api.mcpSetEnabled(server.name, event.currentTarget.checked), `${event.currentTarget.checked ? 'Turned on' : 'Turned off'} ${server.name}.`)} />
                     <span></span>
                   </label>
@@ -265,42 +363,13 @@
       <div class="empty column">
         <Plug size={22} strokeWidth={1.6} />
         <strong>No MCP servers yet</strong>
-        <span>Add a server by its URL or command. Threads reach MCP tools through one <code>mcp</code> tool, and servers connect only when used.</span>
+        <span>Add a server by URL or command. Threads reach MCP tools through codemode scripts, tool search, or directly, depending on each server's exposure.</span>
       </div>
     {/if}
-
-    {#if needsSignIn.length}
-      <div class="callout signin">
-        <KeyRound size={18} />
-        <div>
-          <strong>{needsSignIn.length === 1 ? `${needsSignIn[0].name} needs` : 'These servers need'} a one-time sign-in</strong>
-          <p>Sign in opens πDesk's terminal and runs <code>pi '/mcp-auth {needsSignIn.length === 1 ? needsSignIn[0].name : '<server>'}'</code>, which opens your browser. The token is kept in your macOS keychain.</p>
-          {#if onRunInTerminal}
-            <div class="signin-list">
-              {#each needsSignIn as server (server.name)}
-                <button class="secondary" aria-label={`Sign in to ${server.name}`} onclick={() => onRunInTerminal(`pi '/mcp-auth ${server.name}'`)}><Terminal size={13} />{needsSignIn.length === 1 ? 'Sign in' : `Sign in to ${server.name}`}</button>
-              {/each}
-            </div>
-          {/if}
-        </div>
-      </div>
-    {/if}
-
-    <h3 class="sub">Options</h3>
-    <div class="option">
-      <div><strong>Ask before every MCP tool call</strong><p>{overview.approveTools === 'custom' ? 'mcp.json has custom approval rules; edit them there.' : 'Threads show a permission card before running any MCP tool, even in Auto.'}</p></div>
-      {#if overview.approveTools !== 'custom'}
-        <label class="switch">
-          <input type="checkbox" role="switch" aria-label="Ask before every MCP tool call" checked={overview.approveTools === 'all'} disabled={busy}
-            onchange={event => void act(() => api.mcpSetApproveTools(event.currentTarget.checked))} />
-          <span></span>
-        </label>
-      {/if}
-    </div>
 
     {#if rawOpen}
       <div class="panel">
-        <div class="panel-head"><strong>{overview.path}</strong><span class="muted">Every adapter option lives here. Comments are kept when you save this editor; the form above rewrites the file without them.</span></div>
+        <div class="panel-head"><strong>{overview.path}</strong><span class="muted">Pi's built-in MCP reads this file as strict JSON (no comments). Every server option can be set here.</span></div>
         <textarea class="raw" bind:value={rawText} spellcheck="false" aria-label="mcp.json"></textarea>
         {#if rawError}<p class="field-error" role="alert">{rawError}</p>{/if}
         <div class="row-actions">
@@ -309,7 +378,6 @@
         </div>
       </div>
     {/if}
-    <p class="hint">Adapter {overview.adapterVersion ? `v${overview.adapterVersion}` : 'not installed'}. {#if overview.hasComments}mcp.json has comments; editing a server here removes them.{/if}</p>
   {/if}
 </div>
 
@@ -334,11 +402,14 @@
         <label>Environment <span class="muted">one per line · NAME=value</span><textarea bind:value={draft.env} rows="2" spellcheck="false" placeholder="API_KEY=…"></textarea></label>
       {/if}
       <div class="grid2">
-        <label>Sign-in
-          <select bind:value={draft.auth}><option value="">None</option><option value="oauth">OAuth (browser sign-in)</option><option value="bearer">Bearer token</option></select>
-        </label>
-        <label>Connect
-          <select bind:value={draft.lifecycle}><option value="">When first used (default)</option><option value="eager">At thread start</option><option value="keep-alive">At start, stay connected</option><option value="lazy-keep-alive">When first used, stay connected</option></select>
+        <label>Description <span class="muted">optional, one line</span><input bind:value={draft.description} placeholder="What this server offers" maxlength="200" /></label>
+        <label>Tools reach the model
+          <select bind:value={draft.exposure}>
+            <option value="">Through codemode scripts (default)</option>
+            <option value="deferred">After tool_search finds them</option>
+            <option value="direct">Directly, always declared</option>
+            <option value="hidden">Hidden</option>
+          </select>
         </label>
       </div>
       {#if formError}<p class="field-error" role="alert">{formError}</p>{/if}
@@ -380,8 +451,6 @@
   .callout > :global(svg) { flex: none; color: var(--accent); }
   .callout.import { border-color: color-mix(in srgb, var(--accent) 35%, var(--line-strong)); background: color-mix(in srgb, var(--accent-bg) 55%, var(--panel)); }
   .callout div { flex: 1; min-width: 0; }
-  .callout.signin { align-items: flex-start; }
-  .signin-list { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
   .callout strong { font-size: 13px; }
   .callout p { margin: 2px 0 0; color: var(--muted); font-size: 12.5px; line-height: 1.5; }
 
@@ -399,8 +468,11 @@
   .info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
   .title-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 13.5px; }
   .info code { color: var(--subtle); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .description { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .chip { display: inline-flex; align-items: center; gap: 3px; height: 18px; padding: 0 6px; border-radius: 5px; background: var(--surface-2); color: var(--muted); font-size: 11px; font-weight: 500; }
   .chip.warn { background: var(--warn-bg); color: var(--warn); }
+  .chip.ok { background: var(--good-bg); color: var(--text); }
+  .chip.bad { background: var(--bad-bg); color: var(--bad); }
   .actions { flex: none; display: flex; align-items: center; gap: 4px; }
 
   .switch { position: relative; display: inline-flex; width: 34px; height: 20px; margin-right: 4px; cursor: pointer; }
@@ -433,12 +505,5 @@
   .seg button { height: 26px; padding: 0 10px; border: 0; border-radius: 7px; background: none; color: var(--muted); }
   .seg button.on { background: var(--bg); color: var(--text); box-shadow: var(--shadow-sm); }
   .field-error { margin: 0; color: var(--bad); font-size: 12.5px; }
-
-  .sub { margin: 10px 0 0; font-size: 12px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--subtle); }
-  .option { display: flex; align-items: center; gap: 16px; padding: 12px 16px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); }
-  .option div { flex: 1; }
-  .option strong { font-size: 13px; }
-  .option p { margin: 2px 0 0; color: var(--muted); font-size: 12.5px; }
   .raw { min-height: 260px; }
-  .hint { margin: 0; color: var(--subtle); font-size: 12px; }
 </style>

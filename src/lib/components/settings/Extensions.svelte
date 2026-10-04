@@ -136,7 +136,7 @@
     <label for="ext-source">Install a package</label>
     <div class="field">
       <span class="prompt">$ pi install</span>
-      <input id="ext-source" bind:value={sourceInput} placeholder="npm:pi-mcp-adapter  or  git:github.com/owner/repo" autocomplete="off" spellcheck="false" maxlength="300" />
+      <input id="ext-source" bind:value={sourceInput} placeholder="npm:pi-web-access  or  git:github.com/owner/repo" autocomplete="off" spellcheck="false" maxlength="300" />
       <button class="primary" type="submit" disabled={!sourceInput.trim() || Object.values(busy).includes('install')}>
         {#if Object.values(busy).includes('install')}<LoaderCircle size={14} class="spin" />Installing…{:else}<Download size={14} />Install{/if}
       </button>

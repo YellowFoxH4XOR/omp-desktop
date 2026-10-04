@@ -8,7 +8,7 @@ register('data:text/javascript,' + encodeURIComponent(`
     if (specifier === '@earendil-works/pi-coding-agent') return { url: 'data:text/javascript,export function createBashTool() { return { name: "bash", execute: async () => ({}) } }', shortCircuit: true };
     return next(specifier, context);
   }`));
-const { default: extension, describeCall, foreignPath, isMcpLookup, isReadOnlyCommand, realHomeBash, realHomeEnv } = await import('./pidesk-modes.mjs');
+const { default: extension, describeCall, foreignPath, isReadOnlyCommand, realHomeBash, realHomeEnv } = await import('./pidesk-modes.mjs');
 
 function harness(flags = {}) {
   const hooks = new Map();
@@ -65,18 +65,19 @@ test('Auto is the default and blocks nothing', async () => {
 test('Plan lets reads through and asks before anything else', async () => {
   const pi = harness({ 'pidesk-plan': true });
   assert.equal(pi.statuses.at(-1), 'plan');
-  for (const toolName of ['read', 'grep', 'find', 'ls', 'pidesk', 'request_auto']) assert.equal(await pi.blocked(toolName), false, toolName);
+  for (const toolName of ['read', 'grep', 'find', 'ls', 'pidesk', 'request_auto', 'codemode', 'tool_search', 'list_mcp_resources', 'list_mcp_resource_templates', 'read_mcp_resource']) assert.equal(await pi.blocked(toolName), false, toolName);
   assert.equal(await pi.blocked('bash', { command: 'git diff' }), false);
-  // MCP metadata lookups are reads; calling or connecting is not.
-  for (const input of [{}, { server: 'github' }, { search: 'screenshot', limit: 5 }, { describe: 'x_y' }, { instructions: 'github' }]) assert.equal(await pi.blocked('mcp', input), false, JSON.stringify(input));
   assert.equal(pi.asked.length, 0);
   for (const toolName of ['edit', 'write', 'custom_tool']) assert.equal(await pi.blocked(toolName), true, toolName);
   assert.equal(await pi.blocked('bash', { command: 'npm install' }), true);
-  for (const input of [{ tool: 'github_create_issue', args: {} }, { connect: 'github' }, { action: 'auth-start', server: 'x' }]) assert.equal(await pi.blocked('mcp', input), true, JSON.stringify(input));
-  assert.equal(pi.asked.length, 7);
+  // MCP tool calls ask, including ones a codemode script makes: Pi sends
+  // every nested call through this hook, which is what makes codemode safe.
+  for (const toolName of ['mcp__github__create_issue', 'mcp__dev_radius__search']) assert.equal(await pi.blocked(toolName, { title: 'x' }), true, toolName);
+  const nested = await pi.hooks.get('tool_call')({ toolName: 'write', input: { path: 'a.ts', content: 'x' }, parentToolCallId: 'call_1' }, pi.ctx);
+  assert.equal(nested.block, true);
+  assert.equal(pi.asked.length, 6);
   assert.match(pi.asked[3].title, /^Plan mode: allow this\?\n\nRun in the shell:\nnpm install$/);
   assert.deepEqual(pi.asked[0].options, ['Allow once', 'Allow for this run (Auto)', 'Keep blocked']);
-  assert.equal(isMcpLookup({ search: 'a', tool: '' }), true);
   assert.throws(() => pi.hooks.get('user_bash')(), /read-only/);
   assert.equal(pi.hooks.get('before_agent_start')().message.display, false);
 });
@@ -141,7 +142,7 @@ test('permission cards say exactly what would happen', () => {
   assert.equal(describeCall('grep', { path: 'src', pattern: 'token' }), 'Search src for “token”');
   assert.equal(describeCall('edit', { path: 'src/a.ts', edits: [{}, {}] }), 'Edit src/a.ts (2 changes)');
   assert.equal(describeCall('write', { path: 'b.md', content: 'hello' }), 'Write b.md (5 characters)');
-  assert.equal(describeCall('mcp', { tool: 'github_create_issue', args: { title: 'x' } }), 'Use MCP: github_create_issue\n{"title":"x"}');
+  assert.equal(describeCall('mcp__github__create_issue', { title: 'x' }), 'Call the MCP tool create_issue on github\n{"title":"x"}');
   assert.equal(describeCall('custom', {}), 'Use custom');
   assert.ok(describeCall('bash', { command: 'x'.repeat(5000) }).length < 1300);
 });

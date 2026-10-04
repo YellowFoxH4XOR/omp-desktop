@@ -4,7 +4,7 @@ import { BUILTIN_COMMANDS, INTERN_COMMANDS, TERMINAL_ONLY, parseSlash, slashSugg
 test('slash commands parse into a name and the rest of the line', () => {
   expect(parseSlash('/model opencode-go/glm-5.1')).toEqual({ name: 'model', args: 'opencode-go/glm-5.1' });
   expect(parseSlash('  /compact  keep the API notes\nand tests ')).toEqual({ name: 'compact', args: 'keep the API notes\nand tests' });
-  expect(parseSlash('/skill:mcp-scripting')).toEqual({ name: 'skill:mcp-scripting', args: '' });
+  expect(parseSlash('/skill:mcp-builder')).toEqual({ name: 'skill:mcp-builder', args: '' });
   expect(parseSlash('please /compact')).toBeNull();
   expect(parseSlash('/')).toBeNull();
   // A path is not a command.
@@ -19,10 +19,10 @@ test('πDesk handles the common built-ins and knows which are terminal-only', ()
 });
 
 test('suggestions list built-ins, then Pi commands, never host controls', () => {
-  const pi = [{ name: 'mcp-auth', description: 'Sign in to an MCP server', source: 'extension' as const }, { name: 'pidesk-mode' }, { name: 'skill:mcp-scripting', source: 'skill' as const }];
-  expect(slashSuggestions('/', pi, BUILTIN_COMMANDS, 50).map(command => command.name)).toContain('mcp-auth');
+  const pi = [{ name: 'mcp', description: 'Manage MCP servers: sign in, reconnect, enable or disable, and change exposure', source: 'extension' as const }, { name: 'pidesk-mode' }, { name: 'skill:mcp-builder', source: 'skill' as const }];
+  expect(slashSuggestions('/', pi, BUILTIN_COMMANDS, 50).map(command => command.name)).toContain('mcp');
   expect(slashSuggestions('/', pi, BUILTIN_COMMANDS, 50).map(command => command.name)).not.toContain('pidesk-mode');
-  expect(slashSuggestions('/mc', pi).map(command => command.name)).toEqual(['mcp-auth', 'skill:mcp-scripting']);
+  expect(slashSuggestions('/mc', pi).map(command => command.name)).toEqual(['mcp', 'skill:mcp-builder']);
   expect(slashSuggestions('/model x', pi)).toEqual([]);
   expect(slashSuggestions('hello', pi)).toEqual([]);
   // Intern has no titles or modes to switch.

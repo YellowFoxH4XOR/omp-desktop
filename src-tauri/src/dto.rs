@@ -33,6 +33,9 @@ pub struct HarnessInstallation {
     pub path: String,
     pub version: String,
     pub source: String,
+    /// The Pi version this build runs. Another `version` means setup must
+    /// update the private copy before any Pi starts.
+    pub required_version: String,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -1,7 +1,7 @@
 import { invoke, type Channel } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { z } from 'zod';
-import type { BackendEvent, CatalogPage, ChangesSummary, InstalledPackage, McpOverview, GitFile, HarnessInstallation, HarnessInstallCommand, HarnessKind, ModelInfo, Project, SessionSnapshot, SessionState, Thread, ThreadDeletePreview, ThreadMode, UiResponse, Usage, RuntimeStats, ModelDefaults, InternImage, InternPlan } from './types';
+import type { BackendEvent, CatalogPage, ChangesSummary, InstalledPackage, McpImportResult, McpOverview, McpStatus, GitFile, HarnessInstallation, HarnessInstallCommand, HarnessKind, ModelInfo, Project, SessionSnapshot, SessionState, Thread, ThreadDeletePreview, ThreadMode, UiResponse, Usage, RuntimeStats, ModelDefaults, InternImage, InternPlan } from './types';
 
 export const api = {
   internSnapshot: () => invoke<SessionSnapshot>('intern_snapshot'),
@@ -52,10 +52,13 @@ export const api = {
   mcpSaveServer: (original: string | null, name: string, config: Record<string, unknown>) => invoke<void>('mcp_save_server', { original, name, config }),
   mcpRemoveServer: (name: string) => invoke<void>('mcp_remove_server', { name }),
   mcpSetEnabled: (name: string, enabled: boolean) => invoke<void>('mcp_set_enabled', { name, enabled }),
-  mcpSetApproveTools: (all: boolean) => invoke<void>('mcp_set_approve_tools', { all }),
   mcpSaveRaw: (text: string) => invoke<void>('mcp_save_raw', { text }),
-  mcpImport: (source: string, names: string[]) => invoke<string[]>('mcp_import', { source, names }),
-  mcpInstallAdapter: () => invoke<void>('mcp_install_adapter'),
+  mcpImport: (source: string, names: string[]) => invoke<McpImportResult>('mcp_import', { source, names }),
+  mcpSwitchToBuiltin: () => invoke<McpImportResult>('mcp_switch_to_builtin'),
+  mcpEnableBuiltin: () => invoke<void>('mcp_enable_builtin'),
+  mcpCheck: () => invoke<McpStatus>('mcp_check'),
+  mcpLogin: (name: string) => invoke<string>('mcp_login', { name }),
+  mcpLoginCancel: () => invoke<void>('mcp_login_cancel'),
   setThreadFlags: (threadId: string, pinned?: boolean, archived?: boolean) => invoke<Thread>('set_thread_flags', { threadId, pinned, archived }),
   respondUi: (threadId: string, requestId: string, response: UiResponse) => invoke<void>('respond_ui', { threadId, requestId, response }),
   terminalOpen: (cols: number, rows: number, cwd: string | undefined, output: Channel<ArrayBuffer>) => invoke<string>('terminal_open', { cols, rows, cwd, output }),

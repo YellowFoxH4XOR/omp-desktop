@@ -109,6 +109,8 @@
   let installPlan = $state<HarnessInstallCommand | null>(null);
   let installPlanError = $state('');
   let installerVisible = $state(false);
+  /** Version an update started from, so setup can say what changed. */
+  let updatingFrom = $state<string | undefined>();
   let checkingRuntime = $state(false);
   let eventsReady = $state(false);
   let renaming = $state<string | null>(null);
@@ -198,7 +200,11 @@
     if (id && id !== shownPlanId) { shownPlanId = id; rightPanel = 'plan'; }
     else if (!id && rightPanel === 'plan') rightPanel = null;
   });
-  const installation = $derived(harnesses[0]);
+  /** Only the Pi version this build runs can start threads, Intern, or the terminal. */
+  const installation = $derived(harnesses.find(candidate => candidate.version === candidate.requiredVersion));
+  /** A private copy of another Pi version, which setup offers to update. */
+  const outdated = $derived(installation ? undefined : harnesses[0]);
+  const setupUpdate = $derived(outdated ? { from: outdated.version, to: outdated.requiredVersion } : updatingFrom && installation ? { from: updatingFrom, to: installation.version } : undefined);
   const onboarding = $derived(!detecting && !installation);
   const switchEntries = $derived([
     ...projects.flatMap(project => [
@@ -980,7 +986,8 @@
       await api.respondUi(targetThread.id, requestId, response);
       if (invalidatedProjects.has(projectId) || invalidatedThreads.has(targetThread.id)) return;
       targetSession?.dismissRequest(requestId);
-      updateThreadStatus(targetThread.id, 'active');
+      // A dialog from a `/command` has no run to resume; the model knows.
+      updateThreadStatus(targetThread.id, targetSession?.view.status ?? 'active');
     } catch (error) {
       if (activeThread?.id === targetThread.id && threadSelectionToken === selectionToken && !invalidatedProjects.has(projectId)) startupError = `Could not respond: ${errorText(error)}`;
       throw error;
@@ -1169,6 +1176,7 @@
     installInProgress = true;
     installerVisible = true;
     installStatus = 'preparing';
+    updatingFrom = outdated?.version;
     installLog = [];
     installError = '';
     try {
@@ -1287,7 +1295,7 @@
       <div class="sidebar-tools">
         <button class="icon-button brand-home" class:pressed={!activeProject} title="Welcome to πDesk" aria-label="Welcome" onclick={goHome}><img src="/app-icon.svg" alt="" width="22" height="22" /></button>
         <button class="icon-button" title="Search projects and threads (⌘K)" aria-label="Switch project or thread" onclick={() => void openSwitcher()}><Search size={16} strokeWidth={1.8} /></button>
-        <button class="icon-button" title="New thread (⌘N)" aria-label="New thread" disabled={!activeProject || pendingAction || !harnesses.length} onclick={() => { if (activeProject) void createThread(activeProject); }}><SquarePen size={16} strokeWidth={1.8} /></button>
+        <button class="icon-button" title="New thread (⌘N)" aria-label="New thread" disabled={!activeProject || pendingAction || !installation} onclick={() => { if (activeProject) void createThread(activeProject); }}><SquarePen size={16} strokeWidth={1.8} /></button>
       </div>
     </div>
 
@@ -1315,7 +1323,7 @@
             {@const visible = visibleThreads(project.id)}
             <div class="thread-list">
               <div class="new-thread-row">
-                <button class="new-thread" disabled={pendingAction || !harnesses.length} onclick={() => void createThread(project)}><Plus size={13} strokeWidth={2.2} /> New thread</button>
+                <button class="new-thread" disabled={pendingAction || !installation} onclick={() => void createThread(project)}><Plus size={13} strokeWidth={2.2} /> New thread</button>
               </div>
               {#if visible.length}
                 <VList data={visible} getKey={thread => thread.id} style={`height: min(58vh, ${visible.length * 52}px);`}>
@@ -1416,13 +1424,13 @@
     {#if startupError}<div class="error-banner" role="alert"><AlertTriangle size={14}/><span>{startupError}</span><button aria-label="Dismiss error" onclick={() => startupError = ''}><X size={14}/></button></div>{/if}
     {#if detecting}<div class="main-empty"><LoaderCircle class="spin" size={24} strokeWidth={1.6}/><h2>Checking private Pi</h2><p>Looking only inside πDesk’s installation directory.</p></div>
     {:else if onboarding || installerVisible}
-      <PiSetup plan={installPlan} status={installStatus} busy={installInProgress} lines={installLog} error={installError || installPlanError} ready={installReady} checking={checkingRuntime} onInstall={() => void install()} onCheck={() => void checkPrivateRuntime()} onContinue={() => { installerVisible = false; installStatus = 'idle'; }} onOpenTerminal={openTerminal} />
+      <PiSetup plan={installPlan} update={setupUpdate} status={installStatus} busy={installInProgress} lines={installLog} error={installError || installPlanError} ready={installReady} checking={checkingRuntime} onInstall={() => void install()} onCheck={() => void checkPrivateRuntime()} onContinue={() => { installerVisible = false; installStatus = 'idle'; updatingFrom = undefined; }} onOpenTerminal={openTerminal} />
     {:else if !activeProject}
       <Welcome {projects} recent={recentThreads} busy={pendingAction} onOpenProject={project => void selectProject(project)} onOpenThread={thread => void openThreadById(thread.id, thread.projectId)} onAddProject={() => void addProject()} onOpenIntern={() => { internStarted = true; internOpen = true; }} />
     {:else if loadingThread}
       <div class="main-empty delayed"><LoaderCircle class="spin" size={24} strokeWidth={1.6}/><h2>Opening thread</h2><p>Restoring the conversation from Pi.</p></div>
     {:else if !visibleThread || !currentView}
-      <div class="main-empty"><div class="empty-graphic"><SquarePen size={24} strokeWidth={1.5}/></div><h2>What shall we work on?</h2><p>Start a thread in <strong>{activeProject.displayName}</strong> to talk to your agent.</p><button class="primary-button" disabled={pendingAction || !harnesses.length} onclick={() => void createThread(activeProject!)}><Plus size={15} strokeWidth={2.2}/> New thread</button><div class="empty-hint"><kbd>⌘</kbd><kbd>N</kbd> new thread <span class="dot-sep"></span> <kbd>⌘</kbd><kbd>K</kbd> jump anywhere</div></div>
+      <div class="main-empty"><div class="empty-graphic"><SquarePen size={24} strokeWidth={1.5}/></div><h2>What shall we work on?</h2><p>Start a thread in <strong>{activeProject.displayName}</strong> to talk to your agent.</p><button class="primary-button" disabled={pendingAction || !installation} onclick={() => void createThread(activeProject!)}><Plus size={15} strokeWidth={2.2}/> New thread</button><div class="empty-hint"><kbd>⌘</kbd><kbd>N</kbd> new thread <span class="dot-sep"></span> <kbd>⌘</kbd><kbd>K</kbd> jump anywhere</div></div>
     {:else}
       {#if currentView.error}<div class="error-banner"><AlertTriangle size={14}/><span>{currentView.error}</span>{#if visibleThread && crashDetails[visibleThread.id]}<button onclick={() => errorDetailsOpen = true}>View details</button>{/if}<button class="banner-action" onclick={() => void restart()}><RefreshCw size={13}/> Restart session</button></div>{/if}
       <Conversation view={currentView} onSend={send} onAbort={stop} onShowChanges={showChanges} onRespond={respond} onSetModel={setModel} onSetEffort={setEffort} {defaultModelKey} onMakeDefault={makeDefaultModel} agentMode={visibleThread.mode ?? 'auto'} onSetMode={setMode} plan={planRequest ? { plan: planOf(planRequest) ?? '', onApprove: () => answerPlan('approve'), onDecline: () => answerPlan('decline'), onFeedback: text => answerPlan('feedback', text), onReview: () => rightPanel = 'plan' } : undefined} />
@@ -1514,7 +1522,7 @@
         </button>
       {/each}
       <span class="grow"></span>
-      <div class="settings-nav-foot">πDesk · Pi {installation?.version ?? 'not installed'}</div>
+      <div class="settings-nav-foot">πDesk · Pi {installation?.version ?? (outdated ? `${outdated.version} (update needed)` : 'not installed')}</div>
     </nav>
     <div class="settings-main">
       <header class="settings-top" data-tauri-drag-region>
@@ -1565,8 +1573,9 @@
         <div class="setting-group">
           <div class="setting-row"><span class="setting-name"><Terminal size={15} strokeWidth={1.8}/> Pi</span>
             {#if installation}<span class="version">{installation.version}</span>
+            {:else if outdated}<span class="missing">{outdated.version} · πDesk needs {outdated.requiredVersion}</span>
             {:else}<span class="missing">Not found</span>{/if}
-            {#if !installation}<button class="secondary-button small" onclick={() => { settingsOpen = false; installerVisible = true; }}>Set up Pi</button>{/if}
+            {#if !installation}<button class="secondary-button small" onclick={() => { settingsOpen = false; installerVisible = true; }}>{outdated ? 'Update Pi' : 'Set up Pi'}</button>{/if}
           </div>
           {#if installation}
             <div class="install-paths">
@@ -1587,8 +1596,8 @@
         {#if installPlanError}<p role="alert">{installPlanError}</p>{/if}
             {#if installation && installPlan}<div class="settings-card signin"><PiSignIn command={installPlan.loginCommand} onOpenTerminal={openTerminal} /></div>{/if}
           {:else if settingsSection === 'mcp'}
-            <h1>MCP servers</h1><p class="lead">Connect tools and data sources through the Model Context Protocol. πDesk's Pi reaches them with one <code>mcp</code> tool, and servers start only when a thread uses them.</p>
-            <McpServers onRunInTerminal={openTerminal} />
+            <h1>MCP servers</h1><p class="lead">Connect tools and data sources through the Model Context Protocol. Pi's built-in MCP connects enabled servers when a thread starts; models reach their tools through codemode scripts, tool search, or directly.</p>
+            <McpServers />
           {:else}
             <h1>Extensions</h1><p class="lead">Pi packages add tools, skills, prompts and themes to every thread. Search the <button class="text-link" onclick={() => void openExternal('https://pi.dev/packages')}>pi.dev gallery</button> or install one by name.</p>
             <Extensions onUpdates={count => extensionUpdates = count} />

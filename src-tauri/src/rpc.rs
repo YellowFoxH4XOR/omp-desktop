@@ -8,7 +8,11 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
 use tokio::sync::{oneshot, watch, Mutex};
 
-pub const MAX_PI_FRAME_BYTES: usize = 8 * 1024 * 1024;
+/// One JSONL frame. `get_messages` returns the whole history in one frame
+/// (threads budget 32 MiB of it), and Pi 1.0 tool results can carry codemode
+/// output of up to 16 Mi characters or generated images. A larger frame kills
+/// the process, so the cap must sit above both.
+pub const MAX_PI_FRAME_BYTES: usize = 64 * 1024 * 1024;
 const STDERR_TAIL_BYTES: usize = 16 * 1024;
 const DEFAULT_CMD_TIMEOUT_SECS: u64 = 60;
 const STDIN_IO_TIMEOUT_SECS: u64 = 10;

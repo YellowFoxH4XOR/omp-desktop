@@ -7,6 +7,8 @@ export interface HarnessInstallation {
   path: string;
   version: string;
   source: string;
+  /** The Pi version this πDesk runs; any other `version` must be updated first. */
+  requiredVersion: string;
 }
 export type InstallStage = 'preparing' | 'installing' | 'verifying';
 export type InstallStatus = 'idle' | InstallStage | 'complete' | 'failed';
@@ -97,7 +99,7 @@ export interface SessionState {
   contextUsage?: ContextUsage;
 }
 export interface RpcContent { type: string; text?: string; thinking?: string; id?: string; name?: string; arguments?: Record<string, unknown>; [key: string]: unknown }
-export interface RpcMessage { role: string; content?: string | RpcContent[]; timestamp?: number; customType?: string; display?: boolean; details?: unknown; toolCallId?: string; toolName?: string; isError?: boolean; usage?: Record<string, unknown>; stopReason?: string; command?: string; output?: string; exitCode?: number }
+export interface RpcMessage { role: string; content?: string | RpcContent[]; timestamp?: number; customType?: string; display?: boolean; details?: unknown; toolCallId?: string; toolName?: string; isError?: boolean; nestedCalls?: unknown; usage?: Record<string, unknown>; stopReason?: string; command?: string; output?: string; exitCode?: number }
 export interface SessionSnapshot {
   thread: Thread;
   messages: RpcMessage[];
@@ -109,9 +111,10 @@ export interface SessionSnapshot {
   commands?: Array<{ name: string; description?: string; source: 'extension' | 'skill' | 'prompt' }>;
 }
 export interface ToolResult { content?: RpcContent[]; details?: unknown; isError?: boolean }
+export interface NestedCall { id: string; toolName: string; args?: Record<string, unknown>; status: 'running' | 'completed' | 'failed' | 'cancelled'; durationMs?: number; error?: string }
 export type ConversationItem =
   | { id: string; kind: 'user' | 'text' | 'thinking'; text: string; streaming?: boolean; timestamp?: number; /** Images sent with a user message. */ images?: number }
-  | { id: string; kind: 'tool'; toolCallId: string; toolName: string; args: Record<string, unknown>; intent?: string; status: ToolStatus; result?: ToolResult; partial?: ToolResult; timestamp?: number }
+  | { id: string; kind: 'tool'; toolCallId: string; toolName: string; args: Record<string, unknown>; intent?: string; status: ToolStatus; result?: ToolResult; partial?: ToolResult; nested?: NestedCall[]; timestamp?: number }
   | { id: string; kind: 'custom' | 'notice' | 'advisor'; text: string; customType?: string; details?: unknown; level?: string; timestamp?: number };
 export interface UiRequest {
   id: string;
@@ -210,7 +213,7 @@ export interface CatalogPackage {
   downloads: number;
   publishedMs: number;
   types: PackageKind[];
-  /** Source for `pi install`, e.g. `npm:pi-mcp-adapter`. */
+  /** Source for `pi install`, e.g. `npm:pi-web-access`. */
   source: string;
 }
 export interface CatalogPage {
@@ -228,15 +231,18 @@ export interface InstalledPackage {
   latest?: string;
   updateAvailable: boolean;
 }
+export type McpExposure = 'codemode' | 'deferred' | 'direct' | 'hidden';
 export interface McpServer {
   name: string;
-  transport: 'stdio' | 'http' | 'socket' | 'unknown';
+  transport: 'stdio' | 'http';
   target: string;
-  disabled: boolean;
-  auth?: string;
-  lifecycle?: string;
+  enabled: boolean;
+  exposure: McpExposure;
+  description?: string;
   hasSecrets: boolean;
-  /** Full entry (private servers only). */
+  /** Import sources only: why it can't be copied. */
+  issue?: string;
+  /** Full entry (private file only). */
   config?: Record<string, unknown>;
 }
 export interface McpImportSource {
@@ -244,14 +250,31 @@ export interface McpImportSource {
   path: string;
   servers: McpServer[];
 }
+export interface McpAdapter {
+  source: string;
+  version?: string;
+  servers: string[];
+}
 export interface McpOverview {
-  adapterInstalled: boolean;
-  adapterVersion?: string;
   path: string;
   servers: McpServer[];
-  approveTools: 'off' | 'all' | 'custom';
   raw: string;
-  hasComments: boolean;
   error?: string;
   importSources: McpImportSource[];
+  adapter?: McpAdapter;
+  builtinDisabled: boolean;
+}
+export interface McpImportResult {
+  copied: string[];
+  skipped: Array<{ name: string; reason: string }>;
+}
+export interface McpServerStatus {
+  name: string;
+  state: string;
+  tools: string[];
+  error?: string;
+}
+export interface McpStatus {
+  servers: McpServerStatus[];
+  errors: string[];
 }
